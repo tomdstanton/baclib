@@ -36,8 +36,6 @@ plugins:
   - mkdocstrings:
       handlers:
         python:
-          import:
-            - https://docs.python.org/3/objects.inv
           options:
             docstring_style: "google"
   - api-autonav:

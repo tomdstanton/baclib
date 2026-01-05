@@ -2,7 +2,7 @@
 Top-level module, including resource and optional dependency management.
 """
 from functools import wraps, cached_property
-from importlib import import_module, resources
+from importlib import import_module
 from importlib.metadata import metadata as load_metadata
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -26,8 +26,8 @@ class Resources:
         # Register cleanup to run automatically when the program exits
         atexit.register(self.shutdown)
 
-    @cached_property
-    def data(self): return resources.files(self.package) / 'data'
+    # @cached_property
+    # def data(self): return resources.files(self.package) / 'data'
 
     @cached_property
     def metadata(self): return load_metadata(self.package)

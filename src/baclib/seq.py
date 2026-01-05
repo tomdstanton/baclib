@@ -13,14 +13,14 @@ from re import compile as regex
 
 import numpy as np
 
-from . import RESOURCES, baclibWarning, jit
+from . import RESOURCES, BaclibWarning, jit
 
 # Exceptions and Warnings ----------------------------------------------------------------------------------------------
 class AlphabetError(Exception): pass
 class SeqError(Exception): pass
 class IntervalError(Exception): pass
 class TranslationError(AlphabetError): pass
-class TranslationWarning(baclibWarning): pass
+class TranslationWarning(BaclibWarning): pass
 
 
 # Classes --------------------------------------------------------------------------------------------------------------

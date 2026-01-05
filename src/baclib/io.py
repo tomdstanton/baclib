@@ -10,7 +10,7 @@ from pathlib import Path
 from sys import stdout, stdin
 from importlib import import_module
 
-from . import baclibWarning
+from . import BaclibWarning
 from .graph import Edge
 from .seq import Record, Feature, Alphabet, Qualifier, Interval, CigarParser
 from .alignment import Alignment
@@ -27,7 +27,7 @@ class ParserError(Exception):
     pass
 
 
-class SeqFileWarning(baclibWarning):
+class SeqFileWarning(BaclibWarning):
     """Warning category for sequence file issues."""
     pass
 
