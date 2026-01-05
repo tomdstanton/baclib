@@ -15,8 +15,8 @@ from warnings import warn
 
 
 # Exceptions and Warnings ----------------------------------------------------------------------------------------------
-class baclibWarning(Warning): pass
-class DependencyWarning(baclibWarning): pass
+class BaclibWarning(Warning): pass
+class DependencyWarning(BaclibWarning): pass
 
 # Classes --------------------------------------------------------------------------------------------------------------
 class Resources:
