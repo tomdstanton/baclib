@@ -1,7 +1,8 @@
 from typing import Literal, IO, Union, Optional, Iterable, Dict
 from pathlib import Path
 from itertools import chain
-from random import Random
+
+import numpy as np
 
 from . import RESOURCES
 from .io import SeqFile
@@ -16,7 +17,25 @@ class GenomeError(Exception): pass
 # Classes --------------------------------------------------------------------------------------------------------------
 class Genome:
     """
-    A class representing a single bacterial genome assembly in memory with contigs and potentially edges.
+    A class representing a single bacterial genome assembly in memory.
+
+    It holds contigs as `Record` objects and the connections between them as `Edge` objects.
+
+    Attributes:
+        id (str): The identifier for the genome.
+        contigs (Dict[str, Record]): A dictionary mapping contig IDs to Record objects.
+        edges (list[Edge]): A list of edges representing connections between contigs.
+
+    Examples:
+        >>> from baclib.genome import Genome
+        >>> # Load a genome from a FASTA file
+        >>> # genome = Genome.from_file("my_genome.fasta")
+        >>> # print(f"Genome ID: {genome.id}")
+        >>> # print(f"Total length: {len(genome)}")
+        >>> # Access a specific contig
+        >>> # if "contig_1" in genome.contigs:
+        ...     # print(genome["contig_1"])
+
     """
     _ALPHABET = Alphabet.dna()
     __slots__ = ('id', 'contigs', 'edges', '_cached_graph')
@@ -32,15 +51,6 @@ class Genome:
     def __iter__(self): return iter(self.contigs.values())
     def __str__(self): return self.id
     def __getitem__(self, item: str) -> 'Record': return self.contigs[item]
-    def __format__(self, __format_spec: Literal['fasta', 'fna', 'ffn', 'faa', 'bed', 'gfa'] = ''):
-        if __format_spec == '': return self.__str__()
-        # Stream contigs
-        if __format_spec in {'fasta', 'fna', 'ffn', 'faa', 'bed'}:
-            return ''.join(format(i, __format_spec) for i in self.contigs.values())
-        # Stream contigs + edges (GFA)
-        elif __format_spec == 'gfa':
-            return ''.join(format(i, __format_spec) for i in chain(self.contigs.values(), self.edges))
-        else: raise NotImplementedError(f'Invalid format: {__format_spec}')
 
     @classmethod
     def from_file(cls, file: Union[str, Path, IO, SeqFile], annotations: Union[str, Path, SeqFile] = None):
@@ -87,15 +97,15 @@ class Genome:
         return self
 
     @classmethod
-    def random(cls, rng: Random = None, n_contigs: int = None, min_contigs: int = 1, max_contigs: int = 1000,
+    def random(cls, rng: np.random.Generator = None, n_contigs: int = None, min_contigs: int = 1, max_contigs: int = 1000,
                length: int = None, min_len: int = 10, max_len: int = 5000000, weights=None):
         """Generates a random genome assembly for testing purposes."""
         if rng is None: rng = RESOURCES.rng
         if n_contigs is None: n_contigs = rng.randint(min_contigs, max_contigs)
 
         # Create one massive sequence then shred it
-        full_seq = cls._ALPHABET.generate_seq(rng, length, min_len, max_len, weights)
-        master_record = Record(full_seq, id_='random_genome')
+        full_seq = cls._ALPHABET.random(rng, length, min_len, max_len, weights)
+        master_record = Record(cls._ALPHABET.seq(full_seq), id_='random_genome')
 
         genome = cls(master_record.id)
         # Assuming Record.shred returns an iterable of Records

@@ -34,6 +34,11 @@ class Hit:
         q_end (int): The end position on the query sequence (0-based, exclusive).
         t_start (int): The start position on the target sequence (0-based).
         t_end (int): The end position on the target sequence (0-based, exclusive).
+
+    Examples:
+        >>> hit = Hit("query1", "target1", score=100.0, q_start=0, q_end=10, t_start=5, t_end=15)
+        >>> print(hit)
+        Hit(query1 -> target1, score=100.0, range=[5:15])
     """
     __slots__ = ('query', 'target', 'score', 'q_start', 'q_end', 't_start', 't_end')
 
@@ -75,6 +80,14 @@ class HitTable:
         query_ids (List[str]): List of unique query IDs.
         target_ids (List[str]): List of unique target IDs.
         data (np.ndarray): Structured array containing hit data.
+
+    Examples:
+        >>> table = HitTable(size=10)
+        >>> # Add raw indices and scores
+        >>> table.add(q_idx=0, t_idx=1, score=95.5, q_interval=(0, 100), t_interval=(50, 150))
+        >>> # Or using Hit objects
+        >>> hit = Hit("q1", "t1", 99.0)
+        >>> table.add_hit(hit)
     """
     __slots__ = ('_data', '_count', 'query_ids', 'target_ids', '_q_map', '_t_map')
     _HIT_DTYPE = np.dtype([
@@ -188,6 +201,11 @@ class JaccardResult:
         target_ids (np.ndarray): Array of target IDs.
         matrix (csr_matrix): Sparse matrix of Jaccard scores.
         encoded_queries (dict): Dictionary of encoded query sequences.
+
+    Examples:
+        >>> # Typically returned by KmerIndex.jaccard()
+        >>> # result = index.jaccard(record1, record2)
+        >>> # hits, scores = result.get_hits("record1")
     """
     __slots__ = ('query_ids', 'target_ids', 'matrix', 'encoded_queries', '_q_map')
 
@@ -346,6 +364,12 @@ class Alignment(Feature):
         score (float): Alignment score.
         n_matches (int): Number of matching bases.
         quality (int): Mapping quality.
+
+    Examples:
+        >>> from baclib.seq import Interval
+        >>> aln = Alignment("q1", Interval(0, 10), "t1", Interval(20, 30), score=50, cigar="10M")
+        >>> print(aln.identity())
+        1.0
     """
     __slots__ = (
         'query', 'query_interval', 'query_length', 'target', 'target_length', 'length', 'cigar', 'score',
@@ -471,6 +495,11 @@ class AlignmentCollection:
 
     Attributes:
         graph (Graph): Graph representation of alignments.
+
+    Examples:
+        >>> # collection = AlignmentCollection([aln1, aln2, aln3])
+        >>> # best_hits = collection.filter_best_hits()
+        >>> # depth = collection.pileup("target1")
     """
 
     def __init__(self, alignments: Union[List[Alignment], HitTable]):
@@ -631,6 +660,12 @@ class KmerEncoder:
         k (int): K-mer size.
         alphabet (Alphabet): Sequence alphabet.
         dtype (type): Numpy data type for hashes (uint32 or uint64).
+
+    Examples:
+        >>> from baclib.seq import Alphabet, Record
+        >>> encoder = KmerEncoder(k=3, alphabet=Alphabet.dna())
+        >>> record = Record(Alphabet.dna().seq("ACGT"), id_="seq1")
+        >>> kmers = encoder.kmers(record)
     """
     _DEFAULT_ALPHABET = Alphabet.amino()
     def __init__(self, k: int = 7, alphabet: Alphabet = None):
@@ -697,6 +732,12 @@ class KmerIndex:
     Attributes:
         encoder (KmerEncoder): The encoder used for k-mer generation.
         pool (Executor): Thread pool for parallel processing.
+
+    Examples:
+        >>> # index = KmerIndex()
+        >>> # index.add(record1, record2)
+        >>> # index.make_sparse()
+        >>> # results = index.jaccard(query_record)
     """
     _TARGET_RESIDUES = 500_000
     _DEFAULT_ENCODER = KmerEncoder()
@@ -864,6 +905,13 @@ class KmerIndex:
 class PairwiseAligner:
     """
     Performs pairwise sequence alignment using Smith-Waterman or Needleman-Wunsch algorithms.
+
+    Examples:
+        >>> from baclib.seq import Alphabet
+        >>> aligner = PairwiseAligner(Alphabet.dna(), k=5)
+        >>> # aligner.add(target_record)
+        >>> # for aln in aligner.search(query_record):
+        >>> #     print(aln.score)
     """
     _MATRICES = {
         'blosum62': np.reshape([

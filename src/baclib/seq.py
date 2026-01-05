@@ -5,7 +5,6 @@ from copy import deepcopy
 from operator import attrgetter
 from bisect import bisect_left, bisect_right
 from typing import Literal, Iterator, Union, Any, Generator, Callable, Iterable
-from random import Random
 from hashlib import new
 from warnings import warn
 from collections.abc import MutableSequence
@@ -25,7 +24,16 @@ class TranslationWarning(BaclibWarning): pass
 
 # Classes --------------------------------------------------------------------------------------------------------------
 class CigarParser:
-    """Parses CIGAR strings into operations and lengths."""
+    """Parses CIGAR strings into operations and lengths.
+
+    Examples:
+        >>> parser = CigarParser()
+        >>> for op, length, q, t, aln in parser.parse("10M2D5M"):
+        ...     print(op, length)
+        M 10
+        D 2
+        M 5
+    """
     _OPS_REGEX = regex(r'(?P<n>[0-9]+)(?P<operation>[MIDNSHP=X])')
     _CONSUMES_QUERY = frozenset({"M", "I", "S", "=", "X"})
     _CONSUMES_TARGET = frozenset({"M", "D", "N", "=", "X"})
@@ -51,10 +59,26 @@ class CigarParser:
 
 
 class GeneticCode:
+    """
+    Represents a genetic code table for translation.
+
+    Attributes:
+        start_codons (set): A set of start codons.
+        stop_codons (set): A set of stop codons.
+        codons (dict): A dictionary mapping codons to amino acids.
+
+    Examples:
+        >>> code = GeneticCode(11)
+        >>> code.codons['ATG']
+        'M'
+        >>> 'TAA' in code.stop_codons
+        True
+    """
     _TABLES = {
         11: ('FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG',
              {'ATG', 'GTG', 'TTG', 'ATT', 'ATC', 'CTG'}, {'TAA', 'TAG', 'TGA'})
     }
+    _UNKNOWN_CHAR = 'X'
     _BASES = 'TCAG'
     __slots__ = ('start_codons', 'stop_codons', 'codons')
     def __init__(self, code: int):
@@ -63,10 +87,22 @@ class GeneticCode:
         self.stop_codons = {'TAA', 'TAG', 'TGA'}
         self.codons = dict(zip((a + b + c for a in self._BASES for b in self._BASES for c in self._BASES), table[0]))
 
+    def __getitem__(self, item: str) -> 'str': return self.codons.get(item, self._UNKNOWN_CHAR)
 
 class Alphabet:
     """
     A class to represent an alphabet of symbols.
+
+    Attributes:
+        symbols (str): The string of symbols in the alphabet.
+        set (frozenset): A frozenset of the symbols for fast lookups.
+        complement (dict): A translation table for complementing sequences.
+
+    Examples:
+        >>> dna_alphabet = Alphabet.dna()
+        >>> seq = dna_alphabet.seq("ATGC")
+        >>> print(seq.reverse_complement())
+        GCAT
     """
     _EXTENSIONS = {'gbk': 'dna', 'genbank': 'dna', 'fasta': 'dna', 'fna': 'dna', 'ffn': 'dna', 'ffa': 'dna',
                    'faa': 'amino'}  # Map fasta file extensions to alphabets
@@ -128,9 +164,9 @@ class Alphabet:
                 raise AlphabetError(f"Sequence contains more symbols ({sym}) than the alphabet ({self})")
         return _Seq(seq, self)
 
-    def generate_seq(self, rng: Random = None, length: int = None, min_len: int = 5, max_len: int = 5000, weights=None) -> str:
+    def random(self, rng: np.random.Generator = None, length: int = None, min_len: int = 5, max_len: int = 5000, weights=None) -> str:
         if rng is None: rng = RESOURCES.rng
-        return ''.join(rng.choices(self.symbols, k=length or rng.randint(min_len, max_len), weights=weights))
+        return ''.join(rng.choice(list(self.symbols), size=length or rng.integers(min_len, max_len), p=weights))
 
     def reverse_complement(self, seq: str) -> str:
         """Reverse complements the sequence if the alphabet has a complement"""
@@ -139,8 +175,15 @@ class Alphabet:
 
 class AminoAcidAlphabet(Alphabet):
     """
-    Child-class of Alphabet to represent the IUPAC unambiguous Amino Acid symbols ACDEFGHIKLMNPQRSTVWY,
-    and extra methods unique to Amino Acids.
+    Represents the IUPAC unambiguous Amino Acid symbols.
+
+    Inherits from Alphabet and provides methods unique to amino acids.
+
+    Examples:
+        >>> aa_alphabet = Alphabet.amino()
+        >>> protein_seq = aa_alphabet.seq("MKT*")
+        >>> print(protein_seq) # Stop symbol is removed by default
+        MKT
     """
 
     def __init__(self, hash_algorithm: str = 'md5', stop_symbol: str = '*'):
@@ -151,7 +194,16 @@ class AminoAcidAlphabet(Alphabet):
 
 class NucleotideAlphabet(Alphabet):
     """
-    Child-class of Alphabet to represent the IUPAC unambiguous DNA symbols TCAG, and extra methods unique to DNA.
+    Represents the IUPAC unambiguous DNA symbols TCAG.
+
+    Inherits from Alphabet and provides methods unique to DNA, like translation.
+
+    Examples:
+        >>> dna_alphabet = Alphabet.dna()
+        >>> dna_seq = dna_alphabet.seq("ATGGCCGCA")
+        >>> protein_seq = dna_alphabet.translate(dna_seq)
+        >>> print(protein_seq)
+        MAA
     """
     _CACHE = {}  # Cache for genetic code
     def __init__(self, hash_algorithm: str = 'sha1', genetic_code: int = 11):
@@ -185,6 +237,24 @@ class NucleotideAlphabet(Alphabet):
 
 
 class Interval:
+    """
+    Represents a genomic interval with start, end, and strand.
+
+    Attributes:
+        start (int): The start coordinate (0-based).
+        end (int): The end coordinate (0-based, exclusive).
+        strand (Literal[1, -1, 0]): The strand (1 for forward, -1 for reverse, 0 for unknown).
+
+    Examples:
+        >>> iv = Interval(10, 20, strand='+')
+        >>> print(len(iv))
+        10
+        >>> 15 in iv
+        True
+        >>> iv2 = Interval(15, 25)
+        >>> print(iv.overlap(iv2))
+        5
+    """
     __slots__ = ('start', 'end', 'strand')
     _AMBIGUOUS_SYMBOLS = {0, '0', '.', '?', None}
     _SENSE_SYMBOLS = {'+', '1', 1}
@@ -243,12 +313,12 @@ class Interval:
         return Interval(*_rc_interval(self.start, self.end, parent_length), self.strand * -1)
 
     @classmethod
-    def random(cls, rng: Random = None, length: int = None, min_len: int = 1, max_len: int = 10000,
+    def random(cls, rng: np.random.Generator = None, length: int = None, min_len: int = 1, max_len: int = 10000,
                min_start: int = 0, max_start: int = 1000000):
         if rng is None: rng = RESOURCES.rng
-        if not length: length = rng.randint(min_len, max_len)
-        start = rng.randint(min_start, max_start - length)
-        return cls(start, start + length, not not rng.getrandbits(1))
+        if not length: length = rng.integers(min_len, max_len)
+        start = rng.integers(min_start, max_start - length)
+        return cls(start, start + length, not not rng.choice([True, False]))
 
 
 class _Seq:
@@ -300,11 +370,16 @@ class _Seq:
 
 class Qualifier:
     """
-    Class to represent a qualifier as a key and value
+    Represents a key-value pair for annotating features.
 
     Attributes:
-        key: str
-        value: Any
+        key (str): The qualifier key (e.g., 'gene', 'product').
+        value (Any): The qualifier value.
+
+    Examples:
+        >>> q = Qualifier("gene", "blaKPC")
+        >>> print(q)
+        gene=blaKPC
     """
     def __init__(self, key: str, value: Any = None):
         self.key = key
@@ -320,7 +395,26 @@ class Qualifier:
 
 class Record:
     """
-    Represents a sequence record.
+    Represents a sequence record, such as a contig or chromosome.
+
+    It contains the sequence itself, an ID, description, and a list of features.
+
+    Attributes:
+        seq (_Seq): The sequence object.
+        id (str): The record identifier.
+        description (str): A description of the record.
+        qualifiers (list[Qualifier]): A list of record-level qualifiers.
+        features (FeatureList): A list of features associated with the record.
+
+    Examples:
+        >>> from baclib.seq import Alphabet, Record, Feature, Interval
+        >>> dna = Alphabet.dna()
+        >>> seq = dna.seq("ATGC" * 10)
+        >>> record = Record(seq, id_="my_contig")
+        >>> feature = Feature(Interval(5, 15), kind="CDS")
+        >>> record.add_features(feature)
+        >>> print(record.features)
+        [CDS(5:15(+))]
     """
     __slots__ = ('seq', 'id', 'description', 'qualifiers', '_features', '_interval_index', '_dirty_index')
 
@@ -465,20 +559,20 @@ class Record:
         self.seq = self.seq[:start] + self.seq[stop:]
         self._dirty_index = True  # Mark dirty
 
-    def shred(self, rng: Random = None, n_breaks: int = None, break_points: list[int] = None
+    def shred(self, rng: np.random.Generator = None, n_breaks: int = None, break_points: list[int] = None
               ) -> Generator['Record', None, None]:
         """
         Shreds the record into smaller records at the specified break points.
 
-        :param rng: Random number generator
+        :param rng: np.random.Generator number generator
         :param n_breaks: The number of breaks to make in the record. If not provided, a random number of breaks will be
             made between 1 and half the length of the record.
         :param break_points: A list of break points to use. If not provided, random break points will be generated.
         :return: A generator of smaller records
         """
         if rng is None: rng = RESOURCES.rng
-        if not n_breaks: n_breaks = rng.randint(1, len(self) // 2)
-        if not break_points: break_points = sorted([rng.randint(0, len(self)) for _ in range(n_breaks)])
+        if not n_breaks: n_breaks = rng.integers(1, len(self) // 2)
+        if not break_points: break_points = sorted([rng.integers(0, len(self)) for _ in range(n_breaks)])
         previous_end = 0
         for break_point in break_points:
             yield self[previous_end:break_point]
@@ -503,6 +597,22 @@ class Record:
 
 
 class Feature:
+    """
+    Represents a genomic feature, such as a gene or CDS.
+
+    Attributes:
+        interval (Interval): The genomic interval of the feature.
+        kind (str): The type of feature (e.g., 'CDS', 'gene', 'misc_feature').
+        qualifiers (list[Qualifier]): A list of qualifiers annotating the feature.
+
+    Examples:
+        >>> from baclib.seq import Interval, Feature, Qualifier
+        >>> interval = Interval(100, 400, strand='+')
+        >>> qualifiers = [Qualifier("gene", "gyrA")]
+        >>> feature = Feature(interval, kind="CDS", qualifiers=qualifiers)
+        >>> print(feature['gene'])
+        gyrA
+    """
     __slots__ = ('interval', 'kind', 'qualifiers')
     def __init__(self, interval: Interval, kind: str = 'misc_feature', qualifiers: list[Qualifier] = None):
         self.interval = interval
@@ -552,7 +662,19 @@ class Feature:
 
 
 class FeatureList(MutableSequence):
-    """A list that notifies a parent Record when modified."""
+    """
+    A list-like object that notifies a parent Record when it is modified.
+
+    This is used internally by the `Record` class to manage its features.
+    When the list is changed (e.g., by adding or removing a feature), it
+    flags the parent record's spatial index as "dirty" so it can be rebuilt.
+
+    Examples:
+        >>> # This class is used internally by Record.
+        >>> # record.features is an instance of FeatureList.
+        >>> # record.features.append(new_feature)
+        >>> # This automatically tells `record` to update its internal index.
+    """
     __slots__ = ('_data', '_parent')
 
     def __init__(self, parent: 'Record', features: Iterable['Feature'] = None):
@@ -586,8 +708,24 @@ class FeatureList(MutableSequence):
 
 class Mutation(Feature):
     """
-    Represents a specific change in sequence: SNP, Insertion, or Deletion.
-    Inherits from Feature to allow spatial indexing and overlap detection.
+    Represents a specific change in a sequence: SNP, Insertion, or Deletion.
+
+    Inherits from `Feature` to allow spatial indexing and overlap detection.
+
+    Attributes:
+        ref_seq (str): The reference sequence at the mutation site.
+        alt_seq (str): The alternate (mutated) sequence.
+        aa_ref (str): The reference amino acid (if applicable).
+        aa_alt (str): The alternate amino acid (if applicable).
+        aa_pos (int): The position of the amino acid change.
+        effect (str): The predicted effect (e.g., 'missense', 'synonymous').
+
+    Examples:
+        >>> from baclib.seq import Interval
+        >>> # A SNP from C to T at position 100
+        >>> snp = Mutation(Interval(100, 101), ref_seq='C', alt_seq='T')
+        >>> print(snp)
+        <Mutation 101:C>T>
     """
     __slots__ = ('ref_seq', 'alt_seq', 'aa_ref', 'aa_alt', 'aa_pos', 'effect')
     _CIGAR_PARSER = CigarParser()
@@ -752,6 +890,22 @@ class Mutation(Feature):
 
 
 class IntervalIndex:
+    """
+    A high-performance index for genomic intervals, powered by NumPy.
+
+    Provides fast operations like intersection, subtraction, merging, and padding.
+
+    Examples:
+        >>> from baclib.seq import Interval, IntervalIndex
+        >>> index1 = IntervalIndex(Interval(0, 10), Interval(20, 30))
+        >>> index2 = IntervalIndex(Interval(5, 15))
+        >>> intersection = index1.intersect(index2)
+        >>> for iv in intersection:
+        ...     print(iv)
+        5:10(+)
+        >>> print(intersection.coverage())
+        5
+    """
     __slots__ = ('_data',)
     _DTYPE = np.int32  # Consider int64 for interval coordinates to future-proof against large assemblies.
     def __init__(self, *intervals: Union[slice, int, Interval, 'Feature']):
@@ -936,8 +1090,16 @@ class IntervalIndex:
 
 class MotifFinder:
     """
-    A generic class for finding sequence motifs using Regular Expressions and
-    associating them with nearby features in a Record.
+    Finds sequence motifs using regular expressions.
+
+    Associates found motifs with nearby features in a Record.
+
+    Examples:
+        >>> from baclib.seq import Record, Alphabet
+        >>> record = Record(Alphabet.dna().seq("...TTGACAnnnnTATAAT..."), id_="p1")
+        >>> finder = MotifFinder("promoter", "TTGACA.{4}TATAAT")
+        >>> for motif, feature in finder.find(record):
+        ...     print(f"Found {motif} near {feature}")
     """
     _ALPHABET = Alphabet.dna()
     def __init__(
@@ -1031,7 +1193,16 @@ class MotifFinder:
 class PromoterFinder(MotifFinder):
     """
     Specialized MotifFinder for Sigma70 Bacterial Promoters.
+
     Matches the -35 and -10 boxes with variable spacing (15-21bp).
+
+    Examples:
+        >>> from baclib.seq import Record, Alphabet
+        >>> record = Record(Alphabet.dna().seq("...TTGACAnnnnnnnnnnnnnnnnnTATAAT..."), id_="p1")
+        >>> finder = PromoterFinder()
+        >>> for motif, _ in finder.find(record):
+        ...     print(motif.kind, motif.interval)
+        promoter 2:35(+)
     """
     # -35 box (TTGACA approx) ... 15-21bp spacer ... -10 box (TATAAT approx)
     # The regex allows for some degeneracy common in bacteria

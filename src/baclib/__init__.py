@@ -3,15 +3,19 @@ Top-level module, including resource and optional dependency management.
 """
 from functools import wraps, cached_property
 from importlib import import_module
-from importlib.metadata import metadata as load_metadata
+# from importlib.metadata import metadata as load_metadata
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-# from random import Random
-from numpy.random import default_rng as Random
+from numpy.random import default_rng
 import atexit
 import os
 from typing import Callable
 from warnings import warn
+try:
+    from ._version import __version__
+except ImportError:
+    # Fallback for when running directly from source without installation
+    __version__ = "unknown"
 
 
 # Exceptions and Warnings ----------------------------------------------------------------------------------------------
@@ -29,11 +33,11 @@ class Resources:
     # @cached_property
     # def data(self): return resources.files(self.package) / 'data'
 
-    @cached_property
-    def metadata(self): return load_metadata(self.package)
+    # @cached_property
+    # def metadata(self): return load_metadata(self.package)
 
     @cached_property
-    def rng(self): return Random()
+    def rng(self): return default_rng()
 
     @cached_property
     def available_cpus(self) -> int:

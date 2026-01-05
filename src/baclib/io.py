@@ -133,6 +133,15 @@ class PeekableHandle:
 class Xopen:
     """
     Handles the Physical Layer: Compression and File System.
+
+    Examples:
+        >>> # Automatically handles .gz extension for writing
+        >>> with Xopen("file.txt.gz", "wt") as f:
+        ...     f.write("hello")
+        >>>
+        >>> # Automatically detects compression for reading
+        >>> with Xopen("file.txt.gz", "rt") as f:
+        ...     content = f.read()
     """
     _MAGIC = {
         b'\x1f\x8b': 'gzip',
@@ -247,7 +256,16 @@ class Xopen:
 
 
 class QualifierParser:
-    """Parses qualifier strings from various file formats."""
+    """
+    Parses qualifier strings from various file formats.
+
+    Examples:
+        >>> parser = QualifierParser()
+        >>> gff_attrs = "ID=gene1;Name=foo"
+        >>> qualifiers = parser.parse_gff_attributes(gff_attrs)
+        >>> print(qualifiers[0].key, qualifiers[0].value)
+        ID gene1
+    """
     _TYPE_MAP = {'f': float, 'i': int, 'Z': str, 'A': str, 'H': str, 'B': str}
     _ABBREVIATIONS = {'dp': 'depth', 'ln': 'length', 'kc': 'kmer count'}
 
@@ -745,7 +763,21 @@ class GfaReader(BaseReader):
 
 class SeqFile:
     """
-    Main interface for reading sequence files. Automatically detects format and compression.
+    Main interface for reading sequence files.
+
+    Automatically detects file format (e.g., FASTA, GenBank, GFF) and
+    compression (e.g., gzip, bzip2), providing a single, unified way to
+    iterate over sequence data.
+
+    Examples:
+        >>> # Read a gzipped FASTA file
+        >>> with SeqFile("sequences.fasta.gz") as reader:
+        ...     for record in reader:
+        ...         print(f"Read record: {record.id}")
+
+        >>> # Force a format if sniffing fails
+        >>> with SeqFile("weird_file.txt", format_="fasta") as reader:
+        ...     # ...
     """
     _SUPPORTED_FORMATS = Literal['fasta', 'gfa', 'genbank', 'fastq', 'gff', 'bed', 'paf']
     _READERS = dict(zip(get_args(_SUPPORTED_FORMATS),
@@ -877,7 +909,16 @@ class BaseWriter(ABC):
 
 
 class FastaWriter(BaseWriter):
-    """Writer for FASTA format files."""
+    """
+    Writer for FASTA format files.
+
+    Examples:
+        >>> from baclib.seq import Record, Alphabet
+        >>> record1 = Record(Alphabet.dna().seq("ACGT"), id_="seq1")
+        >>> record2 = Record(Alphabet.dna().seq("TTGG"), id_="seq2")
+        >>> with FastaWriter("output.fasta") as writer:
+        ...     writer.write(record1, record2)
+    """
 
     def __init__(self, file: Union[str, Path, IO], width: int = 60, **kwargs):
         """
@@ -909,7 +950,18 @@ class FastaWriter(BaseWriter):
 
 
 class GfaWriter(BaseWriter):
-    """Writer for GFA format files."""
+    """
+    Writer for GFA format files.
+
+    Examples:
+        >>> from baclib.seq import Record, Alphabet
+        >>> from baclib.graph import Edge
+        >>> seg1 = Record(Alphabet.dna().seq("ACGT"), id_="seg1")
+        >>> seg2 = Record(Alphabet.dna().seq("TTGG"), id_="seg2")
+        >>> link = Edge(seg1, seg2, attributes={"cigar": "4M"})
+        >>> with GfaWriter("assembly.gfa") as writer:
+        ...     writer.write(seg1, seg2, link)
+    """
 
     def write_one(self, item: Union[Record, Edge]):
         """
@@ -921,13 +973,23 @@ class GfaWriter(BaseWriter):
         if isinstance(item, Record):
             self._handle.write(format(item, 'gfa'))
         elif isinstance(item, Edge):
-            cigar = item.data.get('cigar', '0M')
-            self._handle.write(f"L\t{item.u}\t{item.data.get('u_strand', '+')}\t"
-                               f"{item.v}\t{item.data.get('v_strand', '+')}\t{cigar}\n")
+            cigar = item.attributes.get('cigar', '0M')
+            self._handle.write(f"L\t{item.u}\t{item.attributes.get('u_strand', '+')}\t"
+                               f"{item.v}\t{item.attributes.get('v_strand', '+')}\t{cigar}\n")
 
 
 class GffWriter(BaseWriter):
-    """Writer for GFF3 format files."""
+    """
+    Writer for GFF3 format files.
+
+    Examples:
+        >>> from baclib.seq import Record, Alphabet, Feature, Interval
+        >>> record = Record(Alphabet.dna().seq("A" * 1000), id_="contig1")
+        >>> feature = Feature(Interval(100, 200), kind="CDS")
+        >>> record.add_features(feature)
+        >>> with GffWriter("annotations.gff") as writer:
+        ...     writer.write(record)
+    """
 
     def write_header(self):
         """Writes the GFF3 header."""
@@ -973,7 +1035,17 @@ class GffWriter(BaseWriter):
 
 
 class BedWriter(BaseWriter):
-    """Writer for BED format files."""
+    """
+    Writer for BED format files.
+
+    Examples:
+        >>> from baclib.seq import Record, Alphabet, Feature, Interval
+        >>> record = Record(Alphabet.dna().seq("A" * 1000), id_="contig1")
+        >>> feature = Feature(Interval(300, 400), kind="gene")
+        >>> record.add_features(feature)
+        >>> with BedWriter("regions.bed") as writer:
+        ...     writer.write(record)
+    """
 
     def write_one(self, record: Record):
         """

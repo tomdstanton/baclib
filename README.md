@@ -86,7 +86,7 @@ dna = Alphabet.dna()
 seq = dna.seq("ATGCGTAGCTAG")
 
 # Or generate a random seq
-seq = dna.seq(dna.generate_seq())
+seq = dna.seq(dna.random())
 
 # Reverse complement
 # Note: Returns a new Seq object
@@ -106,12 +106,11 @@ Perform local (Smith-Waterman), global (Needleman-Wunsch) or glocal alignment.
 from baclib.alignment import PairwiseAligner
 from baclib.seq import Alphabet, Record
 
-
 dna = Alphabet.dna()
 aligner = PairwiseAligner(dna, k=5, flavour='local', compute_traceback=True)
 
-target = Record(dna.seq(dna.generate_seq(length=1000)), "target")
-query = Record(dna.seq(dna.generate_seq(length=100)), "query")
+target = Record(dna.seq(dna.random(length=1000)), "target")
+query = Record(dna.seq(dna.random(length=100)), "query")
 
 # Add targets to the index
 if alignment := aligner.align(query, target):
@@ -129,8 +128,8 @@ from baclib.seq import Record, Alphabet
 
 # Generate random records
 dna = Alphabet.dna()
-ref = Record(dna.seq(dna.generate_seq(length=1000)), "ref")
-query = Record(dna.seq(dna.generate_seq(length=100)), "query")
+ref = Record(dna.seq(dna.random(length=1000)), "ref")
+query = Record(dna.seq(dna.random(length=100)), "query")
 
 # Align using Minimap2 wrapper (handles indexing automatically)
 with Minimap2(ref) as mapper:

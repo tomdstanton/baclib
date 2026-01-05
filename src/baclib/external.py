@@ -25,7 +25,20 @@ class Minimap2Error(ExternalProgramError): pass
 class ExternalProgram:
     """
     Base class to handle an external program to be executed in subprocesses.
-    Optimized to avoid shell=True and handle streaming.
+
+    This class provides a robust way to run external command-line tools,
+    handling process creation, streaming I/O, and error reporting. It is
+    optimized to avoid using `shell=True` for security and performance.
+
+    Examples:
+        >>> # This is a base class and is not typically used directly.
+        >>> # See Minimap2 or FragGeneScanRs for usage examples.
+        >>> class MyTool(ExternalProgram):
+        ...     def __init__(self):
+        ...         super().__init__("my_tool_name")
+        ...
+        ...     def get_version(self):
+        ...         return self.run(["--version"])[0].strip()
     """
     def __init__(self, program: str):
         if not (binary := next(find_executable_binaries(program), None)):
@@ -162,6 +175,28 @@ class Minimap2AlignConfig(Config):
 
 
 class Minimap2(ExternalProgram):
+    """
+    A wrapper for the external program Minimap2.
+
+    This class handles building indices and running alignments by streaming
+    `baclib.Record` objects to and from the Minimap2 subprocess, avoiding
+    the need to write intermediate files to disk.
+
+    Requires `minimap2` to be in the system's PATH.
+
+    Examples:
+        >>> from baclib.seq import Record, Alphabet
+        >>> from baclib.external import Minimap2
+        >>>
+        >>> target = Record(Alphabet.dna().seq("AGCT" * 100), id_="target_contig")
+        >>> query = Record(Alphabet.dna().seq("AGCT" * 10), id_="query_read")
+        >>>
+        >>> # Align a query against a target
+        >>> with Minimap2(target) as mapper:
+        ...     for alignment in mapper.align(query):
+        ...         print(f"{alignment.query} -> {alignment.target} with score {alignment.score}")
+
+    """
     _ALPHABET = Alphabet.dna()
     _DEFAULT_ALIGN_CONFIG = Minimap2AlignConfig()
     _DEFAULT_INDEX_CONFIG = Minimap2IndexConfig()
@@ -256,6 +291,29 @@ class FragGeneScanRsError(ExternalProgramError): pass
 
 
 class FragGeneScanRs(ExternalProgram):
+    """
+    A wrapper for the external program FragGeneScanRs for gene prediction.
+
+    Streams sequence records to the FragGeneScanRs subprocess and parses
+    the predicted protein sequences, adding them as features to the original
+    nucleotide records.
+
+    Requires `FragGeneScanRs` to be in the system's PATH.
+
+    Examples:
+        >>> from baclib.seq import Record, Alphabet
+        >>> from baclib.external import FragGeneScanRs
+        >>>
+        >>> contig = Record(Alphabet.dna().seq("ATG...TAA"), id_="contig1")
+        >>> fgs = FragGeneScanRs()
+        >>>
+        >>> # predict() returns the predicted protein records
+        >>> predicted_proteins = list(fgs.predict(contig))
+        >>>
+        >>> # The original contig record is updated with features
+        >>> for feature in contig.features:
+        ...     print(f"Found CDS at {feature.interval}")
+    """
     _ALPHABET = Alphabet.amino()
     _DEFAULT_CONFIG = FragGeneScanRsConfig()
 
