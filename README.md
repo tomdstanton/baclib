@@ -1,5 +1,16 @@
 # baclib
 
+[![License](https://img.shields.io/badge/license-GPLv3-blue.svg?style=flat-square&maxAge=2678400)](https://choosealicense.com/licenses/gpl-3.0/)
+[![PyPI](https://img.shields.io/pypi/v/baclib.svg?style=flat-square&maxAge=3600&logo=PyPI)](https://pypi.org/project/baclib)
+[![Wheel](https://img.shields.io/pypi/wheel/baclib.svg?style=flat-square&maxAge=3600)](https://pypi.org/project/baclib/#files)
+[![Source](https://img.shields.io/badge/source-GitHub-303030.svg?maxAge=2678400&style=flat-square)](https://github.com/tomdstanton/baclib/)
+[![Issues](https://img.shields.io/github/issues/tomdstanton/baclib.svg?style=flat-square&maxAge=600)](https://github.com/tomdstanton/baclib/issues)
+[![pages-build-deployment](https://github.com/tomdstanton/baclib/actions/workflows/docs.yml/badge.svg?style=flat-square)](https://github.com/tomdstanton/baclib/actions/workflows/docs.yml)
+[![Changelog](https://img.shields.io/badge/keep%20a-changelog-8A0707.svg?maxAge=2678400&style=flat-square)](https://github.com/tomdstanton/baclib/blob/main/CHANGELOG.md)
+
+> [!WARNING]
+> 🚧 This package is currently under construction, proceed with caution 🚧
+
 **Lightweight Python Library for Bacterial Genomics**
 
 `baclib` is a high-performance, modern Python library designed for bioinformatics and bacterial genomics. 
