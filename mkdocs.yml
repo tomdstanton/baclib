@@ -7,7 +7,6 @@ watch: [mkdocs.yml, README.md, src]
 
 nav:
   - Home: index.md
-  - Web App: app.md
 
 theme:
   name: "material"
@@ -37,7 +36,7 @@ plugins:
   - mkdocstrings:
       handlers:
         python:
-          import:
+          imports:
             - https://docs.python.org/3/objects.inv
           options:
             docstring_style: "google"
