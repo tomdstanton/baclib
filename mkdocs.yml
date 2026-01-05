@@ -36,7 +36,7 @@ plugins:
   - mkdocstrings:
       handlers:
         python:
-          imports:
+          import:
             - https://docs.python.org/3/objects.inv
           options:
             docstring_style: "google"
