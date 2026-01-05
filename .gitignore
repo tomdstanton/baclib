@@ -211,3 +211,4 @@ __marimo__/
 
 # Folder view configuration files
 .DS_Store
+uv.lock
