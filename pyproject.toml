@@ -6,6 +6,11 @@ readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.11"
 dependencies = ["numpy", "scipy"]
 dynamic = ["version"]
+urls = [
+    {Homepage = "https://tomdstanton.github.io/baclib/"},
+    {Repository = "https://github.com/tomdstanton/baclib.git"},
+    {Documentation = "https://tomdstanton.github.io/baclib/"}
+]
 keywords = ["bioinformatics", "microbiology", "genomics"]
 license = {file = "LICENSE"}
 classifiers = [

@@ -1,5 +1,10 @@
 """
 Module for aligning sequences and managing alignments.
+
+This module provides classes and functions for performing pairwise sequence alignments,
+managing collections of alignments, and calculating sequence similarities using
+k-mer based approaches. It supports local (Smith-Waterman), global (Needleman-Wunsch),
+and glocal alignment strategies.
 """
 from typing import Generator, Union, Optional, List, Dict, Literal
 from concurrent.futures import Executor
@@ -17,23 +22,34 @@ from .graph import Graph, Edge, WeightingPolicy
 class Hit:
     """
     Intermediate representation of a similarity event.
+
     Lighter than an Alignment (no sequence/CIGAR), heavier than a tuple.
+    Used primarily for storing raw alignment results before full object construction.
+
+    Attributes:
+        query (str): The ID of the query sequence.
+        target (str): The ID of the target sequence.
+        score (float): The alignment score.
+        q_start (int): The start position on the query sequence (0-based).
+        q_end (int): The end position on the query sequence (0-based, exclusive).
+        t_start (int): The start position on the target sequence (0-based).
+        t_end (int): The end position on the target sequence (0-based, exclusive).
     """
     __slots__ = ('query', 'target', 'score', 'q_start', 'q_end', 't_start', 't_end')
 
     def __init__(self, query: str, target: str, score: float,
                  q_start: int = -1, q_end: int = -1, t_start: int = -1, t_end: int = -1):
         """
-        Initializes a Hit.
+        Initializes a Hit object.
 
         Args:
-            query: Query sequence ID.
-            target: Target sequence ID.
-            score: Alignment score.
-            q_start: Query start position.
-            q_end: Query end position.
-            t_start: Target start position.
-            t_end: Target end position.
+            query (str): Query sequence ID.
+            target (str): Target sequence ID.
+            score (float): Alignment score.
+            q_start (int, optional): Query start position. Defaults to -1.
+            q_end (int, optional): Query end position. Defaults to -1.
+            t_start (int, optional): Target start position. Defaults to -1.
+            t_end (int, optional): Target end position. Defaults to -1.
         """
         self.query = query
         self.target = target
@@ -50,7 +66,15 @@ class Hit:
 
 class HitTable:
     """
-    A unified, high-performance container for alignment hits (Jaccard or SW).
+    A unified, high-performance container for alignment hits.
+
+    Can store results from Jaccard similarity searches or Smith-Waterman alignments.
+    Uses structured NumPy arrays for memory efficiency.
+
+    Attributes:
+        query_ids (List[str]): List of unique query IDs.
+        target_ids (List[str]): List of unique target IDs.
+        data (np.ndarray): Structured array containing hit data.
     """
     __slots__ = ('_data', '_count', 'query_ids', 'target_ids', '_q_map', '_t_map')
     _HIT_DTYPE = np.dtype([
@@ -65,7 +89,7 @@ class HitTable:
         Initializes a HitTable.
 
         Args:
-            size: Initial size of the data array.
+            size (int, optional): Initial size of the data array. Defaults to 0.
         """
         self._data = np.zeros(size, dtype=self._HIT_DTYPE)
         self._count = 0
@@ -95,11 +119,11 @@ class HitTable:
         Low-level appender using pre-calculated indices.
 
         Args:
-            q_idx: Query index.
-            t_idx: Target index.
-            score: Alignment score.
-            q_interval: Tuple of (start, end) for query.
-            t_interval: Tuple of (start, end) for target.
+            q_idx (int): Index of the query ID.
+            t_idx (int): Index of the target ID.
+            score (float): Alignment score.
+            q_interval (tuple, optional): Tuple of (start, end) for query.
+            t_interval (tuple, optional): Tuple of (start, end) for target.
         """
         if self._count >= len(self._data):
             new_size = max(1024, len(self._data) * 2)
@@ -124,7 +148,7 @@ class HitTable:
         High-level appender for Hit objects.
 
         Args:
-            hit: The Hit object to add.
+            hit (Hit): The Hit object to add.
         """
         q_idx = self._get_or_add_id(hit.query, is_query=True)
         t_idx = self._get_or_add_id(hit.target, is_query=False)
@@ -140,7 +164,7 @@ class HitTable:
         Converts hits in the table to Alignment objects.
 
         Yields:
-            Alignment objects.
+            Alignment: Alignment objects constructed from the table data.
         """
         valid_rows = self.data
         for r in valid_rows:
@@ -158,6 +182,12 @@ class HitTable:
 class JaccardResult:
     """
     Stores the results of a Jaccard similarity search.
+
+    Attributes:
+        query_ids (np.ndarray): Array of query IDs.
+        target_ids (np.ndarray): Array of target IDs.
+        matrix (csr_matrix): Sparse matrix of Jaccard scores.
+        encoded_queries (dict): Dictionary of encoded query sequences.
     """
     __slots__ = ('query_ids', 'target_ids', 'matrix', 'encoded_queries', '_q_map')
 
@@ -167,10 +197,10 @@ class JaccardResult:
         Initializes a JaccardResult.
 
         Args:
-            query_ids: Array of query IDs.
-            target_ids: Array of target IDs.
-            matrix: Sparse matrix of Jaccard scores.
-            encoded_queries: Dictionary of encoded query sequences.
+            query_ids (np.ndarray): Array of query IDs.
+            target_ids (np.ndarray): Array of target IDs.
+            matrix (csr_matrix): Sparse matrix of Jaccard scores.
+            encoded_queries (dict, optional): Dictionary of encoded query sequences.
         """
         self.query_ids = query_ids
         self.target_ids = target_ids
@@ -183,10 +213,10 @@ class JaccardResult:
         Retrieves hits for a specific query.
 
         Args:
-            query_id: The query ID.
+            query_id (str): The query ID.
 
         Returns:
-            A tuple of (target_ids, scores).
+            tuple[np.ndarray, np.ndarray]: A tuple containing an array of target IDs and an array of scores.
         """
         row_idx = self._q_map.get(query_id)
         if row_idx is None: return np.array([]), np.array([])
@@ -196,19 +226,28 @@ class JaccardResult:
         return self.target_ids[self.matrix.indices[start_ptr:end_ptr]], self.matrix.data[start_ptr:end_ptr]
 
     def get_encoded_query(self, query_id: str) -> Optional[np.ndarray]:
-        """Returns the encoded sequence for a query ID."""
+        """
+        Returns the encoded sequence for a query ID.
+
+        Args:
+            query_id (str): The query ID.
+
+        Returns:
+            Optional[np.ndarray]: The encoded sequence, or None if not found.
+        """
         return self.encoded_queries.get(query_id)
 
     def to_hit_table(self, min_score: float = 0.0) -> HitTable:
         """
         Converts Jaccard sparse matrix to a dense HitTable.
+
         Useful for feeding Jaccard results into an AlignmentCollection.
 
         Args:
-            min_score: Minimum score threshold.
+            min_score (float, optional): Minimum score threshold. Defaults to 0.0.
 
         Returns:
-            A HitTable object.
+            HitTable: A HitTable object populated with the Jaccard results.
         """
         # Estimate size (number of non-zeros)
         nnz = self.matrix.getnnz()
@@ -234,7 +273,15 @@ class JaccardResult:
         return table
 
     def __getitem__(self, query_id: str) -> dict[str, float]:
-        """Convenience access: result['geneA'] -> {'contig1': 0.5}"""
+        """
+        Convenience access: result['geneA'] -> {'contig1': 0.5}.
+
+        Args:
+            query_id (str): The query ID.
+
+        Returns:
+            dict[str, float]: A dictionary mapping target IDs to scores.
+        """
         targets, scores = self.get_hits(query_id)
         if len(targets) == 0: return {}
         return dict(zip(targets, scores))
@@ -242,7 +289,11 @@ class JaccardResult:
     def __iter__(self) -> Generator[tuple[str, dict[str, float]], None, None]:
         """
         Yields (query_id, hits_dict) one by one.
+
         Memory efficient: does not materialize the whole table.
+
+        Yields:
+            tuple[str, dict[str, float]]: A tuple of query ID and a dictionary of hits.
         """
         # Iterate only over rows (queries) that have hits
         for row_idx in np.flatnonzero(self.matrix.getnnz(axis=1)):
@@ -259,10 +310,10 @@ class JaccardResult:
         Returns (target_indices, scores) directly, skipping string conversion.
 
         Args:
-            query_id: The query ID.
+            query_id (str): The query ID.
 
         Returns:
-            A tuple of (target_indices, scores).
+            tuple[np.ndarray, np.ndarray]: A tuple of target indices and scores.
         """
         row_idx = self._q_map.get(query_id)
         if row_idx is None: return np.array([], dtype=np.uint32), np.array([], dtype=np.float32)
@@ -280,6 +331,21 @@ class JaccardResult:
 class Alignment(Feature):
     """
     Represents a pairwise sequence alignment.
+
+    Inherits from Feature to allow spatial indexing and overlap detection.
+
+    Attributes:
+        query (str): Query sequence ID.
+        query_interval (Interval): Interval on the query sequence.
+        target (str): Target sequence ID.
+        interval (Interval): Interval on the target sequence.
+        query_length (int): Total length of the query sequence.
+        target_length (int): Total length of the target sequence.
+        length (int): Alignment block length.
+        cigar (str): CIGAR string representing the alignment.
+        score (float): Alignment score.
+        n_matches (int): Number of matching bases.
+        quality (int): Mapping quality.
     """
     __slots__ = (
         'query', 'query_interval', 'query_length', 'target', 'target_length', 'length', 'cigar', 'score',
@@ -294,18 +360,18 @@ class Alignment(Feature):
         Initializes an Alignment.
 
         Args:
-            query: Query sequence ID.
-            query_interval: Interval on the query sequence.
-            target: Target sequence ID.
-            interval: Interval on the target sequence.
-            query_length: Total length of the query sequence.
-            target_length: Total length of the target sequence.
-            length: Alignment block length.
-            cigar: CIGAR string.
-            n_matches: Number of matching bases.
-            quality: Mapping quality.
-            qualifiers: List of qualifiers.
-            score: Alignment score.
+            query (str): Query sequence ID.
+            query_interval (Interval): Interval on the query sequence.
+            target (str): Target sequence ID.
+            interval (Interval): Interval on the target sequence.
+            query_length (int, optional): Total length of the query sequence. Defaults to 0.
+            target_length (int, optional): Total length of the target sequence. Defaults to 0.
+            length (int, optional): Alignment block length. Defaults to 0.
+            cigar (str, optional): CIGAR string. Defaults to None.
+            n_matches (int, optional): Number of matching bases. Defaults to 0.
+            quality (int, optional): Mapping quality. Defaults to 0.
+            qualifiers (list[Qualifier], optional): List of qualifiers. Defaults to None.
+            score (float, optional): Alignment score. Defaults to 0.
         """
         super().__init__(interval, kind='Alignment', qualifiers=qualifiers)
         self.query = str(query)
@@ -320,17 +386,32 @@ class Alignment(Feature):
         self.quality = quality
 
     def query_coverage(self) -> float:
-        """Returns the fraction of the query sequence covered by the alignment."""
+        """
+        Returns the fraction of the query sequence covered by the alignment.
+
+        Returns:
+            float: Coverage fraction (0.0 to 1.0).
+        """
         if self.query_length > 0: return len(self.query_interval) / self.query_length
         return 0.0
 
     def target_coverage(self) -> float:
-        """Returns the fraction of the target sequence covered by the alignment."""
+        """
+        Returns the fraction of the target sequence covered by the alignment.
+
+        Returns:
+            float: Coverage fraction (0.0 to 1.0).
+        """
         if self.target_length > 0: return len(self.interval) / self.target_length
         return 0.0
 
     def identity(self) -> float:
-        """Returns the sequence identity (matches / alignment length)."""
+        """
+        Returns the sequence identity (matches / alignment length).
+
+        Returns:
+            float: Identity fraction (0.0 to 1.0).
+        """
         if self.length > 0: return self.n_matches / self.length
         return 0.0
 
@@ -340,10 +421,10 @@ class Alignment(Feature):
         Factory to upgrade a Hit to an Alignment.
 
         Args:
-            hit: The Hit object.
+            hit (Hit): The Hit object.
 
         Returns:
-            An Alignment object.
+            Alignment: An Alignment object created from the Hit.
         """
         # Note: Hits from SW Score or Jaccard usually lack start coords or cigar
         # We create best-effort intervals.
@@ -355,7 +436,12 @@ class Alignment(Feature):
         return cls(hit.query, Interval(q_start, q_end), hit.target, Interval(t_start, t_end), score=hit.score)
 
     def flip(self) -> 'Alignment':
-        """Flips the query and the target."""
+        """
+        Flips the query and the target.
+
+        Returns:
+            Alignment: A new Alignment object with query and target swapped.
+        """
         return Alignment(
             query=self.target,
             query_interval=self.interval,
@@ -378,9 +464,13 @@ class Alignment(Feature):
 class AlignmentCollection:
     """
     A high-performance container for large sets of Alignments.
+
     Hybrid Architecture:
     1. Topology View (Graph): Fast 'Best Hit', 'Reciprocal Best', and 'Connectivity' operations.
     2. Geometry View (IntervalIndex): Fast 'Overlap', 'Pileup', and 'Depth' operations per target.
+
+    Attributes:
+        graph (Graph): Graph representation of alignments.
     """
 
     def __init__(self, alignments: Union[List[Alignment], HitTable]):
@@ -388,7 +478,7 @@ class AlignmentCollection:
         Initializes an AlignmentCollection.
 
         Args:
-            alignments: List of Alignment objects or a HitTable.
+            alignments (Union[List[Alignment], HitTable]): List of Alignment objects or a HitTable.
         """
         if isinstance(alignments, HitTable): self._master_list = list(alignments.to_alignments())
         else: self._master_list = alignments
@@ -418,10 +508,10 @@ class AlignmentCollection:
         Filters to keep only the best hit for each query.
 
         Args:
-            policy: WeightingPolicy to determine 'best'.
+            policy (WeightingPolicy, optional): WeightingPolicy to determine 'best'. Defaults to max weight.
 
         Returns:
-            A new AlignmentCollection.
+            AlignmentCollection: A new AlignmentCollection containing only the best hits.
         """
         if policy is None: policy = WeightingPolicy(attr='weight', aggregator='max')
         matrix = self.graph.get_matrix(policy)
@@ -436,10 +526,10 @@ class AlignmentCollection:
         Retains the Best Hit for each TARGET (e.g., identifying the best gene for each contig).
 
         Args:
-            policy: WeightingPolicy to determine 'best'.
+            policy (WeightingPolicy, optional): WeightingPolicy to determine 'best'. Defaults to max weight.
 
         Returns:
-            A new AlignmentCollection.
+            AlignmentCollection: A new AlignmentCollection containing only the best hits per target.
         """
         if policy is None: policy = WeightingPolicy(attr='weight', aggregator='max')
         # Get the matrix (Rows=Query, Cols=Target)
@@ -467,11 +557,11 @@ class AlignmentCollection:
         Calculates coverage depth across the target sequence.
 
         Args:
-            target_id: The target sequence ID.
-            length: Length of the target sequence (optional).
+            target_id (str): The target sequence ID.
+            length (int, optional): Length of the target sequence. Defaults to max interval end.
 
         Returns:
-            A numpy array of depths.
+            np.ndarray: A numpy array of depths.
         """
         idx = self._get_spatial_index(target_id)
         if len(idx) == 0: return np.zeros(length or 0, dtype=np.int32)
@@ -488,11 +578,11 @@ class AlignmentCollection:
         Merges overlapping intervals on a target.
 
         Args:
-            target_id: The target sequence ID.
-            tolerance: Gap tolerance for merging.
+            target_id (str): The target sequence ID.
+            tolerance (int, optional): Gap tolerance for merging. Defaults to 0.
 
         Returns:
-            An IntervalIndex of merged intervals.
+            IntervalIndex: An IntervalIndex of merged intervals.
         """
         return self._get_spatial_index(target_id).merge(tolerance=tolerance)
 
@@ -501,11 +591,11 @@ class AlignmentCollection:
         Greedily removes alignments that overlap with higher-scoring alignments on the same target.
 
         Args:
-            max_overlap_fraction: Maximum allowed overlap fraction.
-            key: Attribute to use for sorting (default: 'score').
+            max_overlap_fraction (float, optional): Maximum allowed overlap fraction. Defaults to 0.1.
+            key (str, optional): Attribute to use for sorting. Defaults to 'score'.
 
         Returns:
-            A new AlignmentCollection.
+            AlignmentCollection: A new filtered AlignmentCollection.
         """
         kept_indices = []
         # Optimization: Process each target independently to avoid N^2 checks across the whole list
@@ -534,15 +624,22 @@ class AlignmentCollection:
 
 
 class KmerEncoder:
-    """Encodes sequences into k-mer hashes."""
+    """
+    Encodes sequences into k-mer hashes.
+
+    Attributes:
+        k (int): K-mer size.
+        alphabet (Alphabet): Sequence alphabet.
+        dtype (type): Numpy data type for hashes (uint32 or uint64).
+    """
     _DEFAULT_ALPHABET = Alphabet.amino()
     def __init__(self, k: int = 7, alphabet: Alphabet = None):
         """
         Initializes the KmerEncoder.
 
         Args:
-            k: K-mer size.
-            alphabet: Alphabet to use.
+            k (int, optional): K-mer size. Defaults to 7.
+            alphabet (Alphabet, optional): Alphabet to use. Defaults to Amino Acid.
         """
         self.k: int = k
         self.alphabet: Alphabet = alphabet or self._DEFAULT_ALPHABET
@@ -563,10 +660,14 @@ class KmerEncoder:
         Encodes a record's sequence into integer representation.
 
         Args:
-            record: The Record object.
+            record (Record): The Record object.
 
         Returns:
-            Numpy array of encoded symbols.
+            np.ndarray: Numpy array of encoded symbols.
+
+        Raises:
+            AlphabetError: If the record's alphabet does not match the encoder's.
+            ValueError: If the record contains non-ASCII characters.
         """
         if record.seq.alphabet != self.alphabet:
             raise AlphabetError(f"Seq alphabet is {record.seq.alphabet}, not {self.alphabet}")
@@ -580,10 +681,10 @@ class KmerEncoder:
         Generates k-mer hashes for a record.
 
         Args:
-            record: Record object or encoded sequence array.
+            record (Union[Record, np.ndarray]): Record object or encoded sequence array.
 
         Returns:
-            Numpy array of k-mer hashes.
+            np.ndarray: Numpy array of k-mer hashes.
         """
         if isinstance(record, Record): record = self.encode(record)
         return _rolling_hash_kernel(record, self.k, self._bits_per_symbol, self.mask, self.dtype)
@@ -592,6 +693,10 @@ class KmerEncoder:
 class KmerIndex:
     """
     Index for fast k-mer based sequence search.
+
+    Attributes:
+        encoder (KmerEncoder): The encoder used for k-mer generation.
+        pool (Executor): Thread pool for parallel processing.
     """
     _TARGET_RESIDUES = 500_000
     _DEFAULT_ENCODER = KmerEncoder()
@@ -600,8 +705,8 @@ class KmerIndex:
         Initializes the KmerIndex.
 
         Args:
-            encoder: KmerEncoder instance.
-            pool: Executor for parallel processing.
+            encoder (KmerEncoder, optional): KmerEncoder instance. Defaults to default encoder.
+            pool (Executor, optional): Executor for parallel processing. Defaults to global pool.
         """
         self.encoder: KmerEncoder = encoder or self._DEFAULT_ENCODER
         self._records: list[str] = []
@@ -632,10 +737,13 @@ class KmerIndex:
         Adds records to the index.
 
         Args:
-            *records: Record objects to add.
+            *records (Record): Record objects to add.
 
         Returns:
-            List of added records.
+            list[Record]: List of added records.
+
+        Raises:
+            RuntimeError: If the index is already finalized (sparse).
         """
         if self.is_sparse: raise RuntimeError("Cannot add to a Sparse (frozen) index.")
         self._matrix = None
@@ -691,10 +799,11 @@ class KmerIndex:
         Encodes a batch of records and maps them to the index vocabulary.
 
         Args:
-            *records: Records to encode.
+            *records (Record): Records to encode.
 
         Returns:
-            Tuple of (ids, sparse_matrix, encoded_map).
+            tuple[np.ndarray, Optional[csr_matrix], dict[str, np.ndarray]]:
+                Tuple of (ids, sparse_matrix, encoded_map).
         """
         if not (records := list(records)): return np.array([]), None, {}
         self._build()
@@ -721,15 +830,16 @@ class KmerIndex:
 
     def jaccard(self, *queries: Record, against_self: bool = False) -> JaccardResult:
         """
-        Calculate the Jaccard similarity between queries and the index. If against_self is true, then
-        the queries become the index itself.
+        Calculate the Jaccard similarity between queries and the index.
+
+        If against_self is true, then the queries become the index itself.
 
         Args:
-            *queries: Query records.
-            against_self: If True, compares index against itself.
+            *queries (Record): Query records.
+            against_self (bool, optional): If True, compares index against itself. Defaults to False.
 
         Returns:
-            JaccardResult object.
+            JaccardResult: JaccardResult object containing similarity scores.
         """
         self._build()
         if against_self:  # 1. Self-Comparison Optimization
@@ -793,17 +903,17 @@ class PairwiseAligner:
         Initializes the PairwiseAligner.
 
         Args:
-            alphabet: Sequence alphabet.
-            k: K-mer size for seeding.
-            flavour: Alignment type ('local', 'global', 'glocal').
-            min_similarity: Minimum Jaccard similarity to trigger alignment.
-            compute_traceback: Whether to compute CIGAR strings.
-            matrix: Substitution matrix name (e.g., 'blosum62').
-            match: Match score.
-            mismatch: Mismatch penalty.
-            gap_open: Gap open penalty.
-            gap_extend: Gap extension penalty.
-            band_padding: Padding for the alignment band.
+            alphabet (Alphabet): Sequence alphabet.
+            k (int): K-mer size for seeding.
+            flavour (Literal['local', 'global', 'glocal'], optional): Alignment type. Defaults to 'local'.
+            min_similarity (float, optional): Minimum Jaccard similarity to trigger alignment. Defaults to 0.0.
+            compute_traceback (bool, optional): Whether to compute CIGAR strings. Defaults to True.
+            matrix (Literal['blosum62'], optional): Substitution matrix name. Defaults to None.
+            match (int, optional): Match score. Defaults to None.
+            mismatch (int, optional): Mismatch penalty. Defaults to None.
+            gap_open (int, optional): Gap open penalty. Defaults to None.
+            gap_extend (int, optional): Gap extension penalty. Defaults to None.
+            band_padding (int, optional): Padding for the alignment band. Defaults to None.
         """
         self._index = KmerIndex(KmerEncoder(k, alphabet))
         self._records: list[np.ndarray] = []
@@ -836,7 +946,7 @@ class PairwiseAligner:
         Adds records to the aligner's index.
 
         Args:
-            *records: Record objects to add.
+            *records (Record): Record objects to add.
         """
         to_add = []
         existing_ids = set(self._index.records)
@@ -855,12 +965,12 @@ class PairwiseAligner:
         Searches for alignments between queries and indexed records.
 
         Args:
-            *queries: Query records.
-            jaccard_result: Pre-computed Jaccard results (optional).
-            against_self: If True, aligns index against itself.
+            *queries (Record): Query records.
+            jaccard_result (JaccardResult, optional): Pre-computed Jaccard results. Defaults to None.
+            against_self (bool, optional): If True, aligns index against itself. Defaults to False.
 
         Yields:
-            Alignment or Hit objects.
+            Union[Alignment, Hit]: Alignment or Hit objects.
         """
 
         # 1. Handle Jaccard Logic
@@ -1004,11 +1114,11 @@ class PairwiseAligner:
         If the target is a string, it will be used to retrieve an existing target in the index.
 
         Args:
-            query: Query record.
-            target: Target record or ID.
+            query (Record): Query record.
+            target (Union[Record, str]): Target record or ID.
 
         Returns:
-            Alignment object or None.
+            Optional[Alignment]: Alignment object or None.
         """
         encoder = self._index.encoder
 
@@ -1049,11 +1159,11 @@ def _make_cigar(seq1_ali: np.ndarray, seq2_ali: np.ndarray) -> Generator[str, No
     Generates CIGAR string from aligned sequences.
 
     Args:
-        seq1_ali: Aligned query sequence (integers).
-        seq2_ali: Aligned target sequence (integers).
+        seq1_ali (np.ndarray): Aligned query sequence (integers).
+        seq2_ali (np.ndarray): Aligned target sequence (integers).
 
     Yields:
-        CIGAR operations (e.g., "10M", "2D").
+        str: CIGAR operations (e.g., "10M", "2D").
     """
     if len(seq1_ali) == 0: return
     ops = ('D' if s1 == -1 else 'I' if s2 == -1 else 'M' for s1, s2 in zip(seq1_ali, seq2_ali))
@@ -1588,10 +1698,10 @@ def otsu(similarity_matrix) -> float:
     Calculates Otsu's threshold for a similarity matrix.
 
     Args:
-        similarity_matrix: Array of similarity scores.
+        similarity_matrix (np.ndarray): Array of similarity scores.
 
     Returns:
-        The calculated threshold.
+        float: The calculated threshold.
     """
     if len(similarity_matrix) == 0: return 0.5
     hist, bin_edges = np.histogram(similarity_matrix, bins=256, range=(0.0, 1.0))
