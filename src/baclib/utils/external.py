@@ -3,17 +3,19 @@ Module for managing external programs such as Minimap2.
 """
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Iterable, Generator, Union, Literal, Optional, Any
+from typing import Iterable, Generator, Union, Literal, Optional, Any, IO
 from subprocess import Popen, PIPE, DEVNULL
 from dataclasses import dataclass, asdict
 from threading import Thread
 import errno
 
-from . import RESOURCES
-from .seq import Record, Feature, Qualifier, Interval, Alphabet
-from .io import PafReader, FastaWriter, FastaReader
-from .utils import Config, find_executable_binaries, is_non_empty_file
-from .alignment import Alignment
+from baclib.core.interval import Interval
+from baclib.core.seq import Alphabet
+from baclib.containers.record import Record, Feature
+from baclib.io.align import PafReader
+from baclib.io.seq import FastaWriter, FastaReader
+from baclib.utils import Config, find_executable_binaries, LiteralFile
+from baclib.utils.resources import RESOURCES
 
 
 # Exceptions and Warnings ----------------------------------------------------------------------------------------------
@@ -22,6 +24,47 @@ class Minimap2Error(ExternalProgramError): pass
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
+class _ProcessStream:
+    """
+    Wraps a subprocess stdout to behave like a file-like object (BinaryIO),
+    ensuring the process and writer thread are cleaned up correctly on close.
+    """
+    def __init__(self, proc: Popen, writer_thread: Thread, write_error: list, program: str):
+        self._proc = proc
+        self._thread = writer_thread
+        self._write_error = write_error
+        self._program = program
+        self._stdout = proc.stdout
+        self._closed = False
+
+    def read(self, n: int = -1) -> bytes:
+        return self._stdout.read(n)
+
+    def readline(self, limit: int = -1) -> bytes:
+        return self._stdout.readline(limit)
+
+    def __iter__(self):
+        return self._stdout
+
+    def close(self):
+        if self._closed: return
+        self._closed = True
+
+        # Wait for process to finish
+        self._proc.wait()
+        self._thread.join()
+
+        # Check for errors
+        if self._proc.returncode != 0:
+            stderr = self._proc.stderr.read()
+            raise ExternalProgramError(f"{self._program} failed (code {self._proc.returncode}): {stderr.decode('utf-8', errors='replace')}")
+
+        if self._write_error: raise self._write_error[0]
+
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb): self.close()
+
+
 class ExternalProgram:
     """
     Base class to handle an external program to be executed in subprocesses.
@@ -29,64 +72,50 @@ class ExternalProgram:
     This class provides a robust way to run external command-line tools,
     handling process creation, streaming I/O, and error reporting. It is
     optimized to avoid using `shell=True` for security and performance.
-
-    Examples:
-        >>> # This is a base class and is not typically used directly.
-        >>> # See Minimap2 or FragGeneScanRs for usage examples.
-        >>> class MyTool(ExternalProgram):
-        ...     def __init__(self):
-        ...         super().__init__("my_tool_name")
-        ...
-        ...     def get_version(self):
-        ...         return self.run(["--version"])[0].strip()
     """
     def __init__(self, program: str):
         if not (binary := next(find_executable_binaries(program), None)):
             raise ExternalProgramError(f'Could not find {program}')
         self._program = program
         self._binary = binary
-        self._version = None
 
     def __repr__(self): return f'{self._program}({self._binary})'
 
-    def version(self) -> str:
-        if not self._version:
-            try:
-                stdout, _ = self.run(['--version'])
-                self._version = stdout.strip().split(maxsplit=1)[-1]
-            except Exception:
-                self._version = "unknown"
-        return self._version
+    @property
+    def version(self) -> bytes:
+        try:
+            stdout, _ = self.run(['--version'])
+            return stdout.strip().split(maxsplit=1)[-1]
+        except Exception: return b"unknown"
 
-    def run(self, args: list[str], input_: str = None) -> tuple[str, str]:
+    def run(self, args: list[str], input_: bytes = None) -> tuple[bytes, bytes]:
         """Blocking execution (for short tasks like indexing/version)."""
         cmd = [self._binary] + args
-        with Popen(cmd, stdin=PIPE if input_ else DEVNULL, stdout=PIPE, stderr=PIPE, text=True) as proc:
+        with Popen(cmd, stdin=PIPE if input_ else DEVNULL, stdout=PIPE, stderr=PIPE) as proc:
             return proc.communicate(input=input_)
 
-    def stream(self, args: list[str]) -> Generator[str, None, None]:
+    def stream(self, args: list[str]) -> Generator[bytes, None, None]:
         """
         Streaming execution (for long tasks like alignment).
         Yields lines from stdout as they become available.
         """
         cmd = [self._binary] + args
-        with Popen(cmd, stdout=PIPE, stderr=PIPE, text=True, bufsize=1) as proc:
+        with Popen(cmd, stdout=PIPE, stderr=PIPE) as proc:
             yield from proc.stdout
 
             # Wait for process to finish *after* reading all stdout
             proc.wait()
             if proc.returncode != 0:
                 stderr = proc.stderr.read()
-                raise ExternalProgramError(f"{self._program} failed (code {proc.returncode}): {stderr}")
+                raise ExternalProgramError(f"{self._program} failed (code {proc.returncode}): {stderr.decode('utf-8', errors='replace')}")
 
-    def _stream_input_output(self, args: list[str], input_items: Iterable[Any], writer_cls=FastaWriter) -> Generator[str, None, None]:
+    def _stream_input_output(self, args: list[str], input_items: Iterable[Any], writer_cls=FastaWriter) -> IO[bytes]:
         """
         Advanced streaming: Writes items to subprocess stdin using a Writer class in a background thread,
-        while simultaneously yielding lines from subprocess stdout.
+        while returning a file-like object of the subprocess stdout.
         """
         cmd = [self._binary] + args
-        # bufsize=1 for line buffering
-        proc = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, text=True, bufsize=1)
+        proc = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
 
         # Container to propagate exceptions from the thread
         write_error = []
@@ -117,22 +146,7 @@ class ExternalProgram:
         t = Thread(target=writer_thread)
         t.start()
 
-        # Yield stdout as it comes (Main Thread)
-        yield from proc.stdout
-
-        # Clean up
-        proc.wait()
-        t.join()
-
-        # If the process failed, prefer its error over the thread's error
-        # (because the thread error might just be a symptom of the process crashing)
-        if proc.returncode != 0:
-            stderr = proc.stderr.read()
-            raise ExternalProgramError(f"{self._program} failed (code {proc.returncode}): {stderr}")
-
-        # If process succeeded but thread had an error (e.g. serialization issue)
-        if write_error:
-            raise write_error[0]
+        return _ProcessStream(proc, t, write_error, self._program)
 
 
 @dataclass
@@ -183,19 +197,6 @@ class Minimap2(ExternalProgram):
     the need to write intermediate files to disk.
 
     Requires `minimap2` to be in the system's PATH.
-
-    Examples:
-        >>> from baclib.seq import Record, Alphabet
-        >>> from baclib.external import Minimap2
-        >>>
-        >>> target = Record(Alphabet.dna().seq("AGCT" * 100), id_="target_contig")
-        >>> query = Record(Alphabet.dna().seq("AGCT" * 10), id_="query_read")
-        >>>
-        >>> # Align a query against a target
-        >>> with Minimap2(target) as mapper:
-        ...     for alignment in mapper.align(query):
-        ...         print(f"{alignment.query} -> {alignment.target} with score {alignment.score}")
-
     """
     _ALPHABET = Alphabet.dna()
     _DEFAULT_ALIGN_CONFIG = Minimap2AlignConfig()
@@ -249,17 +250,17 @@ class Minimap2(ExternalProgram):
             # Stream records to stdin ('-')
             args = params + ['-d', str(index_path), '-']
             # Consume generator locally
-            for _ in self._stream_input_output(args, targets, FastaWriter): pass
+            with self._stream_input_output(args, targets, FastaWriter) as stream:
+                for _ in stream: pass
 
-        if not is_non_empty_file(index_path):
-            # Check for specific stderr info if run() captured it, otherwise vague error
+        if not LiteralFile.from_path(index_path, return_bool=True):
             raise Minimap2Error(f'Failed to build index at {index_path}')
 
         self._target_index = index_path
         self._temp_files.append(index_path)
         return index_path
 
-    def align(self, *queries: Record, targets: Iterable[Record] = (), config: Minimap2AlignConfig = None) -> Generator[Alignment, None, None]:
+    def align(self, *queries: Record, targets: Iterable[Record] = (), config: Minimap2AlignConfig = None):
         if not config: config = self._align_config
 
         target_arg = None
@@ -273,8 +274,8 @@ class Minimap2(ExternalProgram):
         params = _build_params(config)
         args = params + [target_arg, '-']
 
-        output_stream = self._stream_input_output(args, queries, FastaWriter)
-        yield from PafReader(output_stream)
+        with self._stream_input_output(args, queries, FastaWriter) as stream:
+            yield from PafReader(stream)
 
 
 @dataclass
@@ -299,20 +300,6 @@ class FragGeneScanRs(ExternalProgram):
     nucleotide records.
 
     Requires `FragGeneScanRs` to be in the system's PATH.
-
-    Examples:
-        >>> from baclib.seq import Record, Alphabet
-        >>> from baclib.external import FragGeneScanRs
-        >>>
-        >>> contig = Record(Alphabet.dna().seq("ATG...TAA"), id_="contig1")
-        >>> fgs = FragGeneScanRs()
-        >>>
-        >>> # predict() returns the predicted protein records
-        >>> predicted_proteins = list(fgs.predict(contig))
-        >>>
-        >>> # The original contig record is updated with features
-        >>> for feature in contig.features:
-        ...     print(f"Found CDS at {feature.interval}")
     """
     _ALPHABET = Alphabet.amino()
     _DEFAULT_CONFIG = FragGeneScanRsConfig()
@@ -323,33 +310,31 @@ class FragGeneScanRs(ExternalProgram):
 
     def predict(self, *seqs: Record, config: FragGeneScanRsConfig = None) -> Generator[Record, None, None]:
         config = config or self._config
-        args = _build_params(config) + ['--seq-file-name', 'stdin']
+        args = _build_params(config) + ['--core-file-name', 'stdin']
 
         seq_map = {i.id: i for i in seqs}
 
-        stdout_lines = self._stream_input_output(args, seqs, FastaWriter)
-        reader = FastaReader(stdout_lines, alphabet=self._ALPHABET)
-
-        for record in reader:
-            try:
-                # FragGeneScanRs header: >parent_start_end_strand
-                parent_id, start, end, strand = record.id.rsplit('_', 3)
-                if parent_id in seq_map:
-                    seq_map[parent_id].features.append(
-                        Feature(
-                            Interval(int(start) - 1, int(end), strand),
-                            kind='CDS',
-                            qualifiers=[
-                                Qualifier('transl_table', 11),
-                                Qualifier('inference', f'ab initio prediction:FragGeneScanRs:{self.version()}'),
-                            ]
+        with self._stream_input_output(args, seqs, FastaWriter) as stream:
+            for record in FastaReader(stream, alphabet=self._ALPHABET):
+                try:
+                    # FragGeneScanRs header: >parent_start_end_strand
+                    parent_id, start, end, strand = record.id.rsplit(b'_', 3)
+                    if parent_id in seq_map:
+                        seq_map[parent_id].features.append(
+                            Feature(
+                                Interval(int(start) - 1, int(end), strand),
+                                kind=b'CDS',
+                                qualifiers=[
+                                    (b'transl_table', 11),
+                                    (b'inference', b'ab initio prediction:FragGeneScanRs:' + self.version),
+                                ]
+                            )
                         )
-                    )
-            except ValueError:
-                # Robustness: Don't crash if FGS outputs a weird header, just skip associating the feature
-                pass
+                except ValueError:
+                    # Robustness: Don't crash if FGS outputs a weird header, just skip associating the feature
+                    pass
 
-            yield record
+                yield record
 
 
 # Helpers --------------------------------------------------------------------------------------------------------------

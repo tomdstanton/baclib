@@ -80,13 +80,13 @@ with SeqFile("annotation.gbk") as reader:
 ### Sequence Manipulation
 
 ```python
-from baclib.seq import Alphabet
+from baclib.core.seq import Alphabet
 
 dna = Alphabet.dna()
-seq = dna.seq("ATGCGTAGCTAG")
+seq = dna._data("ATGCGTAGCTAG")
 
-# Or generate a random seq
-seq = dna.seq(dna.random())
+# Or generate a random core
+seq = dna._data(dna.random())
 
 # Reverse complement
 # Note: Returns a new Seq object
@@ -103,14 +103,14 @@ print(protein)
 Perform local (Smith-Waterman), global (Needleman-Wunsch) or glocal alignment.
 
 ```python
-from baclib.alignment import PairwiseAligner
-from baclib.seq import Alphabet, Record
+from baclib.align.alignment import PairwiseAligner
+from baclib.core.seq import Alphabet, Record
 
 dna = Alphabet.dna()
 aligner = PairwiseAligner(dna, k=5, flavour='local', compute_traceback=True)
 
-target = Record(dna.seq(dna.random(length=1000)), "target")
-query = Record(dna.seq(dna.random(length=100)), "query")
+target = Record(dna._data(dna.random(length=1000)), "target")
+query = Record(dna._data(dna.random(length=100)), "query")
 
 # Add targets to the index
 if alignment := aligner.align(query, target):
@@ -123,13 +123,13 @@ if alignment := aligner.align(query, target):
 Ensure `minimap2` is installed and in your PATH.
 
 ```python
-from baclib.external import Minimap2
-from baclib.seq import Record, Alphabet
+from baclib.utils.external import Minimap2
+from baclib.core.seq import Record, Alphabet
 
 # Generate random records
 dna = Alphabet.dna()
-ref = Record(dna.seq(dna.random(length=1000)), "ref")
-query = Record(dna.seq(dna.random(length=100)), "query")
+ref = Record(dna._data(dna.random(length=1000)), "ref")
+query = Record(dna._data(dna.random(length=100)), "query")
 
 # Align using Minimap2 wrapper (handles indexing automatically)
 with Minimap2(ref) as mapper:
