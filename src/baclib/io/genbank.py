@@ -15,6 +15,12 @@ class GenbankReader(BaseReader):
     """
     High-performance Genbank Reader (Binary Mode).
     Robust to fuzzy coordinates (<1..>100) and loose indentation.
+
+    Examples:
+        >>> with open("genome.gbk", "rb") as f:
+        ...     reader = GenbankReader(f)
+        ...     for record in reader:
+        ...         print(record.id)
     """
     # Relaxed regex to handle <, > and partial entries (Bytes)
     _INTERVAL_REGEX = regex(rb'(?P<partial_start><)?(?P<start>[0-9]+)\.\.(?P<partial_end>>)?(?P<end>[0-9]+)')

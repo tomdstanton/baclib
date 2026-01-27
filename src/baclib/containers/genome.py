@@ -20,6 +20,18 @@ class Genome:
     """
     A class representing a single bacterial genome assembly in memory.
     It holds contigs as `Record` objects and the connections between them as `Edge` objects.
+
+    Attributes:
+        id (bytes): The genome identifier.
+        contigs (Dict[bytes, Record]): A dictionary mapping contig IDs to Record objects.
+        edges (list[Edge]): A list of edges representing the assembly graph.
+
+    Examples:
+        >>> g = Genome(id_=b'Ecoli_K12')
+        >>> r = Record(Alphabet.dna().seq("ACGT"), id_=b'contig1')
+        >>> g.contigs[b'contig1'] = r
+        >>> len(g)
+        4
     """
     __slots__ = ('id', 'contigs', 'edges', '_cached_graph')
     _ALPHABET = Alphabet.dna()
@@ -39,6 +51,16 @@ class Genome:
     def from_file(cls, file: Union[str, Path, BinaryIO, SeqFile], annotations: Union[str, Path, BinaryIO, SeqFile] = None):
         """
         Loads a genome from a file with optional annotations.
+
+        Args:
+            file: The sequence file (FASTA, GFA, GenBank).
+            annotations: Optional annotation file (GFF, BED).
+
+        Returns:
+            A Genome object.
+
+        Raises:
+            GenomeError: If file formats are incompatible.
         """
         self = cls()
         if isinstance(file, str): file = Path(file)
@@ -87,7 +109,22 @@ class Genome:
     @classmethod
     def random(cls, rng: np.random.Generator = None, n_contigs: int = None, min_contigs: int = 1,
                max_contigs: int = 1000, length: int = None, min_len: int = 10, max_len: int = 5_000_000, weights=None):
-        """Generates a random genome assembly for testing purposes."""
+        """
+        Generates a random genome assembly for testing purposes.
+
+        Args:
+            rng: Random number generator.
+            n_contigs: Number of contigs.
+            min_contigs: Min contigs if n_contigs is None.
+            max_contigs: Max contigs if n_contigs is None.
+            length: Total length of the genome.
+            min_len: Min length per contig.
+            max_len: Max length per contig.
+            weights: Symbol weights.
+
+        Returns:
+            A random Genome object.
+        """
         if rng is None: rng = RESOURCES.rng
         if n_contigs is None: n_contigs = int(rng.integers(min_contigs, max_contigs))
 
@@ -117,6 +154,15 @@ class Genome:
         return any(bool(c.features) for c in self.contigs.values())
 
     def as_graph(self, node_attributes: Iterable[bytes] = ()) -> Graph:
+        """
+        Returns the assembly graph representation.
+
+        Args:
+            node_attributes: List of qualifier keys to include as node attributes.
+
+        Returns:
+            A Graph object.
+        """
         if self._cached_graph is None:
             g = Graph()
             # Add Nodes

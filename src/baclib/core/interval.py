@@ -11,6 +11,9 @@ else: prange = range
 
 # Classes --------------------------------------------------------------------------------------------------------------
 class Strand(IntEnum):
+    """
+    Enumeration for genomic strands.
+    """
     FORWARD = 1
     REVERSE = -1
     UNSTRANDED = 0
@@ -24,6 +27,15 @@ class Strand(IntEnum):
 
     @classmethod
     def from_symbol(cls, symbol: Any) -> 'Strand':
+        """
+        Creates a Strand from various symbols.
+
+        Args:
+            symbol: The symbol to convert (e.g., '+', '-', 1, -1, b'+').
+
+        Returns:
+            A Strand enum member.
+        """
         if symbol is None: return cls.UNSTRANDED
         # Fast path for integers (including numpy scalars)
         if symbol in (1, -1, 0): return cls(int(symbol))
@@ -44,11 +56,31 @@ class Strand(IntEnum):
 class Interval:
     """
     Immutable genomic interval. Safe for hashing and use in sets/dicts.
+
+    Attributes:
+        start: The start position (0-based, inclusive).
+        end: The end position (0-based, exclusive).
+        strand: The strand (FORWARD, REVERSE, or UNSTRANDED).
+
+    Examples:
+        >>> i = Interval(10, 20, '+')
+        >>> len(i)
+        10
+        >>> i.strand
+        <Strand.FORWARD: 1>
     """
     # 1. Use private slots
     __slots__ = ('_start', '_end', '_strand')
 
     def __init__(self, start: int, end: int, strand: Any = None):
+        """
+        Initializes an Interval.
+
+        Args:
+            start: Start position.
+            end: End position.
+            strand: Strand symbol or enum.
+        """
         self._start: int = int(start)
         self._end: int = int(end)
         self._strand: Strand = Strand.from_symbol(strand)
@@ -81,6 +113,15 @@ class Interval:
         return self._start <= item.start and self._end >= item.end
 
     def overlap(self, other: Union[slice, int, 'Interval']) -> int:
+        """
+        Calculates the overlap length with another interval.
+
+        Args:
+            other: The other interval.
+
+        Returns:
+            The number of overlapping bases.
+        """
         other = Interval.from_item(other)
         return max(0, min(self._end, other.end) - max(self._start, other.start))
 
@@ -104,14 +145,47 @@ class Interval:
         return Interval(new_start, new_end, self._strand)
 
     def shift(self, x: int, y: int = None) -> 'Interval':
+        """
+        Shifts the interval coordinates.
+
+        Args:
+            x: Amount to shift start (and end if y is None).
+            y: Amount to shift end (optional).
+
+        Returns:
+            A new shifted Interval.
+        """
         return Interval(self._start + x, self._end + (y if y is not None else x), self._strand)
 
     def reverse_complement(self, parent_length: int) -> 'Interval':
+        """
+        Returns the interval coordinates on the reverse complement strand.
+
+        Args:
+            parent_length: The length of the parent sequence.
+
+        Returns:
+            A new Interval on the opposite strand.
+        """
         return Interval(parent_length - self._end, parent_length - self._start, self._strand * -1)
 
     @classmethod
     def random(cls, rng: np.random.Generator = None, length: int = None, min_len: int = 1, max_len: int = 10_000,
                min_start: int = 0, max_start: int = 1_000_000):
+        """
+        Generates a random Interval.
+
+        Args:
+            rng: Random number generator.
+            length: Fixed length (optional).
+            min_len: Minimum length.
+            max_len: Maximum length.
+            min_start: Minimum start position.
+            max_start: Maximum start position.
+
+        Returns:
+            A random Interval.
+        """
         if rng is None: rng = RESOURCES.rng
         if not length: length = rng.integers(min_len, max_len)
         # Ensure we don't go negative on the bounds
@@ -121,6 +195,20 @@ class Interval:
 
     @classmethod
     def from_item(cls, item: Union[slice, int, 'Interval', Match], strand: int = 0, length: int = None) -> 'Interval':
+        """
+        Coerces various types into an Interval.
+
+        Args:
+            item: The item to coerce (slice, int, Interval, Match).
+            strand: Default strand if not present in item.
+            length: Length of the sequence (needed for slice with None stop).
+
+        Returns:
+            An Interval object.
+
+        Raises:
+            TypeError: If coercion is not possible.
+        """
         if isinstance(item, Interval): return item
         if interval := getattr(item, 'interval', None): return interval
         if isinstance(item, Match): return Interval(item.start(), item.end(), strand or 1)
@@ -141,12 +229,33 @@ class Interval:
 class IntervalIndex:
     """
     High-performance index for genomic intervals, powered by NumPy.
+
+    This class provides efficient querying, intersection, and manipulation of
+    large sets of genomic intervals.
+
+    Examples:
+        >>> i1 = Interval(0, 100, '+')
+        >>> i2 = Interval(50, 150, '-')
+        >>> idx = IntervalIndex.from_intervals(i1, i2)
+        >>> len(idx)
+        2
+        >>> idx.coverage()
+        150
     """
     __slots__ = ('_starts', '_ends', '_strands', '_original_indices', '_max_len')
     _DTYPE = np.int32  # int32 allows up to 2.14 Billion bp (fits all bacterial genomes)
 
     def __init__(self, starts: np.ndarray = None, ends: np.ndarray = None, strands: np.ndarray = None,
                  original_indices: np.ndarray = None):
+        """
+        Initializes an IntervalIndex.
+
+        Args:
+            starts: Array of start positions.
+            ends: Array of end positions.
+            strands: Array of strands.
+            original_indices: Array of original indices (for tracking after sort).
+        """
         if starts is None:
             self._starts = np.empty(0, dtype=self._DTYPE)
             self._ends = np.empty(0, dtype=self._DTYPE)
@@ -167,6 +276,7 @@ class IntervalIndex:
         self.sort()
 
     def sort(self):
+        """Sorts the intervals by start position, then end position."""
         # Sort both data and the index tracker
         if len(self._starts) > 0:
             # Lexsort: Primary key is last in the tuple (starts), Secondary is ends
@@ -178,6 +288,15 @@ class IntervalIndex:
 
     @classmethod
     def from_intervals(cls, *intervals: Interval):
+        """
+        Creates an IntervalIndex from a list of Interval objects.
+
+        Args:
+            *intervals: Variable number of Interval objects.
+
+        Returns:
+            An IntervalIndex.
+        """
         if not intervals: return cls()
         # Convert to SoA
         arr = np.array([tuple(i) for i in intervals], dtype=cls._DTYPE)
@@ -185,12 +304,30 @@ class IntervalIndex:
 
     @classmethod
     def from_features(cls, *features):
+        """
+        Creates an IntervalIndex from a list of Feature objects.
+
+        Args:
+            *features: Variable number of Feature objects (must have .interval attribute).
+
+        Returns:
+            An IntervalIndex.
+        """
         if not features: return cls()
         arr = np.array([tuple(i.interval) for i in features], dtype=cls._DTYPE)
         return cls(arr[:, 0], arr[:, 1], arr[:, 2])
 
     @classmethod
     def from_items(cls, *items: Union[slice, int, 'Interval', Match]):
+        """
+        Creates an IntervalIndex from various items.
+
+        Args:
+            *items: Items to convert to intervals.
+
+        Returns:
+            An IntervalIndex.
+        """
         if not items: return cls()
         arr = np.array([tuple(Interval.from_item(i)) for i in items], dtype=cls._DTYPE)
         return cls(arr[:, 0], arr[:, 1], arr[:, 2])
@@ -198,6 +335,7 @@ class IntervalIndex:
     def __len__(self): return len(self._starts)
     def __iter__(self): return iter(zip(self.starts, self.ends, self.strands))
     def copy(self):
+        """Returns a deep copy of the IntervalIndex."""
         return IntervalIndex(
             self._starts.copy(), self._ends.copy(), self._strands.copy(),
             self._original_indices.copy() if self._original_indices is not None else None
@@ -221,6 +359,16 @@ class IntervalIndex:
                              start, end, self._max_len)
 
     def intersect(self, other: 'IntervalIndex', stranded: bool = False) -> 'IntervalIndex':
+        """
+        Computes the intersection with another IntervalIndex.
+
+        Args:
+            other: The other IntervalIndex.
+            stranded: If True, only intersects intervals on the same strand.
+
+        Returns:
+            A new IntervalIndex representing the intersection.
+        """
         if len(self) == 0 or len(other) == 0: return IntervalIndex()
         # Call Numba Kernel
         out = _intersect_kernel(self.starts, self.ends, self.strands,
@@ -230,6 +378,16 @@ class IntervalIndex:
         return IntervalIndex(out[0], out[1], out[2])
 
     def subtract(self, other: 'IntervalIndex', stranded: bool = False) -> 'IntervalIndex':
+        """
+        Subtracts regions in 'other' from this index.
+
+        Args:
+            other: The IntervalIndex to subtract.
+            stranded: If True, only subtracts intervals on the same strand.
+
+        Returns:
+            A new IntervalIndex.
+        """
         if len(other) == 0: return self.copy()
         # Merge B to simplify subtraction
         b_merged = other.merge()
@@ -244,10 +402,28 @@ class IntervalIndex:
         Extracts promoter regions relative to strand.
         Forward: [Start - Up, Start + Down]
         Reverse: [End - Down, End + Up]
+
+        Args:
+            upstream: Bases upstream of the start.
+            downstream: Bases downstream of the start.
+
+        Returns:
+            A new IntervalIndex of promoters.
         """
         return self.flank(upstream, downstream, direction='upstream')
 
     def flank(self, left: int, right: int = None, direction: str = 'both') -> 'IntervalIndex':
+        """
+        Generates flanking regions.
+
+        Args:
+            left: Bases to the left (relative to direction).
+            right: Bases to the right (relative to direction).
+            direction: 'both', 'upstream', or 'downstream'.
+
+        Returns:
+            A new IntervalIndex.
+        """
         if right is None: right = left
         if len(self) == 0: return IntervalIndex()
 
@@ -278,6 +454,12 @@ class IntervalIndex:
         """
         Calculates Jaccard Index (Intersection / Union) in bp.
         Useful for comparing gene predictions or annotations.
+
+        Args:
+            other: The other IntervalIndex.
+
+        Returns:
+            The Jaccard index (0.0 to 1.0).
         """
         union_len = self.merge().coverage() + other.merge().coverage()
         if union_len == 0: return 0.0
@@ -290,6 +472,15 @@ class IntervalIndex:
         return intersect_len / real_union
 
     def merge(self, tolerance: int = 0) -> 'IntervalIndex':
+        """
+        Merges overlapping or adjacent intervals.
+
+        Args:
+            tolerance: Maximum distance between intervals to merge.
+
+        Returns:
+            A new merged IntervalIndex.
+        """
         if len(self) == 0: return self
         # Note: self.sort() must be guaranteed before calling this kernel
         # Since we sort on init, we are usually safe, but you might want to ensure it.
@@ -302,6 +493,13 @@ class IntervalIndex:
         """
         Splits intervals into sliding windows of 'width'.
         Keeps windows strictly INSIDE the original intervals.
+
+        Args:
+            width: Window width.
+            step: Step size (defaults to width).
+
+        Returns:
+            A new IntervalIndex of tiles.
         """
         if step is None: step = width
         if len(self) == 0: return IntervalIndex()
@@ -334,6 +532,13 @@ class IntervalIndex:
         """
         Expands intervals by 'upstream' and 'downstream' bp.
         Respects strand (upstream is 5', downstream is 3').
+
+        Args:
+            upstream: Bases to add upstream.
+            downstream: Bases to add downstream (defaults to upstream).
+
+        Returns:
+            A new padded IntervalIndex.
         """
         if downstream is None: downstream = upstream
         if len(self) == 0: return self
@@ -363,6 +568,12 @@ class IntervalIndex:
         """
         Returns the 'gaps' in the index up to 'length'.
         Essential for finding intergenic regions.
+
+        Args:
+            length: The total length of the region (e.g., genome size).
+
+        Returns:
+            A new IntervalIndex representing the gaps.
         """
         if len(self) == 0:
             return IntervalIndex.from_intervals(Interval(0, length))

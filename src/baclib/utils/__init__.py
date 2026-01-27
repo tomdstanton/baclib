@@ -70,6 +70,10 @@ class GitRepo:
     """
     A context-aware class to represent a git repository.
     Handles temporary directories automatically via the 'with' statement.
+
+    Examples:
+        >>> with GitRepo('owner', 'repo') as repo:
+        ...     print(repo.local_path)
     """
     _BASE_URL = 'https://api.github.com'
     __slots__ = ('owner', 'repo', 'branch', '_api_url', '_meta_cache', '_temp_dir_obj', 'local_path')

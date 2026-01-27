@@ -12,6 +12,10 @@ from baclib.io import BaseReader, BaseWriter, ParserError
 class FastaWriter(BaseWriter):
     """
     Writer for FASTA format files.
+
+    Examples:
+        >>> with FastaWriter("output.fasta") as w:
+        ...     w.write_one(record)
     """
 
     def __init__(self, file: Union[str, Path, BinaryIO], width: int = 60, **kwargs):
@@ -52,7 +56,15 @@ class FastaWriter(BaseWriter):
 
 
 class FastaReader(BaseReader):
-    """Reader for FASTA format files."""
+    """
+    Reader for FASTA format files.
+
+    Examples:
+        >>> with open("genome.fasta", "rb") as f:
+        ...     reader = FastaReader(f)
+        ...     for record in reader:
+        ...         print(record.id)
+    """
     _TOPOLOGY_REGEX = regex(rb'(?i)(\bcircular\b|\bcircular\s*=\s*true\b)')
     _COPY_NUMBER_REGEX = regex(rb'depth=(\d+\.\d+)')
 
@@ -139,6 +151,11 @@ class FastaReader(BaseReader):
 class GfaWriter(BaseWriter):
     """
     Writer for GFA format files.
+
+    Examples:
+        >>> with GfaWriter("graph.gfa") as w:
+        ...     w.write_one(record)
+        ...     w.write_one(edge)
     """
 
     def write_one(self, item: Union[Record, Edge]):
@@ -157,7 +174,16 @@ class GfaWriter(BaseWriter):
 
 
 class GfaReader(BaseReader):
-    """Reader for GFA (Graphical Fragment Assembly) files."""
+    """
+    Reader for GFA (Graphical Fragment Assembly) files.
+
+    Examples:
+        >>> with open("graph.gfa", "rb") as f:
+        ...     reader = GfaReader(f)
+        ...     for item in reader:
+        ...         if isinstance(item, Record): print("Segment:", item.id)
+        ...         elif isinstance(item, Edge): print("Link:", item.u, "->", item.v)
+    """
 
     def __init__(self, handle: BinaryIO, alphabet: Alphabet = None, min_seq_length: int = 1, **kwargs):
         """
@@ -230,7 +256,15 @@ class GfaReader(BaseReader):
 
 
 class FastqReader(BaseReader):
-    """Reader for FASTQ format files."""
+    """
+    Reader for FASTQ format files.
+
+    Examples:
+        >>> with open("reads.fastq", "rb") as f:
+        ...     reader = FastqReader(f)
+        ...     for record in reader:
+        ...         print(record.id)
+    """
 
     def __init__(self, handle: BinaryIO, alphabet: Alphabet = None, **kwargs):
         """

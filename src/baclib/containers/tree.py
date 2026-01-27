@@ -44,6 +44,16 @@ class PhyloBuilder:
 
 
 class PhyloNode:
+    """
+    Represents a node in a phylogenetic tree.
+
+    Attributes:
+        name (bytes): Node name.
+        length (float): Branch length to parent.
+        support (float): Support value (e.g., bootstrap).
+        parent (PhyloNode): Parent node.
+        children (list[PhyloNode]): List of children.
+    """
     def __init__(
         self,
         name: bytes = None,
@@ -60,6 +70,13 @@ class PhyloNode:
 
 
 class PhyloTree:
+    """
+    Represents a phylogenetic tree using a parent array structure.
+
+    Attributes:
+        parents (np.ndarray): Array of parent indices.
+        lengths (np.ndarray): Array of branch lengths.
+    """
     __slots__ = ('_parents', '_lengths', '_node_order', '_n_tips')
 
     def __init__(self, parents: np.ndarray, lengths: np.ndarray, node_names: np.ndarray = None):
@@ -77,6 +94,9 @@ class PhyloTree:
         """
         Returns the distance from the root to every node.
         This operation is vectorized and nearly instant.
+
+        Returns:
+            Array of distances.
         """
         # Allocate output array
         dists = np.zeros(len(self._parents), dtype=np.float64)

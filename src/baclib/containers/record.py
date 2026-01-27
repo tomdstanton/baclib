@@ -15,6 +15,12 @@ class QualifierList(MutableSequence):
     """
     A list-like container for (key, value) tuples that also supports dictionary-style access.
     Maintains insertion order and allows duplicate keys.
+
+    Examples:
+        >>> q = QualifierList([(b'gene', 'gyrA')])
+        >>> q[b'gene']
+        'gyrA'
+        >>> q.add(b'note', 'important')
     """
     __slots__ = ('_data',)
 
@@ -53,14 +59,17 @@ class QualifierList(MutableSequence):
         return False
 
     def get(self, key, default=None):
+        """Returns the first value for a key, or default."""
         for k, v in self._data:
             if k == key: return v
         return default
 
     def get_all(self, key: bytes) -> list[Any]:
+        """Returns all values for a key."""
         return [v for k, v in self._data if k == key]
 
     def add(self, key: bytes, value: Any):
+        """Adds a new key-value pair."""
         self._data.append((key, value))
 
     def to_dict(self) -> dict[bytes, Any]:
@@ -75,6 +84,12 @@ class Feature:
         interval (Interval): The genomic interval of the feature.
         kind (bytes): The type of feature (e.g., 'CDS', 'gene', 'misc_feature').
         qualifiers (list[Qualifier]): A list of qualifiers annotating the feature.
+
+    Examples:
+        >>> i = Interval(100, 200, '+')
+        >>> f = Feature(i, kind=b'gene', qualifiers=[(b'gene', 'gyrA')])
+        >>> f[b'gene']
+        'gyrA'
     """
     __slots__ = ('interval', 'kind', 'qualifiers')
     def __init__(self, interval: 'Interval', kind: bytes = b'misc_feature', qualifiers: Iterable[tuple[bytes, Any]] = None):
@@ -174,6 +189,21 @@ class FeatureList(MutableSequence):
 class Record:
     """
     Represents a sequence record, such as a contig or chromosome.
+
+    Attributes:
+        seq (Seq): The sequence data.
+        id (bytes): The record identifier.
+        description (bytes): Description text.
+        qualifiers (QualifierList): Record-level annotations.
+        features (FeatureList): List of features on the record.
+
+    Examples:
+        >>> from baclib.core.seq import Alphabet
+        >>> dna = Alphabet.dna()
+        >>> s = dna.seq("ACGT")
+        >>> r = Record(s, id_=b'seq1')
+        >>> len(r)
+        4
     """
     __slots__ = ('seq', 'id', 'description', 'qualifiers', '_features')
     def __init__(self, seq: Seq, id_: bytes = None, desc: bytes = None, qualifiers: Iterable[tuple] = None,
@@ -192,10 +222,22 @@ class Record:
     def __eq__(self, other) -> bool: return self.id == other.id if isinstance(other, Record) else False
 
     @classmethod
-    def from_seq(cls, seq: Seq, id_: bytes = None) -> 'Record': return cls(seq, id_=id_)
+    def from_seq(cls, seq: Seq, id_: bytes = None) -> 'Record':
+        """Creates a Record from a Seq object."""
+        return cls(seq, id_=id_)
 
     @classmethod
     def from_batch(cls, batch: SeqBatch, ids: list[bytes] = None) -> Generator['Record', None, None]:
+        """
+        Generates Records from a SeqBatch.
+
+        Args:
+            batch: The SeqBatch.
+            ids: Optional list of IDs.
+
+        Yields:
+            Record objects.
+        """
         if ids is None: ids = [b'Seq_%d' % i for i in range(len(batch))]
         for id_, seq in zip(ids, batch): yield cls(seq, id_=id_)
 
@@ -209,6 +251,7 @@ class Record:
     def interval_index(self) -> 'IntervalIndex': return self.features.interval_index
 
     def add_features(self, *features: 'Feature'):
+        """Adds features and sorts them by start position."""
         self.features.extend(features)
         self.features.sort(key=attrgetter('interval.start'))
 
@@ -393,6 +436,17 @@ class Record:
 
     def shred(self, rng: np.random.Generator = None, n_breaks: int = None, break_points: list[int] = None
               ) -> Generator['Record', None, None]:
+        """
+        Shreds the record into smaller pieces.
+
+        Args:
+            rng: Random number generator.
+            n_breaks: Number of random breaks.
+            break_points: Specific break points.
+
+        Yields:
+            Record fragments.
+        """
         if rng is None: rng = RESOURCES.rng
         if not n_breaks and not break_points:
             n_breaks = rng.integers(1, max(2, len(self) // 1000))  # improved default

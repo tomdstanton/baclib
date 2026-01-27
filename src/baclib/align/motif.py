@@ -13,6 +13,18 @@ else: prange = range
 
 # Classes --------------------------------------------------------------------------------------------------------------
 class Background:
+    """
+    Represents the background nucleotide frequencies.
+
+    Attributes:
+        alphabet (Alphabet): The alphabet used.
+        data (np.ndarray): Array of probabilities.
+
+    Examples:
+        >>> bg = Background.uniform(Alphabet.dna())
+        >>> bg.data
+        array([0.25, 0.25, 0.25, 0.25], dtype=float32)
+    """
     __slots__ = ('_alphabet', '_data')
     _DNA = Alphabet.dna()
     _DTYPE = np.float32
@@ -25,6 +37,7 @@ class Background:
     def data(self) -> np.ndarray: return self._data
     @classmethod
     def from_counts(cls, counts: np.ndarray, alphabet: Alphabet = None) -> 'Background':
+        """Creates a Background from raw counts."""
         alphabet = alphabet or cls._DNA
         assert len(counts) == len(alphabet)
         new = cls()
@@ -34,9 +47,11 @@ class Background:
         return new
     @classmethod
     def from_seq(cls, seq: Union[Seq, SeqBatch]) -> 'Background':
+        """Creates a Background from a sequence or batch."""
         return cls.from_counts(np.bincount(seq.encoded), seq.alphabet)
     @classmethod
     def uniform(cls, alphabet: Alphabet = None) -> 'Background':
+        """Creates a uniform Background."""
         alphabet = alphabet or cls._DEFAULT_ALPHABET
         new = cls()
         new._alphabet = alphabet
@@ -50,7 +65,19 @@ class Background:
 
 class Motif:
     """
-    Standard Position Specific Scoring Matrix.
+    Standard Position Specific Scoring Matrix (PSSM).
+
+    Attributes:
+        name (bytes): Motif name.
+        background (Background): Background model.
+        pssm (np.ndarray): The scoring matrix.
+
+    Examples:
+        >>> bg = Background.uniform(Alphabet.dna())
+        >>> counts = np.array([[10, 0, 0, 0], [0, 10, 0, 0]]) # AA
+        >>> m = Motif.from_counts(b'polyA', counts.T, bg)
+        >>> len(m)
+        2
     """
     _DTYPE = np.float32
     _DEFAULT_GRANULARITY = 1000
@@ -102,6 +129,7 @@ class Motif:
     @classmethod
     def from_counts(cls, name: bytes, counts: np.ndarray, background: Background,
                     granularity: int = _DEFAULT_GRANULARITY, pseudocount: float = _DEFAULT_PSEUDOCOUNT) -> 'Motif':
+        """Creates a Motif from a count matrix (Rows=Bases, Cols=Positions)."""
         adjusted = counts + pseudocount
         frequencies = adjusted / adjusted.sum(axis=0)
         return cls.from_frequencies(name, frequencies, background, granularity, pseudocount, counts)
@@ -110,6 +138,7 @@ class Motif:
     def from_frequencies(cls, name: bytes, frequencies: np.ndarray, background: Background,
                         granularity: int = _DEFAULT_GRANULARITY, pseudocount: float = _DEFAULT_PSEUDOCOUNT,
                         counts: np.ndarray = None) -> 'Motif':
+        """Creates a Motif from a frequency matrix."""
         weights = frequencies / background.data[:, None]
         return cls.from_weights(name, weights, background, granularity, pseudocount, counts, frequencies)
 
@@ -118,6 +147,7 @@ class Motif:
                      granularity: int = _DEFAULT_GRANULARITY, pseudocount: float = _DEFAULT_PSEUDOCOUNT,
                      counts: np.ndarray = None,
                      frequencies: np.ndarray = None) -> 'Motif':
+        """Creates a Motif from a weight matrix."""
         with np.errstate(divide='ignore', invalid='ignore'):
             scores = np.log2(weights, dtype=cls._DTYPE)
 
@@ -134,9 +164,11 @@ class Motif:
     def from_scores(cls, name: bytes, scores: np.ndarray, background: Background,
                     granularity: int = _DEFAULT_GRANULARITY, pseudocount: float = _DEFAULT_PSEUDOCOUNT,
                     counts: np.ndarray = None, frequencies: np.ndarray = None, weights: np.ndarray = None) -> 'Motif':
+        """Creates a Motif from a log-odds score matrix."""
         return cls(name, scores, background, granularity, pseudocount, counts, frequencies, weights)
     
     def pdf(self):
+        """Computes the probability density function of scores."""
         if self._pdf is None:
             bg = self._background.data.astype(np.float64)
             self._pdf = _score_distribution_kernel(self._discrete, bg, self._min_score, self._max_score)
@@ -176,6 +208,13 @@ class Motif:
     def scan(self, seqs: SeqBatch, pvalue_threshold: float = 0.0) -> 'MotifHitBatch':
         """
         Scans the sequence batch for instances of this motif.
+
+        Args:
+            seqs: The SeqBatch to scan.
+            pvalue_threshold: The maximum P-value to report.
+
+        Returns:
+            A MotifHitBatch containing the hits.
         """
         data, starts, lengths = seqs.arrays
         seq_idxs_list = []
@@ -231,6 +270,12 @@ class Motif:
 class MotifHitBatch:
     """
     Container for motif scan results.
+
+    Attributes:
+        seq_indices (np.ndarray): Indices of sequences in the batch.
+        positions (np.ndarray): Start positions of hits.
+        scores (np.ndarray): Scores of hits.
+        strands (np.ndarray): Strands of hits.
     """
     __slots__ = ('seq_indices', 'positions', 'scores', 'strands', '_motif')
 

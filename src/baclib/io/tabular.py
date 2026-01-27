@@ -7,6 +7,10 @@ from baclib.io import BaseWriter, TabularReader
 class BedWriter(BaseWriter):
     """
     Writer for BED format files.
+
+    Examples:
+        >>> with BedWriter("output.bed") as w:
+        ...     w.write_one(record)
     """
 
     def write_one(self, record: Record):
@@ -27,7 +31,15 @@ class BedWriter(BaseWriter):
 
 
 class BedReader(TabularReader):
-    """Reader for BED format files."""
+    """
+    Reader for BED format files.
+
+    Examples:
+        >>> with open("features.bed", "rb") as f:
+        ...     reader = BedReader(f)
+        ...     for feature in reader:
+        ...         print(feature.kind)
+    """
     _min_cols = 3
 
     def parse_row(self, parts: list[bytes]) -> Feature:
@@ -54,6 +66,11 @@ class BedReader(TabularReader):
 class GffWriter(BaseWriter):
     """
     Writer for GFF3 format files.
+
+    Examples:
+        >>> with GffWriter("output.gff") as w:
+        ...     w.write_header()
+        ...     w.write_one(record)
     """
 
     def write_header(self):
@@ -101,7 +118,15 @@ class GffWriter(BaseWriter):
 
 
 class GffReader(TabularReader):
-    """Reader for GFF3 format files."""
+    """
+    Reader for GFF3 format files.
+
+    Examples:
+        >>> with open("features.gff", "rb") as f:
+        ...     reader = GffReader(f)
+        ...     for feature in reader:
+        ...         print(feature.kind)
+    """
     _min_cols = 9
 
     def parse_row(self, parts: list[bytes]) -> Feature:

@@ -197,6 +197,12 @@ class Minimap2(ExternalProgram):
     the need to write intermediate files to disk.
 
     Requires `minimap2` to be in the system's PATH.
+
+    Examples:
+        >>> mm2 = Minimap2()
+        >>> mm2.build_index(target_record)
+        >>> for hit in mm2.align(query_record):
+        ...     print(hit)
     """
     _ALPHABET = Alphabet.dna()
     _DEFAULT_ALIGN_CONFIG = Minimap2AlignConfig()
@@ -231,6 +237,16 @@ class Minimap2(ExternalProgram):
         self._temp_files.clear()
 
     def build_index(self, *targets: Union[str, Path, Record], config: Minimap2IndexConfig = None) -> Path:
+        """
+        Builds a Minimap2 index.
+
+        Args:
+            *targets: Target sequences (Records or file paths).
+            config: Indexing configuration.
+
+        Returns:
+            Path to the index file.
+        """
         if not config: config = self._index_config
 
         # Create a named temp file for the output index
@@ -261,6 +277,17 @@ class Minimap2(ExternalProgram):
         return index_path
 
     def align(self, *queries: Record, targets: Iterable[Record] = (), config: Minimap2AlignConfig = None):
+        """
+        Aligns query sequences to the target index.
+
+        Args:
+            *queries: Query records.
+            targets: Optional targets (if index not already built).
+            config: Alignment configuration.
+
+        Yields:
+            Alignment objects (parsed from PAF).
+        """
         if not config: config = self._align_config
 
         target_arg = None
@@ -300,6 +327,11 @@ class FragGeneScanRs(ExternalProgram):
     nucleotide records.
 
     Requires `FragGeneScanRs` to be in the system's PATH.
+
+    Examples:
+        >>> fgs = FragGeneScanRs()
+        >>> for record in fgs.predict(dna_record):
+        ...     print(len(record.features))
     """
     _ALPHABET = Alphabet.amino()
     _DEFAULT_CONFIG = FragGeneScanRsConfig()
@@ -309,6 +341,17 @@ class FragGeneScanRs(ExternalProgram):
         self._config = config or self._DEFAULT_CONFIG
 
     def predict(self, *seqs: Record, config: FragGeneScanRsConfig = None) -> Generator[Record, None, None]:
+        """
+        Predicts genes in the given sequences.
+
+        Args:
+            *seqs: Input DNA records.
+            config: Configuration options.
+
+        Yields:
+            Protein records (representing the predicted CDS translations).
+            Side effect: Adds CDS features to the input `seqs` objects.
+        """
         config = config or self._config
         args = _build_params(config) + ['--core-file-name', 'stdin']
 

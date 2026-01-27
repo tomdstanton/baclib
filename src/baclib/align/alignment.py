@@ -29,6 +29,15 @@ class CigarParser:
 
     @classmethod
     def parse(cls, cigar: bytes) -> Generator[tuple[bytes, int, int, int, int], None, None]:
+        """
+        Parses a CIGAR string.
+
+        Args:
+            cigar: The CIGAR string as bytes.
+
+        Yields:
+            Tuples of (op_char, count, query_consumed, target_consumed, aln_consumed).
+        """
         ops, counts = _parse_cigar_kernel(cigar, cls._BYTE_TO_OP)
         q_len, t_len, aln_len = 0, 0, 0
         lookup = cls._OP_BYTES_LOOKUP
@@ -43,13 +52,35 @@ class CigarParser:
 
     @staticmethod
     def make(query: np.ndarray, target: np.ndarray, gap_code: int = 255, extended: bool = False) -> bytes:
+        """
+        Constructs a CIGAR string from aligned sequences.
+
+        Args:
+            query: Aligned query sequence (with gaps).
+            target: Aligned target sequence (with gaps).
+            gap_code: Integer code representing a gap.
+            extended: Use extended CIGAR (=/X) instead of M.
+
+        Returns:
+            The CIGAR string as bytes.
+        """
         if len(query) == 0: return b""
         counts, ops = _cigar_rle_kernel(query, target, gap_code, extended)
         return b"".join([b"%d" % c + CigarParser._OP_BYTES_LOOKUP[o] for c, o in zip(counts, ops)])
 
 
 class Alignment(Feature):
-    """Represents a pairwise sequence alignment."""
+    """
+    Represents a pairwise sequence alignment.
+
+    Attributes:
+        query (bytes): Query sequence ID.
+        query_interval (Interval): Interval on the query.
+        target (bytes): Target sequence ID.
+        interval (Interval): Interval on the target (inherited from Feature).
+        score (float): Alignment score.
+        cigar (bytes): CIGAR string.
+    """
     __slots__ = (
         'query', 'query_interval', 'query_length', 'target', 'target_length', 'length', 'cigar', 'score',
         'n_matches', 'quality'
@@ -101,15 +132,19 @@ class Alignment(Feature):
         )
 
     def query_coverage(self) -> float:
+        """Returns the fraction of the query sequence covered by the alignment."""
         return len(self.query_interval) / self.query_length if self.query_length > 0 else 0.0
 
     def target_coverage(self) -> float:
+        """Returns the fraction of the target sequence covered by the alignment."""
         return len(self.interval) / self.target_length if self.target_length > 0 else 0.0
 
     def identity(self) -> float:
+        """Returns the sequence identity (matches / alignment length)."""
         return self.n_matches / self.length if self.length > 0 else 0.0
 
     def flip(self) -> 'Alignment':
+        """Swaps query and target."""
         return Alignment(
             query=self.target, query_interval=self.interval, query_length=self.target_length,
             target=self.query, interval=self.query_interval, target_length=self.query_length,
@@ -122,6 +157,13 @@ class AlignmentBatch:
     """
     High-performance container for alignment batches.
     Stores data in Structure-of-Arrays (SoA) layout.
+
+    Examples:
+        >>> batch = AlignmentBatch.from_alignments([aln1, aln2])
+        >>> len(batch)
+        2
+        >>> batch.scores
+        array([100.,  95.], dtype=float32)
     """
 
     class _Fields:
@@ -279,6 +321,16 @@ class AlignmentBatch:
     def t_strands(self) -> np.ndarray: return self._data[self._Fields.T_STRAND]
 
     def filter(self, query_idxs: Iterable[int] = None, target_idxs: Iterable[int] = None) -> 'AlignmentBatch':
+        """
+        Filters alignments by query or target indices.
+
+        Args:
+            query_idxs: Iterable of query indices to keep.
+            target_idxs: Iterable of target indices to keep.
+
+        Returns:
+            A new filtered AlignmentBatch.
+        """
         mask = None
         if query_idxs is not None:
             # Create a boolean lookup table if range is reasonable, else hash set
@@ -294,6 +346,15 @@ class AlignmentBatch:
         return self[mask] if mask is not None else self[:]
 
     def best(self, by_target: bool = False) -> 'AlignmentBatch':
+        """
+        Keeps only the best scoring alignment for each query (or target).
+
+        Args:
+            by_target: If True, keeps best per target.
+
+        Returns:
+            A new AlignmentBatch.
+        """
         indices = self.t_indices if by_target else self.q_indices
         # To find max ID for array sizing, we scan once.
         # This is safe because indices correspond to SeqBatch,
@@ -303,6 +364,16 @@ class AlignmentBatch:
         return self[np.sort(best_indices)]
 
     def sort(self, by: str = 'score', ascending: bool = False) -> 'AlignmentBatch':
+        """
+        Sorts the batch.
+
+        Args:
+            by: Field to sort by ('score', 'query', 'target').
+            ascending: Sort order.
+
+        Returns:
+            A new sorted AlignmentBatch.
+        """
         # Now we map the 'by' string to our internal fields safely
         lookup = {
             'score': self._Fields.SCORE,

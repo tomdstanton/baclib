@@ -15,7 +15,15 @@ class MotifReader(BaseReader):
 
 
 class MemeReader(MotifReader):
-    """Reader for MEME format files."""
+    """
+    Reader for MEME format files.
+
+    Examples:
+        >>> with open("motifs.meme", "rb") as f:
+        ...     reader = MemeReader(f)
+        ...     for motif in reader:
+        ...         print(motif.name)
+    """
 
     def __iter__(self) -> Generator[Motif, None, None]:
         lines = (line.strip() for line in self._handle)
@@ -103,7 +111,15 @@ class MemeReader(MotifReader):
 
 
 class TransfacReader(MotifReader):
-    """Reader for TRANSFAC format files."""
+    """
+    Reader for TRANSFAC format files.
+
+    Examples:
+        >>> with open("motifs.transfac", "rb") as f:
+        ...     reader = TransfacReader(f)
+        ...     for motif in reader:
+        ...         print(motif.name)
+    """
 
     def __iter__(self) -> Generator[Motif, None, None]:
         lines = (line.strip() for line in self._handle)

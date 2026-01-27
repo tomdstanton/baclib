@@ -46,6 +46,12 @@ class SeqFile:
     Automatically detects file format (e.g., FASTA, GenBank, GFF) and
     compression (e.g., gzip, bzip2), providing a single, unified way to
     iterate over sequence data.
+
+    Examples:
+        >>> # Reading a FASTA file
+        >>> with SeqFile("genome.fasta") as f:
+        ...     for record in f:
+        ...         print(record.id)
     """
     _SUPPORTED_FORMATS = Literal['fasta', 'gfa', 'genbank', 'fastq', 'gff', 'bed', 'paf']
     _READERS = dict(zip(get_args(_SUPPORTED_FORMATS),

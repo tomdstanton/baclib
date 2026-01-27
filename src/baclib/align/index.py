@@ -15,6 +15,11 @@ class BaseIndex(ABC):
     """
     Abstract Base Class for all Sequence Indexes.
     Acts as the configuration context for hashing (k, alphabet, masking).
+
+    Attributes:
+        k (int): K-mer length.
+        alphabet (Alphabet): The alphabet used.
+        canonical (bool): Whether to use canonical k-mers (min of forward/reverse).
     """
 
     def __init__(self, k: int, alphabet: Alphabet, canonical: bool = True):
@@ -99,12 +104,30 @@ class SparseMapIndex(BaseIndex):
         self._built = True
 
     def query(self, seq: Seq) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Queries the index with a single sequence.
+
+        Args:
+            seq: The query sequence.
+
+        Returns:
+            (query_pos, target_pos, target_id) arrays.
+        """
         if not self._built: raise RuntimeError("Index not built")
         # Delegate to subclass to get anchors (now uses batch kernel for consistency)
         q_hashes, q_pos = self._get_anchors(seq)
         return _find_hits_kernel(q_hashes, q_pos, self._hashes, self._positions, self._ids)
 
     def query_batch(self, batch: SeqBatch) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Queries the index with a batch of sequences.
+
+        Args:
+            batch: The query batch.
+
+        Returns:
+            (query_seq_idx, target_seq_idx) arrays.
+        """
         if not self._built: raise RuntimeError("Index not built")
         # We only need hashes and sequence IDs for the query
         hashes, _, batch_ids = self._compute_batch_seeds(batch)
@@ -127,6 +150,11 @@ class SparseMapIndex(BaseIndex):
 class MinimizerIndex(SparseMapIndex):
     """
     Selects anchors based on windowed minimums.
+
+    Examples:
+        >>> idx = MinimizerIndex(k=15, w=10)
+        >>> idx.build(batch)
+        >>> hits = idx.query(query_seq)
     """
 
     def __init__(self, k: int = 15, w: int = 10, alphabet: Alphabet = None):
@@ -155,6 +183,10 @@ class MinimizerIndex(SparseMapIndex):
 class SyncmerIndex(SparseMapIndex):
     """
     Selects anchors based on internal structure (Open Syncmers).
+
+    Examples:
+        >>> idx = SyncmerIndex(k=15, s=5)
+        >>> idx.build(batch)
     """
 
     def __init__(self, k: int = 15, s: int = 5, t: int = 0, alphabet: Alphabet = None):
@@ -189,6 +221,11 @@ class MinHashSketch(BaseIndex):
     """
     Compression Index for Distance Estimation (Jaccard/ANI).
     Stores hashes in multiple memory blocks to allow instant updates.
+
+    Examples:
+        >>> sketch = MinHashSketch(k=21, size=1000)
+        >>> sketch.build(batch)
+        >>> dists = sketch.query(query_seq)
     """
 
     def __init__(self, k: int = 16, size: int = 1000, alphabet: Alphabet = None):
@@ -216,6 +253,12 @@ class MinHashSketch(BaseIndex):
     def query(self, seq: Seq = None) -> np.ndarray:
         """
         Query the index.
+
+        Args:
+            seq: The query sequence. If None, computes all-vs-all distances.
+
+        Returns:
+            Array of Jaccard similarities.
         """
         if not self._built: raise RuntimeError("Index not built")
 
@@ -234,6 +277,12 @@ class MinHashSketch(BaseIndex):
     def query_batch(self, batch: SeqBatch) -> np.ndarray:
         """
         Batch query (Many-vs-Many).
+
+        Args:
+            batch: The query batch.
+
+        Returns:
+            Matrix of Jaccard similarities (M x N).
         """
         if not self._built: raise RuntimeError("Index not built")
 

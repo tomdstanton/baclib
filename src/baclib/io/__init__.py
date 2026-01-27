@@ -161,7 +161,13 @@ class TabularReader(BaseReader):
 
 # Writers --------------------------------------------------------------------------------------------------------------
 class BaseWriter(ABC):
-    """Abstract base class for sequence file writers."""
+    """
+    Abstract base class for sequence file writers.
+
+    Examples:
+        >>> with FastaWriter("output.fasta") as w:
+        ...     w.write(record1, record2)
+    """
 
     def __init__(self, file: Union[str, Path, BinaryIO], mode: str = 'wb', compression: str = 'guess', **kwargs):
         """

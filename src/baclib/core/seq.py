@@ -23,7 +23,23 @@ class TranslationError(AlphabetError): pass
 # Classes --------------------------------------------------------------------------------------------------------------
 class Alphabet:
     """
-    A class to represent an alphabet of ASCII symbols
+    A class to represent an alphabet of ASCII symbols.
+
+    This class handles encoding/decoding of sequences and provides factory methods
+    for creating `Seq` objects.
+
+    Attributes:
+        DTYPE: The numpy dtype used for internal storage (uint8).
+        INVALID: The value used to represent invalid symbols.
+        MAX_LEN: Maximum alphabet size.
+        ENCODING: The encoding used for string conversion ('ascii').
+
+    Examples:
+        >>> dna = Alphabet.dna()
+        >>> len(dna)
+        4
+        >>> 'A' in dna
+        True
     """
     _EXTENSIONS = {'gbk': 'dna', 'genbank': 'dna', 'fasta': 'dna', 'fna': 'dna',
                    'ffn': 'dna', 'ffa': 'dna', 'faa': 'amino'}
@@ -35,6 +51,16 @@ class Alphabet:
     ENCODING: Final = 'ascii'
 
     def __init__(self, symbols: bytes, complement: bytes = None):
+        """
+        Initializes an Alphabet.
+
+        Args:
+            symbols: The symbols in the alphabet as bytes.
+            complement: Optional complement symbols as bytes. Must be same length as symbols.
+
+        Raises:
+            AlphabetError: If symbols are not ASCII, too long, contain duplicates, or if complement is invalid.
+        """
         if not symbols.isascii(): raise AlphabetError('Alphabet symbols must be a valid ASCII string')
         if len(symbols) > self.MAX_LEN:
             raise AlphabetError(f'Alphabet size cannot exceed {self.MAX_LEN} symbols ({self.DTYPE})')
@@ -101,14 +127,27 @@ class Alphabet:
 
     @property
     def bits_per_symbol(self) -> int:
+        """Returns the number of bits required to represent a symbol in this alphabet."""
         return (len(self._data) - 1).bit_length()
 
     @property
     def complement(self):
+        """Returns the complement lookup table if available."""
         return self._complement
 
     def masker(self, k: int) -> tuple[int, int, np.dtype]:
-        """Returns (bits_per_symbol, bit_mask, dtype) for a specific K."""
+        """
+        Returns (bits_per_symbol, bit_mask, dtype) for a specific K.
+
+        Args:
+            k: The k-mer length.
+
+        Returns:
+            A tuple of (bits_per_symbol, bit_mask, dtype).
+
+        Raises:
+            ValueError: If K is too large for 64-bit hashing.
+        """
         bps = self.bits_per_symbol
         total_bits = k * bps
         if total_bits <= 32:
@@ -122,18 +161,42 @@ class Alphabet:
 
     @classmethod
     def dna(cls):
+        """
+        Returns the standard DNA alphabet (TCAG).
+        
+        Returns:
+            The DNA Alphabet singleton.
+        """
         if (cached := cls._CACHE.get('dna')) is None:  # Note: We can reuse the same RC table logic
             cls._CACHE['dna'] = (cached := Alphabet(b'TCAG', b'AGTC'))
         return cached
 
     @classmethod
     def amino(cls):
+        """
+        Returns the standard Amino Acid alphabet.
+        
+        Returns:
+            The Amino Acid Alphabet singleton.
+        """
         if (cached := cls._CACHE.get('amino')) is None:
             cls._CACHE['amino'] = (cached := Alphabet(b'ACDEFGHIKLMNPQRSTVWY*'))
         return cached
 
     @classmethod
     def from_extension(cls, extension: str, *args, **kwargs):
+        """
+        Returns an Alphabet based on a file extension.
+
+        Args:
+            extension: The file extension (e.g., 'fasta', 'gbk').
+
+        Returns:
+            The corresponding Alphabet.
+
+        Raises:
+            AlphabetError: If the extension is unknown.
+        """
         if alphabet := cls._EXTENSIONS.get(extension, None):
             return getattr(cls, alphabet)(*args, **kwargs)
         raise AlphabetError(f'Unknown extension "{extension}"')
@@ -141,15 +204,45 @@ class Alphabet:
     def encode(self, text: bytes) -> np.ndarray:
         """
         Zero-copy encoding from Byte String to Array.
+
+        Args:
+            text: The text to encode as bytes.
+
+        Returns:
+            A numpy array of encoded indices.
         """
         return np.frombuffer(text.translate(self._trans_table, delete=self._delete_bytes), dtype=self.DTYPE)
 
     def decode(self, encoded: np.ndarray) -> bytes:
+        """
+        Decodes an array of indices back to bytes.
+
+        Args:
+            encoded: The numpy array of indices.
+
+        Returns:
+            The decoded bytes.
+        """
         return self._data[encoded].tobytes()
 
     def seq(self, seq: Union['Seq', str, bytes, np.ndarray]) -> 'Seq':
         """
         Factory method. The ONLY valid way to create a Seq.
+
+        Args:
+            seq: The sequence data. Can be a Seq, str, bytes, or numpy array.
+
+        Returns:
+            A Seq object.
+
+        Raises:
+            AlphabetError: If the sequence contains invalid symbols or has a different alphabet.
+
+        Examples:
+            >>> dna = Alphabet.dna()
+            >>> s = dna.seq("ACGT")
+            >>> str(s)
+            'ACGT'
         """
         # 1. Handle Pre-encoded (Optimization for internal use)
         if isinstance(seq, Seq):
@@ -166,7 +259,25 @@ class Alphabet:
 
     def random(self, rng: np.random.Generator = None, length: int = None, min_len: int = 5, max_len: int = 5000,
                weights=None) -> 'Seq':
-        """Generates a random sequence from this alphabet and coerces it to a Seq object"""
+        """
+        Generates a random sequence from this alphabet and coerces it to a Seq object.
+
+        Args:
+            rng: Random number generator (optional).
+            length: Exact length of sequence to generate.
+            min_len: Minimum length if length is not specified.
+            max_len: Maximum length if length is not specified.
+            weights: Weights for each symbol (optional).
+
+        Returns:
+            A random Seq object.
+
+        Examples:
+            >>> dna = Alphabet.dna()
+            >>> s = dna.random(length=10)
+            >>> len(s)
+            10
+        """
         if rng is None: rng = RESOURCES.rng
         length = length or rng.integers(min_len, max_len)
         # Optimization: Generate encoded indices directly (avoiding bytes round-trip)
@@ -179,7 +290,17 @@ class Alphabet:
 
     def random_many(self, lengths: Iterable[int], rng: np.random.Generator = None, weights=None) -> Generator[
         'Seq', None, None]:
-        """Generates multiple random sequences efficiently."""
+        """
+        Generates multiple random sequences efficiently.
+
+        Args:
+            lengths: An iterable of lengths for the sequences.
+            rng: Random number generator (optional).
+            weights: Weights for each symbol (optional).
+
+        Yields:
+            Random Seq objects.
+        """
         if rng is None: rng = RESOURCES.rng
         lengths = np.asanyarray(lengths, dtype=np.int64)
         if lengths.size == 0: return
@@ -199,14 +320,31 @@ class Alphabet:
             current += l
 
     def reverse_complement(self, seq: 'Seq') -> 'Seq':
-        """Reverse complements the sequence if the alphabet has a complement"""
+        """
+        Reverse complements the sequence if the alphabet has a complement.
+
+        Args:
+            seq: The input sequence.
+
+        Returns:
+            The reverse complemented sequence.
+
+        Examples:
+            >>> dna = Alphabet.dna()
+            >>> s = dna.seq("ACGT")
+            >>> rc = dna.reverse_complement(s)
+            >>> str(rc)
+            'ACGT'
+        """
         if self._complement is None: return seq
         # Use .encoded for direct numpy access (much faster than iterating reversed(seq))
         return self.seq(self._complement[seq.encoded[::-1]])
 
 
 class GeneticCode:
-    """Represents a genetic code table for translation"""
+    """
+    Represents a genetic code table for translation.
+    """
     _TABLES = {11: b'FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG'}
     _DNA = Alphabet.dna()
     _AMINO = Alphabet.amino()
@@ -223,6 +361,18 @@ class GeneticCode:
 
     @classmethod
     def from_code(cls, code: int) -> 'GeneticCode':
+        """
+        Gets a GeneticCode instance by its NCBI table ID.
+
+        Args:
+            code: The NCBI genetic code ID (e.g., 11 for Bacterial).
+
+        Returns:
+            A GeneticCode instance.
+
+        Raises:
+            NotImplementedError: If the code is not implemented.
+        """
         if (cached := cls._CACHE.get(code)) is None:
             if (table := cls._TABLES.get(code)) is None: raise NotImplementedError('Genetic code not implemented')
             cached = GeneticCode()
@@ -232,6 +382,27 @@ class GeneticCode:
         return cached
 
     def translate(self, seq: 'Seq', frame: Literal[0, 1, 2] = 0) -> 'Seq':
+        """
+        Translates a DNA sequence to Amino Acids.
+
+        Args:
+            seq: The DNA sequence.
+            frame: The reading frame (0, 1, or 2).
+
+        Returns:
+            The translated protein sequence.
+
+        Raises:
+            TranslationError: If the sequence is too short.
+
+        Examples:
+            >>> dna = Alphabet.dna()
+            >>> s = dna.seq("ATG")
+            >>> gc = GeneticCode.from_code(11)
+            >>> p = gc.translate(s)
+            >>> str(p)
+            'M'
+        """
         # Use encoded sequence (0-3 integers) for faster lookup in small table
         # This avoids cache misses associated with the large 16MB lookup table
         n = len(seq)
@@ -243,7 +414,15 @@ class GeneticCode:
         return self._AMINO.seq(translation)
 
     def translate_all(self, seq: 'Seq') -> tuple['Seq', 'Seq', 'Seq']:
-        """Translates all 3 forward reading frames efficiently."""
+        """
+        Translates all 3 forward reading frames efficiently.
+
+        Args:
+            seq: The DNA sequence.
+
+        Returns:
+            A tuple of 3 Seq objects (Frame 0, Frame 1, Frame 2).
+        """
         if len(seq) < 3: raise TranslationError('Cannot translate sequence with less than 1 codon')
 
         # Optimization: Use Numba kernel to avoid allocating intermediate 'indices' and 'translation' arrays
@@ -253,6 +432,13 @@ class GeneticCode:
     def translate_batch(self, batch: 'SeqBatch', frame: int = 0) -> 'SeqBatch':
         """
         Translates an entire SeqBatch efficiently.
+
+        Args:
+            batch: The batch of sequences to translate.
+            frame: The reading frame.
+
+        Returns:
+            A new SeqBatch containing translated sequences.
         """
         new_batch = SeqBatch([], self._AMINO)
         if len(batch) == 0: return new_batch
@@ -296,6 +482,15 @@ class Seq:
     """
     Sequence container optimized for high-throughput genomics.
     Holds ONLY encoded integers (uint8) to minimize memory usage.
+
+    Note:
+        Seq objects should be created via `Alphabet.seq()` or `Alphabet.random()`.
+
+    Examples:
+        >>> dna = Alphabet.dna()
+        >>> s = dna.seq("ACGT")
+        >>> len(s)
+        4
     """
     __slots__ = ('_data', '_alphabet', '_hash')
     DTYPE: Final = np.uint8
@@ -399,6 +594,15 @@ class Seq:
         return bytes(self) >= bytes(other)
 
     def __getitem__(self, item: Union[slice, int, Interval]) -> 'Seq':
+        """
+        Gets a subsequence.
+
+        Args:
+            item: Index, slice, or Interval.
+
+        Returns:
+            A new Seq object representing the subsequence.
+        """
         # 1. Standard Slicing (Fastest)
         if isinstance(item, slice):
             # Numpy handles the slicing logic/views
@@ -430,6 +634,12 @@ class Seq:
         """
         Generates a deterministic, fixed-length ID based on the sequence content.
         Uses BLAKE2b hashing. Output is a hex string (2 * digest_size chars).
+
+        Args:
+            digest_size: Size of the digest in bytes.
+
+        Returns:
+            The hex digest as bytes.
         """
         return blake2b(self._data.tobytes(), digest_size=digest_size, usedforsecurity=False).hexdigest().encode('ascii')
 
@@ -444,6 +654,10 @@ class SeqBatch:
     def __init__(self, items: Iterable[Seq], alphabet: 'Alphabet' = None):
         """
         Optimized initialization that prevents memory spikes.
+
+        Args:
+            items: Iterable of Seq objects.
+            alphabet: The alphabet of the sequences. If None, inferred from first sequence.
         """
         self._alphabet = None
         # 1. Handle Pre-sized Lists (Fast Path)

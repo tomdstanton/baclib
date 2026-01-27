@@ -4,7 +4,15 @@ from baclib.io import TabularReader
 
 
 class PafReader(TabularReader):
-    """Reader for PAF (Pairwise mApping Format) files."""
+    """
+    Reader for PAF (Pairwise mApping Format) files.
+
+    Examples:
+        >>> with open("alignments.paf", "rb") as f:
+        ...     reader = PafReader(f)
+        ...     for aln in reader:
+        ...         print(aln.score)
+    """
     _min_cols = 12
 
     def parse_row(self, parts: list[bytes]) -> Alignment:

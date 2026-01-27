@@ -60,6 +60,16 @@ class WeightingPolicy:
 class Edge:
     """
     Represents a directed edge between two nodes with optional attributes.
+
+    Attributes:
+        u (bytes): Source node ID.
+        v (bytes): Target node ID.
+        attributes (dict): Edge attributes.
+
+    Examples:
+        >>> e = Edge(b'node1', b'node2', {b'weight': 10})
+        >>> e.u
+        b'node1'
     """
     __slots__ = ('_u', '_v', 'attributes')
 
@@ -107,6 +117,11 @@ class Edge:
 class Path:
     """
     Represents a path through the graph.
+
+    Attributes:
+        nodes (list[bytes]): List of node IDs in the path.
+        total_cost (float): Total cost of the path.
+        policy (WeightingPolicy): The policy used to calculate cost.
     """
     __slots__ = ('nodes', 'total_cost', 'policy')
 
@@ -147,6 +162,16 @@ class Graph:
     """
     A simple graph object which act as an abstraction layer on top on scipy sparce matrices; nodes are string
     references to objects in memory.
+
+    Examples:
+        >>> g = Graph()
+        >>> g.add_node(b'A')
+        >>> g.add_node(b'B')
+        >>> g.add_edges([Edge(b'A', b'B', {b'weight': 5})])
+        >>> p = WeightingPolicy(b'weight')
+        >>> path = g.shortest_path(b'A', b'B', p)
+        >>> path.total_cost
+        5.0
     """
     _MAX_PENALTY = 1e12
     _PATHFINDERS = {'D': _d, 'FW': _fw, 'BF': _bf, 'J': _j}
@@ -374,6 +399,17 @@ class Graph:
         """
         Identifies paths between bridged nodes. Automatically switches to dense
         Floyd-Warshall for small graphs to improve performance.
+
+        Args:
+            bridges: Iterable of (start, end) tuples.
+            policy: WeightingPolicy.
+            algorithm: Algorithm to use.
+            max_cost: Max path cost.
+            create_edges: If True, creates bridge edges for missing paths.
+            pool: Executor for parallel processing.
+
+        Yields:
+            Path objects.
         """
         # 1. Group bridges
         bridges_map = defaultdict(set)

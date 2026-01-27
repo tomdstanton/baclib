@@ -23,6 +23,15 @@ _TR_F_EXT = 8
 
 # Classes --------------------------------------------------------------------------------------------------------------
 class ScoreMatrix:
+    """
+    Represents a substitution matrix for alignment.
+
+    Attributes:
+        _data (np.ndarray): The raw matrix data.
+
+    Examples:
+        >>> m = ScoreMatrix.build(4, match=2, mismatch=-2)
+    """
     _DTYPE = np.int8
     __slots__ = ('_data',)
 
@@ -30,6 +39,7 @@ class ScoreMatrix:
 
     @classmethod
     def blosum62(cls):
+        """Returns the BLOSUM62 matrix."""
         return cls(np.reshape([
             4, 0, -2, -1, -2, 0, -2, -1, -1, -1, -1, -2, -1, -1, -1, 1, 0, 0, -3, -2,
             0, 9, -3, -4, -2, -3, -3, -1, -3, -1, -1, -3, -3, -3, -3, -1, -1, -1, -2, -2,
@@ -55,6 +65,7 @@ class ScoreMatrix:
 
     @classmethod
     def build(cls, n, match=1, mismatch=-1):
+        """Builds a simple match/mismatch matrix."""
         M = np.full((n, n), mismatch, dtype=cls._DTYPE)
         np.fill_diagonal(M, match)
         return cls(M)
@@ -73,6 +84,11 @@ class Aligner:
     """
     High-performance pairwise aligner.
     Optimized for Seeding -> Window Extraction -> DP.
+
+    Examples:
+        >>> aligner = Aligner()
+        >>> aligner.build(target_batch)
+        >>> hits = aligner.map(query_batch)
     """
     __slots__ = ('_index', '_score_matrix', '_data', 'gap_open', 'gap_extend', '_mode', '_compute_traceback',
                  '_score_kernel', '_full_kernel', '_traceback_kernel')
@@ -107,6 +123,7 @@ class Aligner:
         self._traceback_kernel = kernels['trace']
 
     def build(self, targets: SeqBatch):
+        """Builds the index on the target sequences."""
         self._data = targets
         self._index.build(targets)
 
@@ -114,6 +131,15 @@ class Aligner:
             padding: int = 50) -> AlignmentBatch:
         """
         Aligns queries to the built index.
+
+        Args:
+            queries: Query sequences.
+            min_score: Minimum alignment score to report.
+            min_seeds: Minimum seeds to trigger alignment.
+            padding: Padding around seed clusters.
+
+        Returns:
+            AlignmentBatch containing the alignments.
         """
         if not isinstance(queries, SeqBatch): queries = SeqBatch(queries)
 

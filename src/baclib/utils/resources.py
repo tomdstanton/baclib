@@ -14,6 +14,14 @@ from typing import Callable
 
 # Classes --------------------------------------------------------------------------------------------------------------
 class Resources:
+    """
+    Manages global resources like thread pools, random number generators,
+    and optional dependencies.
+
+    Attributes:
+        package (str): The package name.
+        optional_packages (set): Set of installed optional packages.
+    """
     def __init__(self, *optional_packages: str):
         self.package = Path(__file__).parent.name
         self.optional_packages = set(filter(self._check_module, optional_packages))
@@ -27,17 +35,23 @@ class Resources:
     # def metadata(self): return load_metadata(self.package)
 
     @cached_property
-    def rng(self): return default_rng()
+    def rng(self):
+        """Returns a default numpy random number generator."""
+        return default_rng()
 
     @cached_property
     def available_cpus(self) -> int:
+        """Returns the number of available CPUs."""
         try: return os.process_cpu_count()
         except AttributeError: return os.cpu_count()
 
     @cached_property
-    def pool(self) -> ThreadPoolExecutor: return ThreadPoolExecutor(min(32, (self.available_cpus or 1) + 4))
+    def pool(self) -> ThreadPoolExecutor:
+        """Returns a shared ThreadPoolExecutor."""
+        return ThreadPoolExecutor(min(32, (self.available_cpus or 1) + 4))
 
     def shutdown(self):
+        """Shuts down the thread pool."""
         # Check if 'pool' is in __dict__ (meaning it was initialized)
         if 'pool' in self.__dict__: self.pool.shutdown(wait=False, cancel_futures=True)
 

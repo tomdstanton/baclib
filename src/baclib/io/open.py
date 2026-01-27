@@ -106,6 +106,10 @@ class PeekableHandle:
 class Xopen:
     """
     Handles the Physical Layer: Compression and File System.
+
+    Examples:
+        >>> with Xopen("file.gz", "rb") as f:
+        ...     content = f.read()
     """
     _MAGIC = {
         b'\x1f\x8b': 'gzip',
