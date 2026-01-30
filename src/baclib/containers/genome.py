@@ -5,7 +5,7 @@ from typing import Optional, Iterable
 import numpy as np
 
 from baclib.utils.resources import RESOURCES
-from baclib.io.dispatcher import SeqFile
+from baclib.io import SeqFile
 from baclib.core.seq import Alphabet
 from baclib.containers.record import Record, RecordBatch
 from baclib.containers.graph import Graph, Edge
@@ -126,24 +126,22 @@ class Genome:
             A random Genome object.
         """
         if rng is None: rng = RESOURCES.rng
-        if n_contigs is None: n_contigs = int(rng.integers(min_contigs, max_contigs))
 
         genome = cls(b"random_genome_%b" % rng.integers(0, 100_000))
 
-        # Optimization: Generate contigs directly instead of shredding a massive sequence
-        if length is not None:
-            # Partition total length into n_contigs
-            if n_contigs > 1:
-                cuts = np.sort(rng.integers(0, length, size=n_contigs - 1))
-                bounds = np.concatenate(([0], cuts, [length]))
-                lengths = np.diff(bounds)
-            else:
-                lengths = [length]
-        else:
-            lengths = rng.integers(min_len, max_len, size=n_contigs)
+        # Delegate sequence generation to the optimized batch method
+        batch = cls._ALPHABET.random_batch(
+            rng=rng,
+            n_seqs=n_contigs,
+            min_seqs=min_contigs,
+            max_seqs=max_contigs,
+            length=length,
+            min_len=min_len,
+            max_len=max_len,
+            weights=weights
+        )
 
-        lengths = np.maximum(1, lengths)
-        for i, seq in enumerate(cls._ALPHABET.random_many(lengths, rng=rng, weights=weights)):
+        for i, seq in enumerate(batch):
             contig = Record(seq, id_=b"contig_%d" % (i+1))
             genome.contigs[contig.id] = contig
 

@@ -7,7 +7,7 @@ from baclib.containers.record import Feature
 from baclib.core.interval import Interval
 from baclib.utils.resources import RESOURCES, jit
 
-if 'numba' in RESOURCES.optional_packages: from numba import prange
+if RESOURCES.has_module('numba'): from numba import prange
 else: prange = range
 
 
@@ -421,4 +421,3 @@ def _scan_fill_kernel(data, starts, lengths, pssm, score_threshold, max_suffix, 
                 out_scores[out_idx] = score
                 out_seq_idxs[out_idx] = i
                 out_idx += 1
-

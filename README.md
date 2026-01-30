@@ -99,7 +99,7 @@ dna = Alphabet.dna()
 seq = dna.seq("ATGCGTAGCTAG")
 
 # Or generate a random sequence
-seq = dna.random(length=100)
+seq = dna.random_seq(length=100)
 
 # Reverse complement
 rc_seq = dna.reverse_complement(seq)
@@ -122,8 +122,8 @@ from baclib.core.seq import Alphabet, SeqBatch
 dna = Alphabet.dna()
 
 # Create random sequences
-targets = SeqBatch([dna.random(length=1000) for _ in range(5)], alphabet=dna)
-queries = SeqBatch([dna.random(length=100) for _ in range(2)], alphabet=dna)
+targets = SeqBatch([dna.random_seq(length=1000) for _ in range(5)], alphabet=dna)
+queries = SeqBatch([dna.random_seq(length=100) for _ in range(2)], alphabet=dna)
 
 # Initialize aligner (Glocal mode: Global in Query, Local in Target)
 aligner = Aligner(mode='glocal', compute_traceback=True)
@@ -149,8 +149,8 @@ from baclib.containers.record import Record
 from baclib.core.seq import Alphabet
 
 dna = Alphabet.dna()
-ref = Record(dna.random(length=10000), id_=b"ref")
-query = Record(dna.random(length=1000), id_=b"query")
+ref = Record(dna.random_seq(length=10000), id_=b"ref")
+query = Record(dna.random_seq(length=1000), id_=b"query")
 
 # Align using Minimap2 wrapper (handles indexing automatically)
 with Minimap2(ref) as mapper:

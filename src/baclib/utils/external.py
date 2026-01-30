@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Iterable, Generator, Union, Literal, Optional, Any, IO
 from subprocess import Popen, PIPE, DEVNULL
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, fields
 from threading import Thread
 import errno
 
@@ -14,7 +14,7 @@ from baclib.core.seq import Alphabet
 from baclib.containers.record import Record, Feature
 from baclib.io.align import PafReader
 from baclib.io.seq import FastaWriter, FastaReader
-from baclib.utils import Config, find_executable_binaries, LiteralFile
+from baclib.utils import Config, LiteralFile
 from baclib.utils.resources import RESOURCES
 
 
@@ -50,12 +50,20 @@ class _ProcessStream:
         if self._closed: return
         self._closed = True
 
+        # Prevent deadlocks: If the process is still running, it might be blocked writing to us.
+        terminated = False
+        if self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+                terminated = True
+            except OSError: pass
+
         # Wait for process to finish
         self._proc.wait()
         self._thread.join()
 
         # Check for errors
-        if self._proc.returncode != 0:
+        if not terminated and self._proc.returncode != 0:
             stderr = self._proc.stderr.read()
             raise ExternalProgramError(f"{self._program} failed (code {self._proc.returncode}): {stderr.decode('utf-8', errors='replace')}")
 
@@ -74,7 +82,7 @@ class ExternalProgram:
     optimized to avoid using `shell=True` for security and performance.
     """
     def __init__(self, program: str):
-        if not (binary := next(find_executable_binaries(program), None)):
+        if not (binary := RESOURCES.find_binary(program)):
             raise ExternalProgramError(f'Could not find {program}')
         self._program = program
         self._binary = binary
@@ -124,7 +132,8 @@ class ExternalProgram:
             try:
                 # writer_cls (e.g. FastaWriter) wraps the pipe
                 with writer_cls(proc.stdin) as writer:
-                    writer.write(*input_items)
+                    for item in input_items:
+                        writer.write_one(item)
             except BrokenPipeError:
                 # Process died early or closed stdin; stop writing silently.
                 # The main thread will handle the process exit code/stderr.
@@ -147,6 +156,19 @@ class ExternalProgram:
         t.start()
 
         return _ProcessStream(proc, t, write_error, self._program)
+
+    @staticmethod
+    def _build_params(config: Config) -> list[str]:
+        params = []
+        for field in fields(config):
+            key = field.name
+            val = getattr(config, key)
+            if val is None or val is False: continue
+            flag = f"-{key}" if len(key) == 1 else f"--{key.replace('_', '-')}"
+            params.append(flag)
+            if val is not True:
+                params.append(str(val))
+        return params
 
 
 @dataclass
@@ -254,10 +276,17 @@ class Minimap2(ExternalProgram):
         tf.close()
         index_path = Path(tf.name)
 
-        params = _build_params(config)
+        params = self._build_params(config)
 
         # Check if targets are Paths/Strings (already on disk) or Records (need streaming)
-        all_paths = all(isinstance(t, (str, Path)) and Path(t).exists() for t in targets)
+        all_paths = True
+        for t in targets:
+            if not isinstance(t, (str, Path)):
+                all_paths = False
+                break
+            if not Path(t).exists():
+                all_paths = False
+                break
 
         if all_paths:
             args = params + ['-d', str(index_path)] + [str(t) for t in targets]
@@ -266,7 +295,7 @@ class Minimap2(ExternalProgram):
             # Stream records to stdin ('-')
             args = params + ['-d', str(index_path), '-']
             # Consume generator locally
-            with self._stream_input_output(args, targets, FastaWriter) as stream:
+            with self._stream_input_output(args, targets, lambda f: FastaWriter(f, width=0)) as stream:
                 for _ in stream: pass
 
         if not LiteralFile.from_path(index_path, return_bool=True):
@@ -298,10 +327,10 @@ class Minimap2(ExternalProgram):
         else:
             raise Minimap2Error('Targets must be supplied if no target index has been built')
 
-        params = _build_params(config)
+        params = self._build_params(config)
         args = params + [target_arg, '-']
 
-        with self._stream_input_output(args, queries, FastaWriter) as stream:
+        with self._stream_input_output(args, queries, lambda f: FastaWriter(f, width=0)) as stream:
             yield from PafReader(stream)
 
 
@@ -353,11 +382,11 @@ class FragGeneScanRs(ExternalProgram):
             Side effect: Adds CDS features to the input `seqs` objects.
         """
         config = config or self._config
-        args = _build_params(config) + ['--core-file-name', 'stdin']
+        args = self._build_params(config) + ['--core-file-name', 'stdin']
 
         seq_map = {i.id: i for i in seqs}
 
-        with self._stream_input_output(args, seqs, FastaWriter) as stream:
+        with self._stream_input_output(args, seqs, lambda f: FastaWriter(f, width=0)) as stream:
             for record in FastaReader(stream, alphabet=self._ALPHABET):
                 try:
                     # FragGeneScanRs header: >parent_start_end_strand
@@ -378,16 +407,3 @@ class FragGeneScanRs(ExternalProgram):
                     pass
 
                 yield record
-
-
-# Helpers --------------------------------------------------------------------------------------------------------------
-def _build_params(config: Config) -> list[str]:
-    params = []
-    for k, v in asdict(config).items():
-        if v is None or v is False: continue
-        flag = f"-{k}" if len(k) == 1 else f"--{k.replace('_', '-')}"
-        if v is True: params.append(flag)
-        else:
-            params.append(flag)
-            params.append(str(v))
-    return params

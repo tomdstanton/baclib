@@ -1,13 +1,16 @@
 from abc import ABC, abstractmethod
+from enum import IntEnum
+from typing import Union
 import numpy as np
 
 from baclib.core.seq import Seq, SeqBatch, Alphabet
 from baclib.utils.resources import RESOURCES, jit
 
-if 'numba' in RESOURCES.optional_packages:
+if RESOURCES.has_module('numba'):
     from numba import prange
 else:
     prange = range
+
 
 
 # --- Base Classes -----------------------------------------------------------------------------------------------------
@@ -21,10 +24,11 @@ class BaseIndex(ABC):
         alphabet (Alphabet): The alphabet used.
         canonical (bool): Whether to use canonical k-mers (min of forward/reverse).
     """
-
-    def __init__(self, k: int, alphabet: Alphabet, canonical: bool = True):
+    __slots__ = ('_k', '_alphabet', '_canonical', '_built', '_bps', '_mask', '_dtype', '_rc_table')
+    _DEFAULT_ALPHABET = Alphabet.dna()
+    def __init__(self, k: int, alphabet: Alphabet = None, canonical: bool = True):
         self._k = k
-        self._alphabet = alphabet
+        self._alphabet = alphabet or self._DEFAULT_ALPHABET
         self._canonical = canonical
         self._built = False
 
@@ -57,164 +61,7 @@ class BaseIndex(ABC):
     @property
     def rc_table(self) -> np.ndarray: return self._rc_table
     @abstractmethod
-    def query(self, seq: Seq): ...
-    @abstractmethod
-    def query_batch(self, seq: SeqBatch): ...
-
-    def _hash_scalar(self, seq: Seq) -> np.ndarray:
-        """Helper: Hashes a single sequence. Used by MinHashSketch."""
-        encoded = seq.encoded
-        hashes = _rolling_hash_kernel(encoded, self._k, self._bps, self._mask, self._dtype)
-        if self.canonical:
-            hashes_rc = _rolling_hash_rc_kernel(
-                encoded, self._k, self._bps, self._mask, self._dtype, self._rc_table
-            )
-            np.minimum(hashes, hashes_rc, out=hashes)
-        return hashes
-
-
-class SparseMapIndex(BaseIndex):
-    """
-    Parent class for Mapping/Seeding indexes (Minimizers & Syncmers).
-    Manages the storage, sorting, and querying of sparse anchors.
-    """
-
-    def __init__(self, k: int, alphabet: Alphabet, canonical: bool = True):
-        super().__init__(k, alphabet, canonical)
-        self._n_seqs = 0
-
-        # Use dtype from alphabet for hashes
-        self._hashes = np.empty(0, dtype=self._dtype)
-        self._positions = np.empty(0, dtype=np.uint32)
-        self._ids = np.empty(0, dtype=np.uint32)
-
-    def __len__(self) -> int:
-        return self._n_seqs
-
-    def build(self, batch: SeqBatch):
-        """Builds the index from a single batch of sequences."""
-        self._n_seqs = len(batch)
-        hashes, pos, ids = self._compute_batch_seeds(batch)
-
-        sorter = np.argsort(hashes)
-        self._hashes = hashes[sorter]
-        self._positions = pos[sorter]
-        self._ids = ids[sorter]
-
-        self._built = True
-
-    def query(self, seq: Seq) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Queries the index with a single sequence.
-
-        Args:
-            seq: The query sequence.
-
-        Returns:
-            (query_pos, target_pos, target_id) arrays.
-        """
-        if not self._built: raise RuntimeError("Index not built")
-        # Delegate to subclass to get anchors (now uses batch kernel for consistency)
-        q_hashes, q_pos = self._get_anchors(seq)
-        return _find_hits_kernel(q_hashes, q_pos, self._hashes, self._positions, self._ids)
-
-    def query_batch(self, batch: SeqBatch) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Queries the index with a batch of sequences.
-
-        Args:
-            batch: The query batch.
-
-        Returns:
-            (query_seq_idx, target_seq_idx) arrays.
-        """
-        if not self._built: raise RuntimeError("Index not built")
-        # We only need hashes and sequence IDs for the query
-        hashes, _, batch_ids = self._compute_batch_seeds(batch)
-        
-        # Pass batch_ids (query sequence indices) as 'q_pos' to the kernel
-        # so the returned q_idxs correspond to sequence indices.
-        q_idxs, _, t_ids = _find_hits_kernel(
-            hashes, batch_ids, self._hashes, self._positions, self._ids
-        )
-        # Return query_seq_idx and target_seq_idx
-        return q_idxs, t_ids
-
-    @abstractmethod
-    def _get_anchors(self, seq: Seq) -> tuple[np.ndarray, np.ndarray]: ...
-    @abstractmethod
-    def _compute_batch_seeds(self, batch: SeqBatch) -> tuple[np.ndarray, np.ndarray, np.ndarray]:  ...
-
-
-# --- Implementations --------------------------------------------------------------------------------------------------
-class MinimizerIndex(SparseMapIndex):
-    """
-    Selects anchors based on windowed minimums.
-
-    Examples:
-        >>> idx = MinimizerIndex(k=15, w=10)
-        >>> idx.build(batch)
-        >>> hits = idx.query(query_seq)
-    """
-
-    def __init__(self, k: int = 15, w: int = 10, alphabet: Alphabet = None):
-        super().__init__(k, alphabet or Alphabet.dna(), canonical=True)
-        self._w = w
-
-    @property
-    def w(self) -> int: return self._w
-
-    def _get_anchors(self, seq: Seq):
-        # reuse batch kernel with single item for max code reuse
-        batch = SeqBatch([seq], seq.alphabet)
-        h, p, _ = _batch_minimizer_kernel(
-            *batch.arrays, self._k, self._w, self._bps, self._mask, self._dtype, self._rc_table
-        )
-        return h, p
-
-    def _compute_batch_seeds(self, batch: SeqBatch):
-        data, starts, lengths = batch.arrays
-        n = len(batch)
-        return _batch_minimizer_kernel(
-            data, starts[:n], lengths[:n], self._k, self._w, self._bps, self._mask, self._dtype, self._rc_table
-        )
-
-
-class SyncmerIndex(SparseMapIndex):
-    """
-    Selects anchors based on internal structure (Open Syncmers).
-
-    Examples:
-        >>> idx = SyncmerIndex(k=15, s=5)
-        >>> idx.build(batch)
-    """
-
-    def __init__(self, k: int = 15, s: int = 5, t: int = 0, alphabet: Alphabet = None):
-        super().__init__(k, alphabet or Alphabet.dna(), canonical=True)
-        if s >= k: raise ValueError("s must be smaller than k")
-        if t > (k - s): raise ValueError("t is out of bounds")
-        self._s = s
-        self._t = t
-        self._mask_s = self._dtype((1 << (int(self._bps) * (s - 1))) - 1)
-
-    @property
-    def s(self) -> int: return self._s
-    @property
-    def t(self) -> int: return self._t
-    
-    def _get_anchors(self, seq: Seq):
-        batch = SeqBatch([seq], seq.alphabet)
-        h, p, _ = _batch_syncmer_kernel(
-            *batch.arrays, self._k, self._s, self._t, self._bps, self._mask, self._mask_s, self._dtype, self._rc_table
-        )
-        return h, p
-
-    def _compute_batch_seeds(self, batch: SeqBatch):
-        data, starts, lengths = batch.arrays
-        n = len(batch)
-        return _batch_syncmer_kernel(
-            data, starts[:n], lengths[:n], self._k, self._s, self._t, self._bps, self._mask, self._mask_s, self._dtype, self._rc_table
-        )
+    def query(self, queries: Union[list[Seq], SeqBatch] = None) -> np.ndarray: ...
 
 
 class MinHashSketch(BaseIndex):
@@ -245,91 +92,139 @@ class MinHashSketch(BaseIndex):
         """Builds the index from a single batch of sequences."""
         data, starts, lengths = batch.arrays
         n = len(batch)
-        self._sketches = _batch_minhash_kernel(
+        self._sketches = _minhash_kernel(
             data, starts[:n], lengths[:n], self._k, self._size, self._bps, self._mask, self._dtype, self._rc_table
         )
         self._built = True
 
-    def query(self, seq: Seq = None) -> np.ndarray:
+    def query(self, queries: Union[list[Seq], SeqBatch] = None) -> np.ndarray:
         """
         Query the index.
 
         Args:
-            seq: The query sequence. If None, computes all-vs-all distances.
+            queries: The query sequences. If None, computes all-vs-all distances.
 
         Returns:
             Array of Jaccard similarities.
         """
         if not self._built: raise RuntimeError("Index not built")
-
-        # Case 1: All-vs-All (Expensive, so we merge first)
-        if seq is None:
-            return _all_vs_all_jaccard_kernel(self._sketches)
-
-        # Case 2: One-vs-Many
-        q_sketch = _compute_sketch_kernel(self._hash_scalar(seq), self._size)
-
-        # Reshape (S,) -> (1, S) to use the many-vs-many kernel
-        q_batch = q_sketch.reshape(1, self._size)
-        scores = _many_vs_many_jaccard_kernel(q_batch, self._sketches)
-        return scores[0]
-
-    def query_batch(self, batch: SeqBatch) -> np.ndarray:
-        """
-        Batch query (Many-vs-Many).
-
-        Args:
-            batch: The query batch.
-
-        Returns:
-            Matrix of Jaccard similarities (M x N).
-        """
-        if not self._built: raise RuntimeError("Index not built")
-
-        # 1. Sketch Query Batch
-        data, starts, lengths = batch.arrays
-        n = len(batch)
-        q_sketches = _batch_minhash_kernel(
+        if queries is None: return _all_vs_all_jaccard_kernel(self._sketches)
+        if not isinstance(queries, SeqBatch): queries = SeqBatch.from_seqs(queries)
+        # Compute sketches for the query batch
+        data, starts, lengths = queries.arrays
+        n = len(queries)
+        q_sketches = _minhash_kernel(
             data, starts[:n], lengths[:n], self._k, self._size, self._bps, self._mask, self._dtype, self._rc_table
         )
-
-        # 2. Query against index
         return _many_vs_many_jaccard_kernel(q_sketches, self._sketches)
 
 
+class SparseMapIndexMode(IntEnum):
+    MINIMIZER = 0
+    SYNCMER = 1
+
+
+class SparseMapIndex(BaseIndex):
+    """
+    Parent class for Mapping/Seeding indexes (Minimizers & Syncmers).
+    Manages the storage, sorting, and querying of sparse anchors.
+    """
+        
+    _KERNEL_REGISTRY = {}
+
+    @classmethod
+    def register_kernel(cls, mode: int):
+        def decorator(func):
+            cls._KERNEL_REGISTRY[mode] = func
+            return func
+        return decorator
+
+    def __init__(self, k: int = 15, alphabet: Alphabet = None,
+                 mode: Union[str, SparseMapIndexMode] = SparseMapIndexMode.MINIMIZER, **kwargs):
+        super().__init__(k, alphabet, canonical=True)
+        self._n_seqs = 0
+        
+        if isinstance(mode, str):
+            self._mode = SparseMapIndexMode[mode.upper()]
+        else:
+            self._mode = SparseMapIndexMode(mode) # Coerce int to Enum member
+            
+        # Setup strategy (Kernel + Args)
+        self._kernel, self._kernel_args = self._KERNEL_REGISTRY[self._mode](self, **kwargs)
+        # Use dtype from alphabet for hashes
+        self._hashes = np.empty(0, dtype=self._dtype)
+        self._positions = np.empty(0, dtype=np.uint32)
+        self._ids = np.empty(0, dtype=np.uint32)
+
+    def __len__(self) -> int: return self._n_seqs
+
+    @property
+    def n_seqs(self) -> int: return self._n_seqs
+    @property
+    def hashes(self) -> np.ndarray: return self._hashes
+    @property
+    def positions(self) -> np.ndarray: return self._positions
+    @property
+    def ids(self) -> np.ndarray: return self._ids
+
+    def compute_seeds(self, queries: Union[list[Seq], SeqBatch]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Computes seeds (hashes, positions, ids) for a batch."""
+        if not isinstance(queries, SeqBatch): queries = SeqBatch.from_seqs(queries)
+        data, starts, lengths = queries.arrays
+        n = len(queries)
+        return self._kernel(data, starts[:n], lengths[:n], self._k, *self._kernel_args)
+
+    def build(self, seqs: Union[list[Seq], SeqBatch]):
+        """Builds the index from a single batch of sequences."""
+        # Ensure we work with a batch to get correct sequence count
+        if isinstance(seqs, SeqBatch):
+            batch = seqs
+        else:
+            batch = SeqBatch.from_seqs(seqs)
+            
+        hashes, pos, ids = self.compute_seeds(batch)
+        self._n_seqs = len(batch)
+        sorter = np.argsort(hashes)
+        self._hashes = hashes[sorter]
+        self._positions = pos[sorter]
+        self._ids = ids[sorter]
+        self._built = True
+
+    def query(self, queries: Union[list[Seq], SeqBatch] = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Queries the index
+
+        Args:
+            queries: The queries.
+
+        Returns:
+            (query_pos, target_pos, target_id) arrays.
+        """
+        if not self._built: raise RuntimeError("Index not built")
+        q_hashes, q_pos, _ = self.compute_seeds(queries)
+        return _find_hits_kernel(q_hashes, q_pos, self._hashes, self._positions, self._ids)
+
+
+# --- Strategies -------------------------------------------------------------------------------------------------------
+@SparseMapIndex.register_kernel(SparseMapIndexMode.MINIMIZER)
+def _setup_minimizer(index, w: int = 10, **kwargs):
+    index.w = w
+    # Kernel Args: w, bits, mask, dtype, rc_table
+    return _minimizer_kernel, (w, index.bps, index.mask, index.dtype, index.rc_table)
+
+
+@SparseMapIndex.register_kernel(SparseMapIndexMode.SYNCMER)
+def _setup_syncmer(index, s: int = 5, t: int = 0, **kwargs):
+    if s >= index.k: raise ValueError("s must be smaller than k")
+    index.s = s
+    index.t = t
+    mask_s = index.dtype((1 << (int(index.bps) * (s - 1))) - 1)
+    index.mask_s = mask_s
+    # Kernel Args: s, t, bits, mask_k, mask_s, dtype, rc_table
+    return _syncmer_kernel, (s, t, index.bps, index.mask, mask_s, index.dtype, index.rc_table)
+
+
 # --- Kernels ----------------------------------------------------------------------------------------------------------
-@jit(nopython=True, cache=True, nogil=True)
-def _rolling_hash_kernel(int_seq, k, bits, mask, dtype):
-    n = len(int_seq)
-    if n < k: return np.empty(0, dtype=dtype)
-    res = np.empty(n - k + 1, dtype=dtype)
-    curr = dtype(0)
-    for i in range(k):
-        curr = (curr << bits) | int_seq[i]
-    res[0] = curr
-    for i in range(1, n - k + 1):
-        curr = ((curr & mask) << bits) | int_seq[i + k - 1]
-        res[i] = curr
-    return res
-
-
-@jit(nopython=True, cache=True, nogil=True)
-def _rolling_hash_rc_kernel(int_seq, k, bits, mask, dtype, rc_table):
-    n = len(int_seq)
-    if n < k: return np.empty(0, dtype=dtype)
-    res = np.empty(n - k + 1, dtype=dtype)
-    curr = dtype(0)
-    for i in range(k):
-        val = rc_table[int_seq[n - 1 - i]]
-        curr = (curr << bits) | val
-    res[n - k] = curr
-    for i in range(1, n - k + 1):
-        val = rc_table[int_seq[n - k - i]]
-        curr = ((curr & mask) << bits) | val
-        res[n - k - i] = curr
-    return res
-
-
 @jit(nopython=True, cache=True, nogil=True, parallel=True)
 def _find_hits_kernel(q_mins, q_pos, db_hashes, db_pos, db_ids):
     # [Kept same as provided - Standard Binary Search]
@@ -348,7 +243,7 @@ def _find_hits_kernel(q_mins, q_pos, db_hashes, db_pos, db_ids):
     for i in range(n_mins):
         offsets[i] = curr
         curr += counts[i]
-    out_q = np.empty(total_hits, dtype=np.uint32)
+    out_q = np.empty(total_hits, dtype=q_pos.dtype)
     out_t = np.empty(total_hits, dtype=np.uint32)
     out_id = np.empty(total_hits, dtype=np.uint32)
     for i in prange(n_mins):
@@ -365,10 +260,9 @@ def _find_hits_kernel(q_mins, q_pos, db_hashes, db_pos, db_ids):
 
 
 @jit(nopython=True, cache=True, nogil=True, parallel=True)
-def _batch_minimizer_kernel(data, starts, lengths, k, w, bits, mask, dtype, rc_table):
+def _minimizer_kernel(data, starts, lengths, k, w, bits, mask, dtype, rc_table):
     n_seqs = len(starts)
     counts = np.zeros(n_seqs, dtype=np.int32)
-    rc_high_shift = bits * (k - 1)
 
     # Pass 1: Count
     for i in prange(n_seqs):
@@ -376,20 +270,7 @@ def _batch_minimizer_kernel(data, starts, lengths, k, w, bits, mask, dtype, rc_t
         l = lengths[i]
         if l < k: continue
         seq_hashes = np.empty(l - k + 1, dtype=dtype)
-
-        curr_f = dtype(0)
-        curr_r = dtype(0)
-        for j in range(k):
-            val = data[s + j]
-            curr_f = (curr_f << bits) | val
-            curr_r = (curr_r >> bits) | (dtype(rc_table[val]) << rc_high_shift)
-        seq_hashes[0] = curr_f if curr_f < curr_r else curr_r
-        for j in range(1, l - k + 1):
-            val = data[s + j + k - 1]
-            val_rc = rc_table[val]
-            curr_f = ((curr_f & mask) << bits) | val
-            curr_r = (curr_r >> bits) | (dtype(val_rc) << rc_high_shift)
-            seq_hashes[j] = curr_f if curr_f < curr_r else curr_r
+        _compute_hashes(data, s, l, k, bits, mask, dtype, rc_table, seq_hashes)
 
         m_count = 0
         last_min_pos = -1
@@ -432,20 +313,7 @@ def _batch_minimizer_kernel(data, starts, lengths, k, w, bits, mask, dtype, rc_t
         if l < k: continue
         off = offsets[i]
         seq_hashes = np.empty(l - k + 1, dtype=dtype)
-
-        curr_f = dtype(0)
-        curr_r = dtype(0)
-        for j in range(k):
-            val = data[start + j]
-            curr_f = (curr_f << bits) | val
-            curr_r = (curr_r >> bits) | (dtype(rc_table[val]) << rc_high_shift)
-        seq_hashes[0] = curr_f if curr_f < curr_r else curr_r
-        for j in range(1, l - k + 1):
-            val = data[start + j + k - 1]
-            val_rc = rc_table[val]
-            curr_f = ((curr_f & mask) << bits) | val
-            curr_r = (curr_r >> bits) | (dtype(val_rc) << rc_high_shift)
-            seq_hashes[j] = curr_f if curr_f < curr_r else curr_r
+        _compute_hashes(data, start, l, k, bits, mask, dtype, rc_table, seq_hashes)
 
         local_c = 0
         last_min_pos = -1
@@ -474,7 +342,7 @@ def _batch_minimizer_kernel(data, starts, lengths, k, w, bits, mask, dtype, rc_t
 
 
 @jit(nopython=True, cache=True, nogil=True, parallel=True)
-def _batch_syncmer_kernel(data, starts, lengths, k, s, t, bits, mask_k, mask_s, dtype, rc_table):
+def _syncmer_kernel(data, starts, lengths, k, s, t, bits, mask_k, mask_s, dtype, rc_table):
     n_seqs = len(starts)
     counts = np.zeros(n_seqs, dtype=np.int32)
     n_sub = k - s + 1
@@ -592,47 +460,18 @@ def _batch_syncmer_kernel(data, starts, lengths, k, s, t, bits, mask_k, mask_s, 
     return out_hashes, out_pos, out_ids
 
 
-@jit(nopython=True, cache=True, nogil=True)
-def _compute_sketch_kernel(hashes, size):
-    # [Kept as is - Optimized selection]
-    if len(hashes) > size * 10:
-        limit = min(len(hashes), size * 2)
-        hashes = np.partition(hashes, limit)[:limit]
-    unique = np.unique(hashes)
-    dtype = hashes.dtype
-    fill = np.iinfo(dtype).max
-    if len(unique) <= size:
-        res = np.full(size, fill, dtype=dtype)
-        res[:len(unique)] = unique
-        return res
-    return unique[:size]
-
-
 @jit(nopython=True, cache=True, nogil=True, parallel=True)
-def _batch_minhash_kernel(data, starts, lengths, k, size, bits, mask, dtype, rc_table):
+def _minhash_kernel(data, starts, lengths, k, size, bits, mask, dtype, rc_table):
     # [Kept as is - Optimized Batch Sketching]
     n_seqs = len(starts)
     fill = np.iinfo(dtype).max
     out_matrix = np.full((n_seqs, size), fill, dtype=dtype)
-    rc_high_shift = bits * (k - 1)
     for i in prange(n_seqs):
         s = starts[i]
         l = lengths[i]
         if l < k: continue
         seq_hashes = np.empty(l - k + 1, dtype=dtype)
-        curr_f = dtype(0)
-        curr_r = dtype(0)
-        for j in range(k):
-            val = data[s + j]
-            curr_f = (curr_f << bits) | val
-            curr_r = (curr_r >> bits) | (dtype(rc_table[val]) << rc_high_shift)
-        seq_hashes[0] = curr_f if curr_f < curr_r else curr_r
-        for j in range(1, l - k + 1):
-            val = data[s + j + k - 1]
-            val_rc = rc_table[val]
-            curr_f = ((curr_f & mask) << bits) | val
-            curr_r = (curr_r >> bits) | (dtype(val_rc) << rc_high_shift)
-            seq_hashes[j] = curr_f if curr_f < curr_r else curr_r
+        _compute_hashes(data, s, l, k, bits, mask, dtype, rc_table, seq_hashes)
 
         limit = size * 2
         if len(seq_hashes) > limit * 2:
@@ -655,7 +494,24 @@ def _batch_minhash_kernel(data, starts, lengths, k, size, bits, mask, dtype, rc_
     return out_matrix
 
 
-# [ _batch_jaccard_kernel DELETED - REDUNDANT (Covered by Many-vs-Many) ]
+@jit(nopython=True, cache=True, nogil=True, inline='always')
+def _compute_hashes(data, s, l, k, bits, mask, dtype, rc_table, out_hashes):
+    """Helper to compute rolling hashes for a sequence."""
+    rc_high_shift = bits * (k - 1)
+    curr_f = dtype(0)
+    curr_r = dtype(0)
+    for j in range(k):
+        val = data[s + j]
+        curr_f = (curr_f << bits) | val
+        curr_r = (curr_r >> bits) | (dtype(rc_table[val]) << rc_high_shift)
+    out_hashes[0] = curr_f if curr_f < curr_r else curr_r
+    for j in range(1, l - k + 1):
+        val = data[s + j + k - 1]
+        val_rc = rc_table[val]
+        curr_f = ((curr_f & mask) << bits) | val
+        curr_r = (curr_r >> bits) | (dtype(val_rc) << rc_high_shift)
+        out_hashes[j] = curr_f if curr_f < curr_r else curr_r
+
 
 @jit(nopython=True, cache=True, nogil=True, parallel=True)
 def _all_vs_all_jaccard_kernel(sketches):
@@ -684,14 +540,16 @@ def _all_vs_all_jaccard_kernel(sketches):
             l2 = eff_lens[j]
             if l2 == 0: continue
             s2 = sketches[j]
-            intersect = 0;
-            idx1 = 0;
+            intersect = 0
+            idx1 = 0
             idx2 = 0
             while idx1 < l1 and idx2 < l2:
-                v1 = s1[idx1];
+                v1 = s1[idx1]
                 v2 = s2[idx2]
                 if v1 == v2:
-                    intersect += 1; idx1 += 1; idx2 += 1
+                    intersect += 1
+                    idx1 += 1
+                    idx2 += 1
                 elif v1 < v2:
                     idx1 += 1
                 else:
@@ -741,16 +599,20 @@ def _many_vs_many_jaccard_kernel(q_sketches, db_sketches):
             continue
         for j in range(n):
             db_eff = db_lens[j]
-            if db_eff == 0: scores[i, j] = 0.0; continue
+            if db_eff == 0:
+                scores[i, j] = 0.0
+                continue
             db_s = db_sketches[j]
-            intersect = 0;
-            idx_q = 0;
+            intersect = 0
+            idx_q = 0
             idx_db = 0
             while idx_q < q_eff and idx_db < db_eff:
-                vq = q_s[idx_q];
+                vq = q_s[idx_q]
                 vdb = db_s[idx_db]
                 if vq == vdb:
-                    intersect += 1; idx_q += 1; idx_db += 1
+                    intersect += 1
+                    idx_q += 1
+                    idx_db += 1
                 elif vq < vdb:
                     idx_q += 1
                 else:

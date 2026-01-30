@@ -1,15 +1,15 @@
 """
 Top-level module, including resource and optional dependency management.
 """
-from functools import cached_property
+from functools import cached_property, lru_cache
 from importlib import import_module
-# from importlib.metadata import metadata as load_metadata
+from shutil import which
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from numpy.random import default_rng
 import atexit
 import os
-from typing import Callable
+from typing import Callable, Optional
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
@@ -20,19 +20,11 @@ class Resources:
 
     Attributes:
         package (str): The package name.
-        optional_packages (set): Set of installed optional packages.
     """
-    def __init__(self, *optional_packages: str):
+    def __init__(self) -> None:
         self.package = Path(__file__).parent.name
-        self.optional_packages = set(filter(self._check_module, optional_packages))
         # Register cleanup to run automatically when the program exits
-        atexit.register(self.shutdown)
-
-    # @cached_property
-    # def data(self): return resources.files(self.package) / 'data'
-
-    # @cached_property
-    # def metadata(self): return load_metadata(self.package)
+        atexit.register(self._cleanup)
 
     @cached_property
     def rng(self):
@@ -50,21 +42,42 @@ class Resources:
         """Returns a shared ThreadPoolExecutor."""
         return ThreadPoolExecutor(min(32, (self.available_cpus or 1) + 4))
 
-    def shutdown(self):
+    @cached_property
+    def has_gpu(self) -> bool:
+        """Checks if a CUDA-compatible GPU is available via Numba."""
+        if not self.has_module('numba'): return False
+        try:
+            from numba import cuda
+            return cuda.is_available()
+        except Exception: return False
+
+    def _cleanup(self):
         """Shuts down the thread pool."""
         # Check if 'pool' is in __dict__ (meaning it was initialized)
         if 'pool' in self.__dict__: self.pool.shutdown(wait=False, cancel_futures=True)
 
     @staticmethod
-    def _check_module(module_name: str) -> bool:
+    @lru_cache(maxsize=None)
+    def has_module(module_name: str) -> bool:
+        """Checks if a python package is installed."""
         try:
             import_module(module_name)
             return True
         except ImportError: return False
+        
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def find_binary(program_name: str) -> Optional[Path]:
+        """
+        Locates an executable in the system PATH.
+        Returns the Path object if found, else None.
+        """
+        if path := which(program_name): return Path(path)
+        return None
 
     # __enter__ and __exit__ are still useful for scoped usage (e.g. testing)
     def __enter__(self): return self
-    def __exit__(self, exc_type, exc_val, exc_tb): self.shutdown()
+    def __exit__(self, exc_type, exc_val, exc_tb): self._cleanup()
 
 
 # Decorators -----------------------------------------------------------------------------------------------------------
@@ -84,7 +97,7 @@ def jit(signature_or_function=None, **options) -> Callable:
         ... def func(): ...
     """
     # 1. Fallback: Numba not installed
-    if 'numba' not in RESOURCES.optional_packages:
+    if not RESOURCES.has_module('numba'):
         if callable(signature_or_function): return signature_or_function  # Handle bare @jit
         def passthrough(func: Callable) -> Callable: return func  # Handle @jit(...)
         return passthrough
@@ -95,5 +108,4 @@ def jit(signature_or_function=None, **options) -> Callable:
 
 
 # Constants ------------------------------------------------------------------------------------------------------------
-RESOURCES = Resources('numba')
-
+RESOURCES = Resources()

@@ -4,16 +4,18 @@ import numpy as np
 
 from baclib.align.motif import Motif, Background
 from baclib.core.seq import Alphabet
-from baclib.io import BaseReader
+from baclib.io import BaseReader, SeqFile
 
 
 class MotifReader(BaseReader):
     """Base class for motif readers."""
+    _DEFAULT_BACKGROUND = Background.uniform(Alphabet.dna())
     def __init__(self, handle: BinaryIO, background: Background = None, **kwargs):
         super().__init__(handle, **kwargs)
-        self.background = background or Background.uniform(Alphabet.dna())
+        self.background: Background = background or self._DEFAULT_BACKGROUND
 
 
+@SeqFile.register('meme')
 class MemeReader(MotifReader):
     """
     Reader for MEME format files.
@@ -109,7 +111,11 @@ class MemeReader(MotifReader):
 
         return Motif.from_frequencies(name, mapped_freqs.T, self.background)
 
+    @classmethod
+    def sniff(cls, s: bytes) -> bool:
+        return s.startswith(b'MEME version')
 
+@SeqFile.register('transfac')
 class TransfacReader(MotifReader):
     """
     Reader for TRANSFAC format files.
@@ -159,3 +165,7 @@ class TransfacReader(MotifReader):
                 current_id = b"Unknown"
                 counts = []
                 base_order = None
+
+    @classmethod
+    def sniff(cls, s: bytes) -> bool:
+        return s.startswith(b'ID') or s.startswith(b'AC') or s.startswith(b'VV')

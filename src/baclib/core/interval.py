@@ -1,12 +1,14 @@
-from typing import Union, Any, Match, MutableSequence, Iterable
+from typing import Union, Any, Match, Iterable
 from enum import IntEnum
 
 import numpy as np
 
 from baclib.utils.resources import RESOURCES, jit
 
-if 'numba' in RESOURCES.optional_packages: from numba import prange
-else: prange = range
+if RESOURCES.has_module('numba'):
+    from numba import prange
+else:
+    prange = range
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
@@ -37,6 +39,7 @@ class Strand(IntEnum):
             A Strand enum member.
         """
         if symbol is None: return cls.UNSTRANDED
+        if isinstance(symbol, cls): return symbol
         # Fast path for integers (including numpy scalars)
         if symbol in (1, -1, 0): return cls(int(symbol))
 
@@ -192,6 +195,24 @@ class Interval:
         safe_max_start = max(min_start + 1, max_start - length)
         start = rng.integers(min_start, safe_max_start)
         return cls(start, start + length, rng.choice([1, -1]))
+    
+    @classmethod
+    def from_match(cls, item: Match, strand: int = 0) -> 'Interval': 
+        return Interval(item.start(), item.end(), strand or 1)
+    
+    @classmethod
+    def from_int(cls, item: int, strand: int = 0, length: int = None) -> 'Interval':
+        if item < 0 and length is not None: item += length
+        return cls(item, item + 1, strand or 1)
+
+    @classmethod
+    def from_slice(cls, item: slice, strand: int = 0, length: int = None) -> 'Interval':
+        start, stop, step = item.start, item.stop, item.step
+        if start is None: start = 0
+        if stop is None and length is not None: stop = length
+        if stop is None: raise ValueError("Cannot create Interval from slice with None stop without 'length'")
+        if step == -1: return cls(stop + 1, start + 1, strand or -1)
+        return cls(start, stop, strand or 1)
 
     @classmethod
     def from_item(cls, item: Union[slice, int, 'Interval', Match], strand: int = 0, length: int = None) -> 'Interval':
@@ -209,20 +230,11 @@ class Interval:
         Raises:
             TypeError: If coercion is not possible.
         """
-        if isinstance(item, Interval): return item
+        if isinstance(item, cls): return item
         if interval := getattr(item, 'interval', None): return interval
-        if isinstance(item, Match): return Interval(item.start(), item.end(), strand or 1)
-        if isinstance(item, int):
-            if item < 0 and length is not None: item += length
-            return cls(item, item + 1, strand or 1)
-        if isinstance(item, slice):
-            start, stop, step = item.start, item.stop, item.step
-            if start is None: start = 0
-            if stop is None and length is not None: stop = length
-            if stop is None: raise ValueError("Cannot create Interval from slice with None stop without 'length'")
-
-            if step == -1: return cls(stop + 1, start + 1, strand or -1)
-            return cls(start, stop, strand or 1)
+        if isinstance(item, Match): return cls.from_match(item, strand)
+        if isinstance(item, int): return cls.from_int(item, strand, length)
+        if isinstance(item, slice): return cls.from_slice(item, strand, length)
         raise TypeError(f"Cannot coerce {type(item)} to Interval")
 
 
@@ -298,9 +310,19 @@ class IntervalIndex:
             An IntervalIndex.
         """
         if not intervals: return cls()
-        # Convert to SoA
-        arr = np.array([tuple(i) for i in intervals], dtype=cls._DTYPE)
-        return cls(arr[:, 0], arr[:, 1], arr[:, 2])
+        # Handle single iterable argument
+        if len(intervals) == 1 and isinstance(intervals[0], Iterable) and not isinstance(intervals[0], Interval):
+            intervals = intervals[0]
+        # Optimization: Avoid intermediate tuple list creation
+        n = len(intervals)
+        starts = np.empty(n, dtype=cls._DTYPE)
+        ends = np.empty(n, dtype=cls._DTYPE)
+        strands = np.empty(n, dtype=cls._DTYPE)
+        for i, iv in enumerate(intervals):
+            starts[i] = iv._start
+            ends[i] = iv._end
+            strands[i] = iv._strand
+        return cls(starts, ends, strands)
 
     @classmethod
     def from_features(cls, *features):
@@ -314,8 +336,19 @@ class IntervalIndex:
             An IntervalIndex.
         """
         if not features: return cls()
-        arr = np.array([tuple(i.interval) for i in features], dtype=cls._DTYPE)
-        return cls(arr[:, 0], arr[:, 1], arr[:, 2])
+        # Handle single iterable argument
+        if len(features) == 1 and not hasattr(features[0], 'interval') and isinstance(features[0], Iterable):
+            features = features[0]
+        n = len(features)
+        starts = np.empty(n, dtype=cls._DTYPE)
+        ends = np.empty(n, dtype=cls._DTYPE)
+        strands = np.empty(n, dtype=cls._DTYPE)
+        for i, f in enumerate(features):
+            iv = f.interval
+            starts[i] = iv._start
+            ends[i] = iv._end
+            strands[i] = iv._strand
+        return cls(starts, ends, strands)
 
     @classmethod
     def from_items(cls, *items: Union[slice, int, 'Interval', Match]):
@@ -524,9 +557,7 @@ class IntervalIndex:
 
     def coverage(self) -> int:
         """Returns total unique bases covered."""
-        # Optimization: coverage is just sum(lengths) of the merged set
-        merged = self.merge()
-        return np.sum(merged.ends - merged.starts)
+        return _coverage_kernel(self.starts, self.ends)
 
     def pad(self, upstream: int, downstream: int = None) -> 'IntervalIndex':
         """
@@ -658,14 +689,9 @@ def _intersect_kernel(s_a, e_a, st_a, s_b, e_b, st_b, stranded):
     n_a = len(s_a)
     n_b = len(s_b)
 
-    # Pre-allocate worst-case size.
-    # Logic: In the worst case (perfect tiling), output count is n_a + n_b.
-    max_size = n_a + n_b
-    out_s = np.empty(max_size, dtype=s_a.dtype)
-    out_e = np.empty(max_size, dtype=e_a.dtype)
-    out_st = np.empty(max_size, dtype=st_a.dtype)
-
-    out_idx = 0
+    # Pass 1: Count intersections
+    # We cannot safely predict max_size (worst case is N*M), so we count first.
+    count = 0
     b_idx = 0
 
     for i in range(n_a):
@@ -690,32 +716,48 @@ def _intersect_kernel(s_a, e_a, st_a, s_b, e_b, st_b, stranded):
 
             # Strand Check
             if not stranded or (curr_st_a == curr_st_b):
-                new_s = max(curr_s_a, curr_s_b)
-                new_e = min(curr_e_a, curr_e_b)
-
-                # Write to array
-                out_s[out_idx] = new_s
-                out_e[out_idx] = new_e
-                out_st[out_idx] = curr_st_a
-                out_idx += 1
+                count += 1
 
             temp_b += 1
 
-    return out_s[:out_idx], out_e[:out_idx], out_st[:out_idx]
+    # Pass 2: Fill
+    out_s = np.empty(count, dtype=s_a.dtype)
+    out_e = np.empty(count, dtype=e_a.dtype)
+    out_st = np.empty(count, dtype=st_a.dtype)
+    
+    out_idx = 0
+    b_idx = 0
+    for i in range(n_a):
+        curr_s_a = s_a[i]
+        curr_e_a = e_a[i]
+        curr_st_a = st_a[i]
+
+        while b_idx < n_b and e_b[b_idx] <= curr_s_a:
+            b_idx += 1
+
+        temp_b = b_idx
+        while temp_b < n_b:
+            curr_s_b = s_b[temp_b]
+            if curr_s_b >= curr_e_a: break
+            curr_e_b = e_b[temp_b]
+            curr_st_b = st_b[temp_b]
+
+            if not stranded or (curr_st_a == curr_st_b):
+                out_s[out_idx] = max(curr_s_a, curr_s_b)
+                out_e[out_idx] = min(curr_e_a, curr_e_b)
+                out_st[out_idx] = curr_st_a
+                out_idx += 1
+            temp_b += 1
+
+    return out_s, out_e, out_st
 
 
 @jit(nopython=True, cache=True, nogil=True)
 def _subtract_kernel(s_a, e_a, st_a, s_b, e_b, st_b, stranded):
     n_a, n_b = len(s_a), len(s_b)
 
-    # Worst case: Every A is split into 2 pieces by a B sitting in the middle
-    # Safe upper bound is 2 * n_a + n_b (though usually just n_a)
-    max_size = (n_a * 2) + n_b
-    out_s = np.empty(max_size, dtype=s_a.dtype)
-    out_e = np.empty(max_size, dtype=e_a.dtype)
-    out_st = np.empty(max_size, dtype=st_a.dtype)
-
-    out_idx = 0
+    # Pass 1: Count
+    count = 0
     b_idx = 0
 
     for i in range(n_a):
@@ -738,7 +780,42 @@ def _subtract_kernel(s_a, e_a, st_a, s_b, e_b, st_b, stranded):
                 continue
 
             if b_start > curr_s:
-                # Keep the chunk before the overlap
+                count += 1
+
+            curr_s = max(curr_s, b_end)
+            if curr_s >= end_a:
+                break
+            temp_b += 1
+
+        if curr_s < end_a:
+            count += 1
+
+    # Pass 2: Fill
+    out_s = np.empty(count, dtype=s_a.dtype)
+    out_e = np.empty(count, dtype=e_a.dtype)
+    out_st = np.empty(count, dtype=st_a.dtype)
+    
+    out_idx = 0
+    b_idx = 0
+    for i in range(n_a):
+        curr_s = s_a[i]
+        end_a = e_a[i]
+        strand_a = st_a[i]
+
+        while b_idx < n_b and e_b[b_idx] <= curr_s:
+            b_idx += 1
+
+        temp_b = b_idx
+        while temp_b < n_b and s_b[temp_b] < end_a:
+            b_start = s_b[temp_b]
+            b_end = e_b[temp_b]
+            b_strand = st_b[temp_b]
+
+            if stranded and (b_strand != strand_a):
+                temp_b += 1
+                continue
+
+            if b_start > curr_s:
                 out_s[out_idx] = curr_s
                 out_e[out_idx] = b_start
                 out_st[out_idx] = strand_a
@@ -754,8 +831,8 @@ def _subtract_kernel(s_a, e_a, st_a, s_b, e_b, st_b, stranded):
             out_e[out_idx] = end_a
             out_st[out_idx] = strand_a
             out_idx += 1
-
-    return out_s[:out_idx], out_e[:out_idx], out_st[:out_idx]
+            
+    return out_s, out_e, out_st
 
 
 @jit(nopython=True, cache=True, nogil=True, parallel=True)
@@ -873,3 +950,26 @@ def _flank_kernel(starts, ends, strands, left, right, direction, out_s, out_e, o
                 new_e = s
             
             out_s[idx], out_e[idx], out_st[idx] = new_s, new_e, st
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _coverage_kernel(starts, ends):
+    """Calculates total coverage of sorted intervals without allocating merged arrays."""
+    n = len(starts)
+    if n == 0: return 0
+    
+    total_len = 0
+    curr_start = starts[0]
+    curr_end = ends[0]
+    
+    for i in range(1, n):
+        s, e = starts[i], ends[i]
+        if s < curr_end:
+            if e > curr_end: curr_end = e
+        else:
+            total_len += (curr_end - curr_start)
+            curr_start = s
+            curr_end = e
+            
+    total_len += (curr_end - curr_start)
+    return total_len

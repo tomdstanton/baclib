@@ -6,10 +6,10 @@ from typing import Union, Iterable, Final, Generator, Literal
 
 import numpy as np
 
-from baclib.core.interval import Interval
+from baclib.core.interval import Interval, IntervalIndex
 from baclib.utils.resources import jit, RESOURCES
 
-if 'numba' in RESOURCES.optional_packages: 
+if RESOURCES.has_module('numba'):
     from numba import prange
 else: 
     prange = range
@@ -167,8 +167,9 @@ class Alphabet:
         Returns:
             The DNA Alphabet singleton.
         """
-        if (cached := cls._CACHE.get('dna')) is None:  # Note: We can reuse the same RC table logic
-            cls._CACHE['dna'] = (cached := Alphabet(b'TCAG', b'AGTC'))
+        symbols = b'TCAG'
+        if (cached := cls._CACHE.get(symbols)) is None:  # Note: We can reuse the same RC table logic
+            cls._CACHE[symbols] = (cached := Alphabet(symbols, b'AGTC'))
         return cached
 
     @classmethod
@@ -179,8 +180,8 @@ class Alphabet:
         Returns:
             The Amino Acid Alphabet singleton.
         """
-        if (cached := cls._CACHE.get('amino')) is None:
-            cls._CACHE['amino'] = (cached := Alphabet(b'ACDEFGHIKLMNPQRSTVWY*'))
+        symbols = b'ACDEFGHIKLMNPQRSTVWY'
+        if (cached := cls._CACHE.get(symbols)) is None: cls._CACHE[symbols] = (cached := Alphabet(symbols))
         return cached
 
     @classmethod
@@ -257,8 +258,11 @@ class Alphabet:
         data = self.encode(seq)
         return Seq(data, self, _validation_token=self)
 
-    def random(self, rng: np.random.Generator = None, length: int = None, min_len: int = 5, max_len: int = 5000,
-               weights=None) -> 'Seq':
+    def batch(self, data: np.ndarray, starts: np.ndarray, lengths: np.ndarray):
+        return SeqBatch(data, starts, lengths, self)
+    
+    def random_seq(self, rng: np.random.Generator = None, length: int = None, min_len: int = 5, max_len: int = 5000,
+                   weights=None) -> 'Seq':
         """
         Generates a random sequence from this alphabet and coerces it to a Seq object.
 
@@ -274,7 +278,7 @@ class Alphabet:
 
         Examples:
             >>> dna = Alphabet.dna()
-            >>> s = dna.random(length=10)
+            >>> s = dna.random_seq(length=10)
             >>> len(s)
             10
         """
@@ -288,23 +292,48 @@ class Alphabet:
             indices = rng.choice(n_sym, size=length, p=weights)
         return self.seq(indices.astype(self.DTYPE))
 
-    def random_many(self, lengths: Iterable[int], rng: np.random.Generator = None, weights=None) -> Generator[
-        'Seq', None, None]:
+    def random_batch(self, rng: np.random.Generator = None, n_seqs: int = None, min_seqs: int = 1,
+                     max_seqs: int = 1000, length: int = None, min_len: int = 10, max_len: int = 5_000_000, 
+                     weights=None) -> 'SeqBatch':
         """
-        Generates multiple random sequences efficiently.
+        Generates a SeqBatch of random sequences efficiently.
 
         Args:
-            lengths: An iterable of lengths for the sequences.
             rng: Random number generator (optional).
+            n_seqs: Number of sequences to generate.
+            min_seqs: Minimum number of sequences to generate.
+            max_seqs: Maximum number of sequences to generate.
+            length: Exact length of sequences to generate.
+            min_len: Minimum length of sequences to generate.
+            max_len: Maximum length of sequences to generate.
             weights: Weights for each symbol (optional).
 
-        Yields:
-            Random Seq objects.
+        Returns:
+            A SeqBatch containing the random sequences.
         """
         if rng is None: rng = RESOURCES.rng
-        lengths = np.asanyarray(lengths, dtype=np.int64)
-        if lengths.size == 0: return
-        total_len = lengths.sum()
+        if n_seqs is None: n_seqs = int(rng.integers(min_seqs, max_seqs))
+
+        if length is not None:
+            if n_seqs > length:
+                raise ValueError(f"Cannot partition length {length} into {n_seqs} sequences (min_len=1)")
+            if n_seqs > 1:
+                # Use choice without replacement to ensure distinct cuts (no zero-length seqs)
+                cuts = np.sort(rng.choice(length - 1, size=n_seqs - 1, replace=False) + 1)
+                bounds = np.concatenate(([0], cuts, [length]))
+                lengths_arr = np.diff(bounds).astype(np.int32)
+            else:
+                lengths_arr = np.array([length], dtype=np.int32)
+        else:
+            lengths_arr = rng.integers(min_len, max_len, size=n_seqs, dtype=np.int32)
+            np.maximum(1, lengths_arr, out=lengths_arr)
+        
+        if lengths_arr.size == 0:
+            return SeqBatch(np.empty(0, dtype=self.DTYPE),
+                            np.empty(0, dtype=np.int32),
+                            np.empty(0, dtype=np.int32), self)
+
+        total_len = lengths_arr.sum()
         n_sym = len(self._data)
 
         # Optimization: Generate encoded indices directly
@@ -313,11 +342,11 @@ class Alphabet:
         else:
             indices = rng.choice(n_sym, size=total_len, p=weights)
 
-        full_arr = indices.astype(self.DTYPE)
-        current = 0
-        for l in lengths:
-            yield self.seq(full_arr[current:current + l])
-            current += l
+        starts = np.zeros(len(lengths_arr), dtype=np.int32)
+        if len(lengths_arr) > 1:
+            np.cumsum(lengths_arr[:-1], out=starts[1:])
+
+        return SeqBatch(indices.astype(self.DTYPE, copy=False), starts, lengths_arr, self)
 
     def reverse_complement(self, seq: 'Seq') -> 'Seq':
         """
@@ -345,49 +374,123 @@ class GeneticCode:
     """
     Represents a genetic code table for translation.
     """
-    _TABLES = {11: b'FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG'}
     _DNA = Alphabet.dna()
     _AMINO = Alphabet.amino()
     _CACHE = {}  # Store genetic code singletons here
-    __slots__ = ('_data',)
+    _DTYPE = np.uint8
+    __slots__ = ('_data', '_starts', '_stops')
 
-    def __init__(self):
-        # Verify the alphabet is compatible with the bitwise math
-        # We need T=0, C=1, A=2, G=3
-        expected = np.array([84, 67, 65, 71], dtype=Alphabet.DTYPE)  # ASCII for T, C, A, G
-        if not np.array_equal(self._DNA._data, expected):
-            raise AlphabetError("GeneticCode requires strict 'TCAG' alphabet ordering.")
-        self._stop_val = self._AMINO._lookup_table[ord('*')]
+    def __init__(self, table: bytes, starts: Iterable[bytes] = ()):
+        # Optimization: Pre-encode the table to indices using lookup table directly
+        self._data = self._AMINO._lookup_table[np.frombuffer(table, dtype=self._DTYPE)]
+        # Populate stops and starts
+        # We derive stops from the table string
+        self._stops = np.frombuffer(table, dtype=self._DTYPE) == ord('*')
+        # Populate starts
+        self._starts = np.zeros(64, dtype=bool)
+        
+        valid_starts = [s for s in starts if len(s) == 3]
+        if valid_starts:
+            joined = b"".join(valid_starts)
+            encoded = self._DNA.encode(joined)
+            
+            if len(encoded) == len(joined):
+                # Fast path: Vectorized calculation (No invalid chars dropped)
+                indices = (encoded[0::3] << 4) | (encoded[1::3] << 2) | encoded[2::3]
+                self._starts[indices] = True
+            else:  # Fallback: Process individually to handle invalid chars safely without frame shifts
+                for s in valid_starts:
+                    enc = self._DNA.encode(s)
+                    if len(enc) == 3:
+                        idx = (enc[0] << 4) | (enc[1] << 2) | enc[2]
+                        self._starts[idx] = True
 
     @classmethod
-    def from_code(cls, code: int) -> 'GeneticCode':
-        """
-        Gets a GeneticCode instance by its NCBI table ID.
-
-        Args:
-            code: The NCBI genetic code ID (e.g., 11 for Bacterial).
-
-        Returns:
-            A GeneticCode instance.
-
-        Raises:
-            NotImplementedError: If the code is not implemented.
-        """
-        if (cached := cls._CACHE.get(code)) is None:
-            if (table := cls._TABLES.get(code)) is None: raise NotImplementedError('Genetic code not implemented')
-            cached = GeneticCode()
-            # Optimization: Pre-encode the table to indices using lookup table directly
-            cached._data = cls._AMINO._lookup_table[np.frombuffer(table, dtype=Alphabet.DTYPE)]
-            cls._CACHE[code] = cached
+    def bacterial(cls) -> 'GeneticCode':
+        table = b'FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG'
+        if (cached := cls._CACHE.get(table)) is None:
+            starts = [b'ATG', b'GTG', b'TTG', b'ATT', b'ATC', b'ATA']
+            cls._CACHE[table] = (cached := GeneticCode(table, starts))
         return cached
 
-    def translate(self, seq: 'Seq', frame: Literal[0, 1, 2] = 0) -> 'Seq':
+    @property
+    def starts(self) -> np.ndarray: return self._starts
+    @property
+    def stops(self) -> np.ndarray: return self._stops
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __getitem__(self, item):
+        return self._data[item]
+
+    def __array__(self, dtype=None):
+        return self._data.astype(dtype, copy=False) if dtype else self._data
+
+    def __repr__(self):
+        return repr(self._data)
+
+    def find_starts(self, seq: 'Seq') -> np.ndarray:
+        """Returns indices of all start codons in the sequence (0-based)."""
+        if seq.alphabet != self._DNA: raise ValueError("Sequence must use the DNA alphabet")
+        return _find_codons_kernel(seq.encoded, self._starts)
+
+    def find_stops(self, seq: 'Seq') -> np.ndarray:
+        """Returns indices of all stop codons in the sequence (0-based)."""
+        if seq.alphabet != self._DNA: raise ValueError("Sequence must use the DNA alphabet")
+        return _find_codons_kernel(seq.encoded, self._stops)
+
+    def find_orfs(self, seq: 'Seq', strand: Literal[0, 1, -1] = 0, min_len: int = 30, max_len: int = 3000, include_partials: bool = False) -> IntervalIndex:
         """
-        Translates a DNA sequence to Amino Acids.
+        Finds all Open Reading Frames (ORFs) in the sequence.
+        Returns all in-frame start-stop pairs with no intervening stops.
+
+        Args:
+            seq: The input DNA sequence.
+            strand: 1 (forward), -1 (reverse), or 0 (both).
+            min_len: Minimum length in bases (inclusive).
+            max_len: Maximum length in bases (inclusive).
+            include_partials: If True, includes ORFs that are truncated at the sequence boundaries.
+
+        Returns:
+            An IntervalIndex of the found ORFs.
+        """
+        if seq.alphabet != self._DNA: raise ValueError("Sequence must use the DNA alphabet")
+        starts, ends, strands = [], [], []
+        # Forward Strand
+        if strand >= 0:
+            s, e = _find_orfs_kernel(seq.encoded, self._starts, self._stops, min_len, max_len, include_partials)
+            if len(s) > 0:
+                starts.append(np.array(s, dtype=np.int32))
+                ends.append(np.array(e, dtype=np.int32))
+                strands.append(np.ones(len(s), dtype=np.int32))
+        # Reverse Strand
+        if strand <= 0:
+            rc_seq = seq.alphabet.reverse_complement(seq)
+            s_rc, e_rc = _find_orfs_kernel(rc_seq.encoded, self._starts, self._stops, min_len, max_len, include_partials)
+            if len(s_rc) > 0:
+                s_rc = np.array(s_rc, dtype=np.int32)
+                e_rc = np.array(e_rc, dtype=np.int32)
+                L = len(seq)
+                starts.append(L - e_rc)
+                ends.append(L - s_rc)
+                strands.append(np.full(len(s_rc), -1, dtype=np.int32))
+        if not starts: return IntervalIndex()
+        return IntervalIndex(np.concatenate(starts), np.concatenate(ends), np.concatenate(strands))
+
+    def is_complete_cds(self, seq: 'Seq') -> bool:
+        """Checks if the sequence starts with a start codon and ends with a stop codon."""
+        if len(seq) < 3 or len(seq) % 3 != 0: return False
+        return _check_cds_kernel(seq.encoded, self._starts, self._stops)
+
+    def translate(self, seq: Union['Seq', 'SeqBatch'], frame: Literal[0, 1, 2] = 0, to_stop: bool = True) -> Union['Seq', 'SeqBatch']:
+        """
+        Translates a DNA sequence or SeqBatch to Amino Acids.
 
         Args:
             seq: The DNA sequence.
             frame: The reading frame (0, 1, or 2).
+            to_stop: If True, translation terminates at the first stop codon.
 
         Returns:
             The translated protein sequence.
@@ -403,6 +506,9 @@ class GeneticCode:
             >>> str(p)
             'M'
         """
+        if isinstance(seq, SeqBatch):
+            return self._translate_batch(seq, frame, to_stop)
+
         # Use encoded sequence (0-3 integers) for faster lookup in small table
         # This avoids cache misses associated with the large 16MB lookup table
         n = len(seq)
@@ -410,42 +516,29 @@ class GeneticCode:
         n_codons = (n - start) // 3
         if n_codons <= 0:
             if n < 3 - frame: raise TranslationError('Cannot translate sequence with less than 1 codon')
-        translation = _translate_kernel(seq.encoded, self._data, start, n_codons, self._stop_val, Alphabet.DTYPE)
+        translation = _translate_kernel(seq.encoded, self._data, self._stops, start, n_codons, to_stop, Alphabet.DTYPE)
         return self._AMINO.seq(translation)
 
-    def translate_all(self, seq: 'Seq') -> tuple['Seq', 'Seq', 'Seq']:
+    def _translate_batch(self, batch: 'SeqBatch', frame: int, to_stop: bool) -> 'SeqBatch':
         """
-        Translates all 3 forward reading frames efficiently.
-
-        Args:
-            seq: The DNA sequence.
-
-        Returns:
-            A tuple of 3 Seq objects (Frame 0, Frame 1, Frame 2).
-        """
-        if len(seq) < 3: raise TranslationError('Cannot translate sequence with less than 1 codon')
-
-        # Optimization: Use Numba kernel to avoid allocating intermediate 'indices' and 'translation' arrays
-        f0, f1, f2 = _translate_all_kernel(seq.encoded, self._data, Alphabet.DTYPE)
-        return self._AMINO.seq(f0), self._AMINO.seq(f1), self._AMINO.seq(f2)
-
-    def translate_batch(self, batch: 'SeqBatch', frame: int = 0) -> 'SeqBatch':
-        """
-        Translates an entire SeqBatch efficiently.
+        Internal batch translation logic.
 
         Args:
             batch: The batch of sequences to translate.
             frame: The reading frame.
+            to_stop: Whether to stop at stop codons.
 
         Returns:
             A new SeqBatch containing translated sequences.
         """
-        new_batch = SeqBatch([], self._AMINO)
-        if len(batch) == 0: return new_batch
+        if len(batch) == 0:
+            return SeqBatch(np.empty(0, dtype=Alphabet.DTYPE), np.empty(0, dtype=np.int32),
+                            np.empty(0, dtype=np.int32), self._AMINO)
+
         data, starts, lengths = batch.arrays
         # 1. Calculate lengths (Pass 1)
         new_lengths = _batch_translate_len_kernel(
-            data, starts, lengths, self._data, frame, self._stop_val
+            data, starts, lengths, self._data, self._stops, frame, to_stop
         )
 
         # 2. Calculate offsets
@@ -465,17 +558,7 @@ class GeneticCode:
                 data, starts, self._data, frame, new_data, new_starts, new_lengths
             )
 
-        # 4. Construct Result
-        new_data.flags.writeable = False
-        new_starts.flags.writeable = False
-        new_lengths.flags.writeable = False
-
-        new_batch._data = new_data
-        new_batch._starts = new_starts
-        new_batch._lengths = new_lengths
-        new_batch._count = new_count
-
-        return new_batch
+        return SeqBatch(new_data, new_starts, new_lengths, self._AMINO)
 
 
 class Seq:
@@ -651,71 +734,62 @@ class SeqBatch:
     """
     __slots__ = ('_alphabet', '_data', '_starts', '_lengths', '_count')
     DTYPE = np.uint8
-    def __init__(self, items: Iterable[Seq], alphabet: 'Alphabet' = None):
+   
+    def __init__(self, data: np.ndarray, starts: np.ndarray, lengths: np.ndarray, alphabet: Alphabet):
+        self._data = data
+        self._starts = starts
+        self._lengths = lengths
+        self._alphabet = alphabet
+        self._count = len(starts)
+        
+        # Lock arrays for safety
+        self._data.flags.writeable = False
+        self._starts.flags.writeable = False
+        self._lengths.flags.writeable = False
+
+    @classmethod
+    def from_seqs(cls, seqs: Iterable[Seq], alphabet: Alphabet = None):
         """
         Optimized initialization that prevents memory spikes.
 
         Args:
-            items: Iterable of Seq objects.
+            seqs: Iterable of Seq objects.
             alphabet: The alphabet of the sequences. If None, inferred from first sequence.
         """
-        self._alphabet = None
-        # 1. Handle Pre-sized Lists (Fast Path)
-        if isinstance(items, (list, tuple)):
-            self._count = len(items)
-            if self._count == 0:
-                self._setup_empty()
-                return
+        # Optimization: Fast path for existing SeqBatch (Clone)
+        if isinstance(seqs, SeqBatch):
+            if alphabet and alphabet != seqs.alphabet: raise ValueError("Alphabet mismatch")
+            return cls(seqs._data.copy(), seqs._starts.copy(), seqs._lengths.copy(), seqs.alphabet)
 
-            # First pass: Get lengths without creating new objects
-            self._lengths = np.empty(self._count, dtype=np.int32)
-            total_len = 0
-            for i, s in enumerate(items):
-                if self._alphabet is None: self._alphabet = s.alphabet
-                elif self._alphabet != s.alphabet:
-                    raise ValueError("Cannot concatenate sequences with different alphabets")
-                l = len(s)
-                self._lengths[i] = l
-                total_len += l
+        items = seqs if isinstance(seqs, (list, tuple)) else list(seqs)
+        if not items:
+            return cls(np.empty(0, dtype=cls.DTYPE), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), alphabet or Alphabet.dna())
 
-            # Allocate exact memory once
-            self._data = np.empty(total_len, dtype=self.DTYPE)
+        if alphabet is None: alphabet = items[0].alphabet
 
-            # Starts
-            self._starts = np.zeros(self._count, dtype=np.int32)
-            if self._count > 1:
-                np.cumsum(self._lengths[:-1], out=self._starts[1:])
+        count = len(items)
+        lengths = np.empty(count, dtype=np.int32)
 
-            # Second pass: Fill data
-            # This is much more memory efficient than np.concatenate([list...])
-            curr = 0
-            for s in items:
-                l = len(s)
-                self._data[curr:curr + l] = s.encoded
-                curr += l
+        # Pass 1: Lengths & Validation
+        for i, s in enumerate(items):
+            if s.alphabet != alphabet: raise ValueError("Mixed alphabets in SeqBatch")
+            lengths[i] = len(s)
 
-            # Lock arrays to ensure immutability and thread-safety
-            self._data.flags.writeable = False
-            self._starts.flags.writeable = False
-            self._lengths.flags.writeable = False
-
-        # 2. Handle Generic Iterators (Slower, requires consumption)
+        # Pass 2: Fill Data (Optimized with C-level concatenation)
+        if count > 0:
+            if count == 1:
+                # Zero-copy optimization for single sequence
+                data = items[0].encoded
+            else:
+                data = np.concatenate([s.encoded for s in items])
         else:
-            # Fallback to list conversion if iterator
-            # (We have to consume it anyway to know size)
-            items_list = list(items)
-            # Recursively call self
-            self.__init__(items_list, alphabet)
+            data = np.empty(0, dtype=cls.DTYPE)
 
-    def _setup_empty(self):
-        self._data = np.empty(0, dtype=self.DTYPE)
-        self._starts = np.empty(0, dtype=np.int32)
-        self._lengths = np.empty(0, dtype=np.int32)
-        self._alphabet = Alphabet.dna()
+        starts = np.zeros(count, dtype=np.int32)
+        if count > 1:
+            np.cumsum(lengths[:-1], out=starts[1:])
 
-        self._data.flags.writeable = False
-        self._starts.flags.writeable = False
-        self._lengths.flags.writeable = False
+        return cls(data, starts, lengths, alphabet)
 
     # --- Numba Accessors ---
     # Properties to unpack into Numba function arguments: *batch.arrays
@@ -734,17 +808,38 @@ class SeqBatch:
             length = self._lengths[idx]
             return self._alphabet.seq(self._data[start:start + length])
         elif isinstance(idx, (slice, np.ndarray, list)):
-            # Create a new SeqBatch from selected items
-            selected_items = [self[i] for i in range(len(self)) if i in idx] # This is inefficient for large batches
-            # TODO: Implement more efficient slicing for SeqBatch
-            return SeqBatch(selected_items, self._alphabet)
+            # Optimized slicing: Gather arrays directly without creating Seq objects
+            if isinstance(idx, slice):
+                start, stop, step = idx.indices(self._count)
+                if step == 1:
+                    # Contiguous slice (Fastest)
+                    new_count = max(0, stop - start)
+                    if new_count == 0: return SeqBatch.from_seqs([], self._alphabet)
+                    
+                    s_start = self._starts[start]
+                    s_end = self._starts[stop] if stop < self._count else len(self._data)
+                    
+                    new_data = self._data[s_start:s_end].copy()
+                    new_lengths = self._lengths[start:stop].copy()
+                    new_starts = self._starts[start:stop] - s_start
+                    return SeqBatch(new_data, new_starts, new_lengths, self._alphabet)
+                
+                # Non-contiguous slice -> Convert to array indices
+                indices = np.arange(start, stop, step)
+            else:
+                # Array/List indices
+                indices = np.asanyarray(idx)
+                if indices.dtype == bool:
+                    indices = np.flatnonzero(indices)
+            
+            return self._gather(indices)
+            
         raise TypeError(f"Invalid index type: {type(idx)}")
 
     def __iter__(self) -> Generator[Seq, None, None]:
         # The alphabet property is available via the first sequence, or needs to be passed in init
         # For now, assume all sequences in a batch share the same alphabet.
         # This is a safe assumption given how BatchSeq is constructed.
-        if self._count == 0: return
         for i in range(self._count):
             start = self._starts[i]
             length = self._lengths[i]
@@ -756,6 +851,103 @@ class SeqBatch:
         Uses BLAKE2b hashing. Output is a hex string (2 * digest_size chars).
         """
         return blake2b(self._data.tobytes(), digest_size=digest_size, usedforsecurity=False).hexdigest().encode('ascii')
+
+    def _gather(self, indices: np.ndarray) -> 'SeqBatch':
+        """Internal method to gather sequences by index."""
+        if len(indices) == 0: return SeqBatch.from_seqs([], self._alphabet)
+        
+        new_lengths = self._lengths[indices]
+        total_len = new_lengths.sum()
+        
+        new_data = np.empty(total_len, dtype=self.DTYPE)
+        new_starts = np.zeros(len(indices), dtype=np.int32)
+        if len(indices) > 1:
+            np.cumsum(new_lengths[:-1], out=new_starts[1:])
+            
+        _batch_gather_kernel(self._data, self._starts, self._lengths, indices, new_data, new_starts)
+        return SeqBatch(new_data, new_starts, new_lengths, self._alphabet)
+
+
+class SeqProperty:
+    """
+    Maps sequence symbols to numerical properties (e.g., Hydrophobicity).
+    Calculates average scores for Seqs and SeqBatches.
+    """
+    __slots__ = ('_data', '_alphabet')
+    _CACHE = {}
+    def __init__(self, mapping: dict[Union[bytes, str], float], alphabet: Alphabet):
+        """
+        Args:
+            mapping: Dictionary mapping characters (str) to values (float).
+            alphabet: The Alphabet instance to align with.
+        """
+        self._alphabet = alphabet
+        # Initialize with NaN so missing symbols are ignored in mean/sum
+        self._data = np.full(len(alphabet), np.nan, dtype=np.float32)
+        for char, val in mapping.items():
+            if isinstance(char, str): char = char.encode('ascii')
+            encoded = alphabet.encode(char)
+            if len(encoded) > 0: self._data[encoded[0]] = val
+        self._data.flags.writeable = False
+
+    @classmethod
+    def hydrophobicity(cls) -> 'SeqProperty':
+        """
+        Returns the Singleton instance for Kyte-Doolittle Hydrophobicity.
+        Aligned to the standard Amino Alphabet.
+        """
+        if (cached := cls._CACHE.get('hydrophobicity')) is None:
+            mapping = {
+                b'I': 4.5, b'V': 4.2, b'L': 3.8, b'F': 2.8, b'C': 2.5, b'M': 1.9, b'A': 1.8, b'G': -0.4, b'T': -0.7,
+                b'S': -0.8, b'W': -0.9, b'Y': -1.3, b'P': -1.6, b'H': -3.2, b'E': -3.5, b'Q': -3.5, b'D': -3.5,
+                b'N': -3.5, b'K': -3.9, b'R': -4.5
+            }
+            cls._CACHE['hydrophobicity'] = (cached := SeqProperty(mapping, Alphabet.amino()))
+        return cached
+    
+    @classmethod
+    def GC(cls) -> 'SeqProperty':
+        """
+        Returns the Singleton instance for GC content
+        """
+        if (cached := cls._CACHE.get('GC')) is None:
+            mapping = {b'A': 0, b'C': 1, b'G': 1, b'T': 0}
+            cls._CACHE['GC'] = (cached := SeqProperty(mapping, Alphabet.dna()))
+        return cached
+    
+    def _check_alphabet(self, seq: Union[Seq, SeqBatch]):
+        if seq.alphabet != self._alphabet:
+            raise ValueError(f"Seq alphabet {seq.alphabet} does not match Property alphabet {self._alphabet}")
+
+    def map(self, seq: Union[Seq, SeqBatch]) -> np.ndarray:
+        """
+        Returns the property values across a sequence or batch.
+        Result is a float32 array of the same shape as seq.encoded.
+        """
+        self._check_alphabet(seq)
+        return self._data[seq.encoded]
+
+    def sum(self, seq: Union[Seq, SeqBatch]) -> Union[float, np.ndarray]:
+        """
+        Calculates the sum of property values.
+        Returns float for Seq, or ndarray[float] for SeqBatch.
+        """
+        self._check_alphabet(seq)
+        if isinstance(seq, SeqBatch):
+            data, starts, lengths = seq.arrays
+            return _batch_property_sum_kernel(data, starts, lengths, self._data)
+        return _property_sum_kernel(seq.encoded, self._data)
+
+    def mean(self, seq: Union[Seq, SeqBatch]) -> Union[float, np.ndarray]:
+        """
+        Calculates the average property value.
+        Returns float for Seq, or ndarray[float] for SeqBatch.
+        """
+        self._check_alphabet(seq)
+        if isinstance(seq, SeqBatch):
+            data, starts, lengths = seq.arrays
+            return _batch_property_mean_kernel(data, starts, lengths, self._data)
+        return _property_mean_kernel(seq.encoded, self._data)
 
 
 # class SparseSeq(Seq):
@@ -857,7 +1049,7 @@ class SeqBatch:
 
 # Kernels --------------------------------------------------------------------------------------------------------------
 @jit(nopython=True, cache=True, nogil=True)
-def _translate_kernel(encoded_seq, flat_table, start, n_codons, invalid, dtype):
+def _translate_kernel(encoded_seq, flat_table, stops, start, n_codons, to_stop, dtype):
     """
     Translates DNA -> Amino Acid using a flat lookup table and bitwise math.
     Assumes DNA encoding is 0=T, 1=C, 2=A, 3=G (2 bits).
@@ -866,57 +1058,18 @@ def _translate_kernel(encoded_seq, flat_table, start, n_codons, invalid, dtype):
     for i in range(n_codons):
         # Calculate offset of current codon
         base = start + (i * 3)
-        # Fetch the three 2-bit integers (0-3)
-        b1 = encoded_seq[base]
-        b2 = encoded_seq[base + 1]
-        b3 = encoded_seq[base + 2]
-        # Calculate 1D index: b1*16 + b2*4 + b3
-        # Using bitwise ops is slightly faster/cleaner for powers of 2
-        # b1 << 4  == b1 * 16
-        # b2 << 2  == b2 * 4
-        flat_idx = (b1 << 4) | (b2 << 2) | b3
+        flat_idx = _get_codon_index(encoded_seq, base)
         aa = flat_table[flat_idx]
-        # Early stopping check
-        if aa == invalid: return res[:i]
+        
+        if stops[flat_idx] and to_stop:
+            return res[:i]
+            
         res[i] = aa
     return res
 
 
-@jit(nopython=True, cache=True, nogil=True)
-def _translate_all_kernel(encoded_seq, flat_table, dtype):
-    """
-    Translates all 3 frames in a single pass.
-    """
-    n = len(encoded_seq)
-    # Calculate sizes for each frame
-    n0 = n // 3
-    n1 = (n - 1) // 3
-    n2 = (n - 2) // 3
-
-    f0 = np.empty(n0, dtype=dtype)
-    f1 = np.empty(n1, dtype=dtype)
-    f2 = np.empty(n2, dtype=dtype)
-
-    # We iterate up to n-2 to form codons
-    for i in range(n - 2):
-        # Calculate codon index
-        flat_idx = (encoded_seq[i] << 4) | (encoded_seq[i + 1] << 2) | encoded_seq[i + 2]
-        aa = flat_table[flat_idx]
-
-        # Assign to appropriate frame based on index modulo
-        rem = i % 3
-        if rem == 0:
-            f0[i // 3] = aa
-        elif rem == 1:
-            f1[i // 3] = aa
-        else:
-            f2[i // 3] = aa
-
-    return f0, f1, f2
-
-
 @jit(nopython=True, cache=True, nogil=True, parallel=True)
-def _batch_translate_len_kernel(data, starts, lengths, table, frame, invalid):
+def _batch_translate_len_kernel(data, starts, lengths, table, stops, frame, to_stop):
     n = len(lengths)
     out_lens = np.empty(n, dtype=np.int32)
 
@@ -933,11 +1086,8 @@ def _batch_translate_len_kernel(data, starts, lengths, table, frame, invalid):
         actual_len = n_codons
         for j in range(n_codons):
             base = s + frame + (j * 3)
-            b1 = data[base]
-            b2 = data[base + 1]
-            b3 = data[base + 2]
-            idx = (b1 << 4) | (b2 << 2) | b3
-            if table[idx] == invalid:
+            idx = _get_codon_index(data, base)
+            if stops[idx] and to_stop:
                 actual_len = j
                 break
         out_lens[i] = actual_len
@@ -954,12 +1104,183 @@ def _batch_translate_fill_kernel(data, starts, table, frame, out_data, out_start
 
         for j in range(l):
             base = s + frame + (j * 3)
-            b1 = data[base]
-            b2 = data[base + 1]
-            b3 = data[base + 2]
-            idx = (b1 << 4) | (b2 << 2) | b3
+            idx = _get_codon_index(data, base)
             out_data[out_s + j] = table[idx]
 
+
+@jit(nopython=True, cache=True, nogil=True)
+def _find_codons_kernel(data, mask_table):
+    n = len(data)
+    if n < 3: return np.empty(0, dtype=np.int32)
+    
+    # Pass 1: Count
+    count = 0
+    for i in range(n - 2):
+        idx = _get_codon_index(data, i)
+        if mask_table[idx]:
+            count += 1
+            
+    # Pass 2: Fill
+    res = np.empty(count, dtype=np.int32)
+    k = 0
+    for i in range(n - 2):
+        idx = _get_codon_index(data, i)
+        if mask_table[idx]:
+            res[k] = i
+            k += 1
+    return res
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _find_orfs_kernel(data, starts_table, stops_table, min_len, max_len, include_partials):
+    n = len(data)
+    out_starts = []
+    out_ends = []
+
+    # Iterate 3 frames
+    for frame in range(3):
+        open_starts = []
+        for i in range(frame, n - 2, 3):
+            idx = _get_codon_index(data, i)
+            if stops_table[idx]:
+                # Close ORFs
+                end_pos = i + 3
+                for s in open_starts:
+                    length = end_pos - s
+                    if length >= min_len:
+                        if length <= max_len:
+                            out_starts.append(s)
+                            out_ends.append(end_pos)
+                open_starts = []
+            elif starts_table[idx]:
+                open_starts.append(i)
+            elif include_partials and i == frame:
+                # 5' Partial: Start of frame is a valid start if requested
+                open_starts.append(i)
+
+        # 3' Partial: Close remaining at end of sequence
+        if include_partials and len(open_starts) > 0:
+            end_pos = n
+            for s in open_starts:
+                length = end_pos - s
+                if min_len <= length <= max_len:
+                    out_starts.append(s)
+                    out_ends.append(end_pos)
+
+    return out_starts, out_ends
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _check_cds_kernel(data, starts, stops):
+    n = len(data)
+    # Check start (first 3 bases)
+    start_idx = _get_codon_index(data, 0)
+    if not starts[start_idx]: return False
+    
+    # Check stop (last 3 bases)
+    stop_idx = _get_codon_index(data, n - 3)
+    if not stops[stop_idx]: return False
+    
+    return True
+
+
+@jit(nopython=True, cache=True, nogil=True, parallel=True)
+def _batch_gather_kernel(data, starts, lengths, indices, out_data, out_starts):
+    n = len(indices)
+    for i in prange(n):
+        idx = indices[i]
+        src_s = starts[idx]
+        l = lengths[idx]
+        dst_s = out_starts[i]
+        out_data[dst_s : dst_s + l] = data[src_s : src_s + l]
+
+
+@jit(nopython=True, cache=True, nogil=True, inline='always')
+def _get_codon_index(data, idx):
+    """Helper to calculate 6-bit codon index from 3 bytes."""
+    return (data[idx] << 4) | (data[idx + 1] << 2) | data[idx + 2]
+
+
+@jit(nopython=True, cache=True, nogil=True, parallel=True)
+def _property_mean_kernel(encoded_seq, prop_table):
+    """
+    Calculates average property value for a single sequence.
+    Skips NaN entries in the table.
+    """
+    n = len(encoded_seq)
+    if n == 0: return 0.0
+
+    total = 0.0
+    count = 0
+
+    for i in prange(n):
+        val = prop_table[encoded_seq[i]]
+        if not np.isnan(val):
+            total += val
+            count += 1
+
+    if count == 0: return 0.0
+    return total / count
+
+
+@jit(nopython=True, cache=True, nogil=True, parallel=True)
+def _batch_property_mean_kernel(data, starts, lengths, prop_table):
+    """
+    Parallel calculation of properties for a SeqBatch.
+    """
+    n_seqs = len(starts)
+    results = np.zeros(n_seqs, dtype=np.float32)
+
+    for i in prange(n_seqs):
+        s = starts[i]
+        l = lengths[i]
+
+        if l == 0:
+            results[i] = 0.0
+            continue
+
+        total = 0.0
+        count = 0
+
+        for j in range(l):
+            val = prop_table[data[s + j]]
+            if not np.isnan(val):
+                total += val
+                count += 1
+
+        if count > 0:
+            results[i] = total / count
+        else:
+            results[i] = 0.0
+
+    return results
+
+
+@jit(nopython=True, cache=True, nogil=True, parallel=True)
+def _property_sum_kernel(encoded_seq, prop_table):
+    n = len(encoded_seq)
+    total = 0.0
+    for i in prange(n):
+        val = prop_table[encoded_seq[i]]
+        if not np.isnan(val):
+            total += val
+    return total
+
+
+@jit(nopython=True, cache=True, nogil=True, parallel=True)
+def _batch_property_sum_kernel(data, starts, lengths, prop_table):
+    n_seqs = len(starts)
+    results = np.zeros(n_seqs, dtype=np.float32)
+    for i in prange(n_seqs):
+        s = starts[i]
+        l = lengths[i]
+        total = 0.0
+        for j in range(l):
+            val = prop_table[data[s + j]]
+            if not np.isnan(val):
+                total += val
+        results[i] = total
+    return results
 
 # @jit(nopython=True, cache=True, nogil=True)
 # def _sparse_reconstruct_kernel(

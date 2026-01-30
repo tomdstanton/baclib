@@ -4,7 +4,7 @@ Graph system using `scipy.sparse.csgraph` with separated Weighting Policy and in
 from collections import defaultdict
 from concurrent.futures import Executor
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import IntEnum, Enum
 from typing import Literal, Any, Optional, Union, List, Dict, Set, Iterable, Generator
 
 import numpy as np
@@ -13,8 +13,10 @@ from scipy.sparse.csgraph import connected_components as _cc, bellman_ford as _b
     johnson as _j, floyd_warshall as _fw
 
 from baclib.utils.resources import RESOURCES, jit
-if 'numba' in RESOURCES.optional_packages: from numba import prange
-else: prange = range
+if RESOURCES.has_module('numba'):
+    from numba import prange
+else:
+    prange = range
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
@@ -26,6 +28,13 @@ class Aggregator(IntEnum):
     MEAN = 3
     MIN = 4
     MAX = 5
+
+
+class GraphAlgorithm(str, Enum):
+    DIJKSTRA = 'D'
+    BELLMAN_FORD = 'BF'
+    JOHNSON = 'J'
+    FLOYD_WARSHALL = 'FW'
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,17 +53,10 @@ class WeightingPolicy:
     """
     attr: bytes
     source: Literal['edge', 'node'] = 'edge'
-    aggregator: Union[str, Aggregator] = Aggregator.TO
+    aggregator: Aggregator = Aggregator.TO
     invert: bool = False
     default: float = 1.0
     name: Optional[str] = None
-
-    def __post_init__(self):
-        if isinstance(self.aggregator, str):
-            try: # Normalize string to Enum
-                object.__setattr__(self, 'aggregator', Aggregator[self.aggregator.upper()])
-            except KeyError:
-                object.__setattr__(self, 'aggregator', Aggregator.TO)
 
 
 class Edge:
@@ -158,6 +160,45 @@ class Path:
         return f"Path(steps={len(self.nodes)}, cost={self.total_cost:.4f}, policy={p_str})"
 
 
+class EdgeBatch:
+    """
+    A columnar container for edges, optimized for batch processing and IO.
+    Stores source/target nodes and attributes as numpy arrays.
+    """
+    __slots__ = ('_u', '_v', '_attributes')
+
+    def __init__(self, u: np.ndarray, v: np.ndarray, attributes: Dict[bytes, np.ndarray] = None):
+        self._u = np.array(u, dtype=object, copy=False)
+        self._v = np.array(v, dtype=object, copy=False)
+        self._attributes = attributes or {}
+        
+        if len(self._u) != len(self._v):
+            raise ValueError("u and v arrays must have the same length")
+
+    def __len__(self): return len(self._u)
+
+    def __iter__(self):
+        for i in range(len(self)):
+            attrs = {k: v[i] for k, v in self._attributes.items()}
+            yield Edge(self._u[i], self._v[i], attrs)
+
+    def __getitem__(self, item):
+        if isinstance(item, (int, np.integer)):
+            attrs = {k: v[item] for k, v in self._attributes.items()}
+            return Edge(self._u[item], self._v[item], attrs)
+        elif isinstance(item, (slice, np.ndarray, list)):
+            new_attrs = {k: v[item] for k, v in self._attributes.items()}
+            return EdgeBatch(self._u[item], self._v[item], new_attrs)
+        raise TypeError(f"Invalid index type: {type(item)}")
+
+    @property
+    def u(self) -> np.ndarray: return self._u
+    @property
+    def v(self) -> np.ndarray: return self._v
+    @property
+    def attributes(self) -> Dict[bytes, np.ndarray]: return self._attributes
+
+
 class Graph:
     """
     A simple graph object which act as an abstraction layer on top on scipy sparce matrices; nodes are string
@@ -174,9 +215,16 @@ class Graph:
         5.0
     """
     _MAX_PENALTY = 1e12
-    _PATHFINDERS = {'D': _d, 'FW': _fw, 'BF': _bf, 'J': _j}
-    _ALGORITHMS = Literal['D', 'BF', 'J', 'FW']
-    __slots__ = ('_directed', '_multi', 'edges', '_nodes', '_node_to_idx', '_node_attributes', '_matrix_cache', '_topology_cache')
+    _DEFAULT_POLICY = WeightingPolicy(b'weight', default=1.0)
+    _PATHFINDERS = {
+        GraphAlgorithm.DIJKSTRA: _d,
+        GraphAlgorithm.FLOYD_WARSHALL: _fw,
+        GraphAlgorithm.BELLMAN_FORD: _bf,
+        GraphAlgorithm.JOHNSON: _j
+    }
+    _ALGORITHMS = Union[str, GraphAlgorithm]
+    __slots__ = ('_directed', '_multi', 'edges', '_nodes', '_node_to_idx', '_node_attributes', '_matrix_cache',
+                 '_csc_cache', '_components_cache', '_topology_cache', '_topo_lists')
 
     def __init__(self, edges: Iterable[Union[Edge, tuple]] = None, directed: bool = True, multi: bool = True):
         """
@@ -195,7 +243,10 @@ class Graph:
         self._node_attributes: Dict[bytes, dict] = {}
         # Cache: Policy -> CSR Matrix
         self._matrix_cache: Dict[WeightingPolicy, csr_matrix] = {}
+        self._csc_cache: Dict[WeightingPolicy, csr_matrix] = {}
+        self._components_cache = None
         self._topology_cache = None
+        self._topo_lists = ([], [], [])
         if edges: self.add_edges(edges)
 
     def __repr__(self):
@@ -209,7 +260,10 @@ class Graph:
     def __iter__(self): return iter(self.edges)
     def __len__(self): return len(self.edges)
     def __getitem__(self, item): return self._nodes[item]
-    def _invalidate_cache(self): self._matrix_cache.clear()
+    def _invalidate_cache(self):
+        self._matrix_cache.clear()
+        self._csc_cache.clear()
+        self._components_cache = None
 
     def add_node(self, node: Any, attributes: dict = None):
         """
@@ -238,26 +292,40 @@ class Graph:
         Args:
             edges: An iterable of Edge objects or tuples.
         """
-        # Pre-process nodes to avoid checking dictionary repeatedly
-        new_nodes = set()
-        edge_objs = []
-
-        for e in edges:
-            if not isinstance(e, Edge): e = Edge(*e)
-            edge_objs.append(e)
-            if e.u not in self._node_to_idx: new_nodes.add(e.u)
-            if e.v not in self._node_to_idx: new_nodes.add(e.v)
-
+        # Optimization: Collect unique nodes first to reduce dict lookups from O(E) to O(V)
+        if isinstance(edges, EdgeBatch):
+            # Fast path for batch: access arrays directly
+            potential_nodes = set(edges.u)
+            potential_nodes.update(edges.v)
+            edge_objs = edges
+        else:
+            potential_nodes = set()
+            edge_objs = []
+            for e in edges:
+                if not isinstance(e, Edge): e = Edge(*e)
+                edge_objs.append(e)
+                potential_nodes.add(e.u)
+                potential_nodes.add(e.v)
+        
         # Batch add nodes
-        for n in new_nodes:
+        for n in potential_nodes:
             if n not in self._node_to_idx: # Double check
                 self._node_to_idx[n] = len(self._nodes)
                 self._nodes.append(n)
 
         # Batch add edges
-        len_before = len(self.edges)
-        self.edges.update(edge_objs)
-        if len(self.edges) > len_before:
+        u_list, v_list, e_list = self._topo_lists
+        node_map = self._node_to_idx
+        added = False
+        for e in edge_objs:
+            if e not in self.edges:
+                self.edges.add(e)
+                u_list.append(node_map[e.u])
+                v_list.append(node_map[e.v])
+                e_list.append(e)
+                added = True
+
+        if added:
             self._topology_cache = None
             self._invalidate_cache()
 
@@ -279,21 +347,12 @@ class Graph:
     def _ensure_topology(self):
         if self._topology_cache is not None: return
 
-        n_est = len(self.edges)
-        u_arr = np.empty(n_est, dtype=np.int32)
-        v_arr = np.empty(n_est, dtype=np.int32)
-        edge_list = []
-        node_map = self._node_to_idx
-        idx = 0
-
-        for e in self.edges:
-            if (u := node_map.get(e.u)) is not None and (v := node_map.get(e.v)) is not None:
-                u_arr[idx] = u
-                v_arr[idx] = v
-                edge_list.append(e)
-                idx += 1
-
-        self._topology_cache = (u_arr[:idx], v_arr[:idx], edge_list)
+        u_list, v_list, e_list = self._topo_lists
+        self._topology_cache = (
+            np.array(u_list, dtype=np.int32),
+            np.array(v_list, dtype=np.int32),
+            e_list
+        )
 
     def _build_matrix(self, p: WeightingPolicy) -> csr_matrix:
         """
@@ -317,10 +376,7 @@ class Graph:
         
         # Determine reduction mode for multigraphs
         # Map TO(0)/FROM(1) to MIN(4) as 'direction' doesn't imply summation for parallel edges
-        try:
-            reduce_mode = p.aggregator.value if isinstance(p.aggregator, Aggregator) else int(p.aggregator)
-        except (ValueError, AttributeError):
-            reduce_mode = 4 # Default to MIN
+        reduce_mode = p.aggregator.value
         if reduce_mode <= 1: reduce_mode = 4
         
         if p.source == 'node':
@@ -336,8 +392,12 @@ class Graph:
                 u_idx, v_idx, node_vals, agg_mode, self._directed, p.invert, self._MAX_PENALTY
             )
         else:
-            vals = [e.attributes.get(p.attr, default) for e in edge_list]
-            vals_arr = np.array(vals, dtype=np.float64)
+            # Optimization: Pre-allocate array to avoid list overhead
+            n_edges = len(edge_list)
+            vals_arr = np.full(n_edges, default, dtype=np.float64)
+            attr = p.attr
+            for i, e in enumerate(edge_list):
+                if (val := e.attributes.get(attr)) is not None: vals_arr[i] = float(val)
             
             rows, cols, data = _build_edge_graph_kernel(
                 u_idx, v_idx, vals_arr, self._directed, p.invert, self._MAX_PENALTY
@@ -377,11 +437,11 @@ class Graph:
         """
         if (start_idx := self._node_to_idx.get(start)) is None or (end_idx := self._node_to_idx.get(end)) is None: return None
         matrix = self.get_matrix(policy)
-        if not (finder := self._PATHFINDERS.get(algorithm)): raise ValueError(f"Unknown algorithm: {algorithm}")
+        if not (finder := self._PATHFINDERS.get(algorithm if isinstance(algorithm, GraphAlgorithm) else str(algorithm))): raise ValueError(f"Unknown algorithm: {algorithm}")
         try:
-            if algorithm == 'D':
+            if algorithm == GraphAlgorithm.DIJKSTRA:
                 dist, preds = finder(matrix, directed=self._directed, indices=start_idx, return_predecessors=True, limit=max_cost)
-            elif algorithm == 'FW':
+            elif algorithm == GraphAlgorithm.FLOYD_WARSHALL:
                 dist_mat, pred_mat = finder(matrix, directed=self._directed, return_predecessors=True)
                 dist = dist_mat[start_idx, end_idx]
                 preds = pred_mat[start_idx]
@@ -392,6 +452,55 @@ class Graph:
         d = dist if np.isscalar(dist) else dist[end_idx]
         if np.isinf(d) or d >= 1e11: return None
         return self._reconstruct_path(start_idx, end_idx, preds, float(d), policy)
+
+    def find_paths(self, start: bytes, end: bytes, max_hops: int = 10,
+                   policy: WeightingPolicy = None) -> List[Path]:
+        """
+        Finds all simple paths between start and end nodes within a hop limit.
+        Useful for exploring local graph topology (e.g., bubbles) between anchors.
+
+        Args:
+            start: Start node ID.
+            end: End node ID.
+            max_hops: Maximum number of edges to traverse.
+            policy: Optional policy to calculate cost for the paths.
+
+        Returns:
+            List of Path objects.
+        """
+        s_idx = self._node_to_idx.get(start)
+        e_idx = self._node_to_idx.get(end)
+        if s_idx is None or e_idx is None: return []
+
+        # Access CSR internals directly for speed
+        if policy is None: policy = self._DEFAULT_POLICY
+        matrix = self.get_matrix(policy)
+        indices = matrix.indices
+        indptr = matrix.indptr
+        data = matrix.data
+
+        results = []
+
+        # Optimization: Recursive Backtracking to avoid list copying overhead
+        # Using a single mutable list 'path' is much faster than 'path + [neighbor]'
+        def _dfs(curr, path, cost):
+            if curr == e_idx:
+                nodes = [self._nodes[i] for i in path]
+                results.append(Path(nodes, cost, policy))
+                return
+
+            if len(path) > max_hops: return
+
+            for i in range(indptr[curr], indptr[curr+1]):
+                neighbor = indices[i]
+                if neighbor not in path: # O(Depth) check, acceptable for small max_hops
+                    weight = data[i]
+                    path.append(neighbor)
+                    _dfs(neighbor, path, cost + weight)
+                    path.pop()
+
+        _dfs(s_idx, [s_idx], 0.0)
+        return results
 
     def resolve_bridges(self, bridges: Iterable[tuple[bytes, bytes]], policy: WeightingPolicy,
                         algorithm: _ALGORITHMS = 'D', max_cost: float = np.inf,
@@ -424,14 +533,14 @@ class Graph:
             yield from self._resolve_bridges_dense(bridges_map, policy, max_cost, create_edges)
             return
         # --- HYBRID OPTIMIZATION END ---
-        if not (finder := self._PATHFINDERS.get(algorithm)): raise ValueError(f"Unknown algorithm: {algorithm}")
+        if not (finder := self._PATHFINDERS.get(algorithm if isinstance(algorithm, GraphAlgorithm) else str(algorithm))): raise ValueError(f"Unknown algorithm: {algorithm}")
         # Existing Sparse Logic (Chunked Dijkstra) for large graphs
-        if algorithm == 'FW':
+        if algorithm == GraphAlgorithm.FLOYD_WARSHALL:
             raise ValueError("Floyd-Warshall cannot be used with batched sparse resolution.")
 
         # ... (Rest of your existing Dijkstra logic) ...
         source_ids = list(bridges_map.keys())
-        if policy is None: policy = WeightingPolicy(b'weight', default=1.0)
+        if policy is None: policy = self._DEFAULT_POLICY
         matrix = self.get_matrix(policy)
 
         chunk_size = 100
@@ -450,6 +559,57 @@ class Graph:
             if edges: new_edges_to_add.extend(edges)
 
         if new_edges_to_add: self.add_edges(new_edges_to_add)
+
+    def resolve_scaffolds(self, scaffolds: Iterable[List[bytes]], policy: WeightingPolicy,
+                          algorithm: _ALGORITHMS = 'D', max_cost: float = np.inf) -> Generator[Path, None, None]:
+        """
+        Resolves paths for multi-node skeletons (e.g., from AlignmentBatch.find_scaffolds).
+        Stitches adjacent nodes in the skeleton using the shortest path.
+
+        Args:
+            scaffolds: Iterable of lists of node IDs (e.g. [A, B, C]).
+            policy: WeightingPolicy.
+            algorithm: Algorithm to use.
+            max_cost: Max cost per hop.
+
+        Yields:
+            Path objects representing the fully resolved scaffold.
+        """
+        # 1. Collect all unique segments needed across all scaffolds
+        # This allows us to batch-solve them using parallel Dijkstra
+        scaffold_list = list(scaffolds)
+        needed_segments = set()
+        for skel in scaffold_list:
+            for i in range(len(skel) - 1):
+                needed_segments.add((skel[i], skel[i+1]))
+        
+        # 2. Batch resolve using the optimized resolve_bridges
+        solved_segments = {}
+        for path in self.resolve_bridges(needed_segments, policy, algorithm, max_cost):
+            if not path.nodes: continue
+            # Map (Start, End) -> Path
+            key = (path.nodes[0], path.nodes[-1])
+            solved_segments[key] = path
+            
+        # 3. Stitch scaffolds
+        for skeleton in scaffold_list:
+            if len(skeleton) < 2: continue
+            
+            full_path = None
+            valid = True
+            
+            for i in range(len(skeleton) - 1):
+                u, v = skeleton[i], skeleton[i+1]
+                segment = solved_segments.get((u, v))
+                if segment is None:
+                    valid = False
+                    break
+                
+                if full_path is None: full_path = segment
+                else: full_path = full_path + segment
+            
+            if valid and full_path:
+                yield full_path
 
     def _resolve_bridges_dense(self, bridges_map: Dict[bytes, Set[bytes]],
                                policy: WeightingPolicy, max_cost: float,
@@ -606,14 +766,15 @@ class Graph:
         Yields:
             Lists of node IDs.
         """
-        # Use a dummy policy just to get connectivity
-        policy = WeightingPolicy(attr=b'_connectivity', default=1.0)
-        n, labels = _cc(self.get_matrix(policy), connection='weak', directed=self._directed)
-        components = defaultdict(list)
-        for idx, label in enumerate(labels):
-            components[label].append(self._nodes[idx])
+        if self._components_cache is None:
+            # Use a dummy policy just to get connectivity
+            n, labels = _cc(self.get_matrix(self._DEFAULT_POLICY), connection='weak', directed=self._directed)
+            components = defaultdict(list)
+            for idx, label in enumerate(labels):
+                components[label].append(self._nodes[idx])
+            self._components_cache = list(components.values())
 
-        yield from components.values()
+        yield from self._components_cache
 
     def greedy_set_cover(self, policy: WeightingPolicy, return_ids: bool = False) -> Union[List[int], List[bytes]]:
         """
@@ -629,9 +790,10 @@ class Graph:
         """
         matrix = self.get_matrix(policy)
         # Ensure CSC for column access (Element -> Sets)
-        # This is O(N) memory but critical for speed
-        csc = matrix.tocsc()
-        # Max possible score is the max number of elements in a single set
+        # This is O(N) memory but critical for speed. Cached to avoid re-transposing.
+        if (csc := self._csc_cache.get(policy)) is None:
+            self._csc_cache[policy] = (csc := matrix.tocsc())
+
         # (We can optimize this, but getting max row len is cheap)
         if matrix.shape[0] == 0: return []
         max_score = matrix.getnnz(axis=1).max()
@@ -840,14 +1002,15 @@ def _build_node_graph_kernel(u_indices, v_indices, node_vals, agg_mode, directed
         val_u = node_vals[u]
         val_v = node_vals[v]
         
-        val = 1.0
-        if agg_mode == Aggregator.TO: val = val_v
-        elif agg_mode == Aggregator.FROM: val = val_u
-        elif agg_mode == Aggregator.SUM: val = val_u + val_v
-        elif agg_mode == Aggregator.MEAN: val = (val_u + val_v) * 0.5
-        elif agg_mode == Aggregator.MIN: val = min(val_u, val_v)
-        elif agg_mode == Aggregator.MAX: val = max(val_u, val_v)
+        val_raw = 1.0
+        if agg_mode == Aggregator.TO: val_raw = val_v
+        elif agg_mode == Aggregator.FROM: val_raw = val_u
+        elif agg_mode == Aggregator.SUM: val_raw = val_u + val_v
+        elif agg_mode == Aggregator.MEAN: val_raw = (val_u + val_v) * 0.5
+        elif agg_mode == Aggregator.MIN: val_raw = min(val_u, val_v)
+        elif agg_mode == Aggregator.MAX: val_raw = max(val_u, val_v)
         
+        val = val_raw
         if val <= 1e-9: val = max_penalty
         elif invert: val = 1.0 / val
             
@@ -861,10 +1024,11 @@ def _build_node_graph_kernel(u_indices, v_indices, node_vals, agg_mode, directed
             cols[idx_rev] = u
             
             # Handle asymmetric aggregators for reverse edge
-            if agg_mode == Aggregator.TO: val_rev = val_u # to (now u)
-            elif agg_mode == Aggregator.FROM: val_rev = val_v # from (now v)
-            else: val_rev = val
+            if agg_mode == Aggregator.TO: val_rev_raw = val_u # to (now u)
+            elif agg_mode == Aggregator.FROM: val_rev_raw = val_v # from (now v)
+            else: val_rev_raw = val_raw # Use raw value to avoid double inversion
             
+            val_rev = val_rev_raw
             if val_rev <= 1e-9: val_rev = max_penalty
             elif invert: val_rev = 1.0 / val_rev
             
