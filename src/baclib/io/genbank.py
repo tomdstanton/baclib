@@ -1,31 +1,22 @@
 from typing import List, BinaryIO, Generator
 from re import compile as regex
 
-import numpy as np
-
-from baclib.core.seq import Alphabet
-from baclib.containers.record import Record, Feature, RecordBatch
+from baclib.core.alphabet import Alphabet
+from baclib.containers.record import Record, Feature, RecordBatch, FeatureKey
 from baclib.core.seq import Seq
 from baclib.core.interval import Interval
-from baclib.io import BaseReader, SeqFile
+from baclib.io import BaseReader, SeqFile, SeqFileFormat
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
-@SeqFile.register('genbank')
+@SeqFile.register(SeqFileFormat.GENBANK, extensions=['.gb', '.gbk', '.genbank'])
 class GenbankReader(BaseReader):
     """
     High-performance Genbank Reader (Binary Mode).
-    Robust to fuzzy coordinates (<1..>100) and loose indentation.
-
-    Examples:
-        >>> with open("genome.gbk", "rb") as f:
-        ...     reader = GenbankReader(f)
-        ...     for record in reader:
-        ...         print(record.id)
     """
     # Relaxed regex to handle <, > and partial entries (Bytes)
     _INTERVAL_REGEX = regex(rb'(?P<partial_start><)?(?P<start>[0-9]+)\.\.(?P<partial_end>>)?(?P<end>[0-9]+)')
-    _SUPPORTED_KINDS = frozenset({b'CDS', b'source', b'misc_feature'})
+    _DEFAULT_ALPHABET = Alphabet.DNA
 
     def __init__(self, handle: BinaryIO, alphabet: Alphabet = None):
         super().__init__(handle)
@@ -52,17 +43,14 @@ class GenbankReader(BaseReader):
 
     def _read_chunks(self):
         # Optimization: Read large binary chunks (Seqtk style)
-        read = self._handle.read
         
         buf = b""
         search_pos = 0
-        while True:
-            chunk = read(self._CHUNK_SIZE)
+        for chunk in self.read_chunks(self._CHUNK_SIZE):
             if not chunk:
                 if buf and (b'LOCUS' in buf[:100] or b'//' in buf):
                     # Try to parse remaining buffer if it looks like a record
-                    if len(buf.strip()) > 2:
-                        yield buf
+                    if len(buf.strip()) > 2: yield buf
                 break
             
             buf += chunk
@@ -76,13 +64,11 @@ class GenbankReader(BaseReader):
                 end_pos = -1
                 
                 # Check start of buffer
-                if scan_start == 0 and buf.startswith(b'//'):
-                    end_pos = 0
+                if scan_start == 0 and buf.startswith(b'//'): end_pos = 0
                 else:
                     # Find \n//
                     found = buf.find(b'\n//', scan_start)
-                    if found != -1:
-                        end_pos = found + 1
+                    if found != -1: end_pos = found + 1
                 
                 if end_pos == -1:
                     search_pos = max(pos, len(buf) - 4) # Update search position for next chunk
@@ -100,8 +86,7 @@ class GenbankReader(BaseReader):
                     break
                 
                 record_bytes = buf[pos:end_pos]
-                if record_bytes.strip():
-                    yield record_bytes
+                if record_bytes.strip(): yield record_bytes
                 
                 pos = next_line + 1
                 scan_start = pos # Next search starts after this record
@@ -119,13 +104,10 @@ class GenbankReader(BaseReader):
             if line_end != -1:
                 meta_data = data[:origin_idx]
                 seq_data = data[line_end+1:]
-        
+
         # 2. Encode Sequence
-        if seq_data:
-            seq = self.alphabet.seq(seq_data)
-        else:
-            seq = self.alphabet.seq(np.array([], dtype=np.uint8))
-            
+        seq = self.alphabet.seq_from(seq_data) if seq_data else self.alphabet.empty_seq()
+
         # 3. Parse Metadata
         features_idx = meta_data.find(b'\nFEATURES')
         
@@ -144,7 +126,7 @@ class GenbankReader(BaseReader):
         return self._finalize_record(header_lines, feature_lines, seq)
 
     def _make_batch(self, chunks: List[bytes]) -> RecordBatch:
-        seq_encoded_list = []
+        seq_bytes_list = []
         meta_list = []
         
         for data in chunks:
@@ -159,31 +141,18 @@ class GenbankReader(BaseReader):
                     seq_data = data[line_end+1:]
             
             meta_list.append(meta_data)
-            if seq_data:
-                seq_encoded_list.append(self.alphabet.encode(seq_data))
-            else:
-                seq_encoded_list.append(np.empty(0, dtype=np.uint8))
+            seq_bytes_list.append(seq_data or b"")
 
-        # Build SeqBatch
-        lengths = np.array([len(x) for x in seq_encoded_list], dtype=np.int32)
-        if len(seq_encoded_list) > 0:
-            bulk_data = np.concatenate(seq_encoded_list)
-        else:
-            bulk_data = np.empty(0, dtype=np.uint8)
-            
-        n = len(chunks)
-        starts = np.zeros(n, dtype=np.int32)
-        if n > 1: np.cumsum(lengths[:-1], out=starts[1:])
-        
-        batch = self.alphabet.batch(bulk_data, starts, lengths)
-        
+        batch = self._build_seq_batch(seq_bytes_list, self.alphabet)
+        bulk_data, starts, lengths = batch.arrays
+
         # Build Records
         records = []
         for i, meta_data in enumerate(meta_list):
             # Create View
             s_start = starts[i]
             s_len = lengths[i]
-            s_view = self.alphabet.seq(bulk_data[s_start : s_start + s_len])
+            s_view = self.alphabet.seq_from(bulk_data[s_start: s_start + s_len])
             
             # Parse Meta
             features_idx = meta_data.find(b'\nFEATURES')
@@ -203,8 +172,7 @@ class GenbankReader(BaseReader):
             
         return RecordBatch.from_aligned_batch(batch, records)
 
-    def _finalize_record(self, header_lines: List[bytes], feature_lines: List[bytes],
-                         seq: Seq) -> Record:
+    def _finalize_record(self, header_lines: List[bytes], feature_lines: List[bytes], seq: Seq) -> Record:
         # 1. Parse Header
         name = b'unknown'
         description = b''
@@ -217,11 +185,7 @@ class GenbankReader(BaseReader):
                 description = line[12:].strip()
 
                 # 2. Create Record
-                record = Record(
-                    seq,
-                    name,
-                    description
-                )
+                record = Record(seq, name, description)
 
                 # 3. Parse Features
                 current_lines = []
@@ -237,8 +201,7 @@ class GenbankReader(BaseReader):
                     else:
                         current_lines.append(line)
 
-                if current_lines:
-                    self._parse_feature_block(record, current_lines)
+                if current_lines: self._parse_feature_block(record, current_lines)
 
                 return record
 
@@ -247,8 +210,7 @@ class GenbankReader(BaseReader):
         if not header_line: return
 
         parts = header_line.split(maxsplit=1)
-        kind = parts[0]
-        if kind not in self._SUPPORTED_KINDS: return
+        feature_key = parts[0]
 
         loc_str = parts[1] if len(parts) > 1 else b""
         qual_start_index = 1
@@ -270,7 +232,7 @@ class GenbankReader(BaseReader):
 
         # Handle 'source' or failed parses
         if not intervals:
-            if kind == b'source':
+            if feature_key == FeatureKey.SOURCE.bytes: # Feature init will convert this to FeatureKey.source
                 intervals = [Interval(0, 0, 1)]
             else:
                 return
@@ -280,9 +242,9 @@ class GenbankReader(BaseReader):
             # Create a spanning interval
             span_start = min(i.start for i in intervals)
             span_end = max(i.end for i in intervals)
-            feat = Feature(Interval(span_start, span_end, strand), kind)
+            feat = Feature(Interval(span_start, span_end, strand), feature_key)
         else:
-            feat = Feature(intervals[0], kind)
+            feat = Feature(intervals[0], feature_key)
 
         # Parse Qualifiers
         current_qual = []
@@ -296,12 +258,13 @@ class GenbankReader(BaseReader):
 
         if current_qual: self._parse_and_add_qual(feat, current_qual)
 
-        if kind == b'source':
+        if feat.key == FeatureKey.SOURCE:
             record.qualifiers.extend(feat.qualifiers)
         else:
             record.features.append(feat)
 
-    def _parse_and_add_qual(self, feat: Feature, lines: List[bytes]):
+    @staticmethod
+    def _parse_and_add_qual(feat: Feature, lines: List[bytes]):
         full_text = b"".join(lines)
         # Remove leading '/'
         key, sep, val = full_text[1:].partition(b'=')

@@ -1,23 +1,144 @@
 """
 Module containing various utility functions and classes.
 """
+from abc import ABC, abstractmethod
 from json import loads as json_loads
-from argparse import Namespace
 from dataclasses import dataclass, fields
-from io import BytesIO, IOBase
+from io import IOBase
 from zipfile import ZipFile
 from tempfile import TemporaryDirectory
 from pathlib import Path
-from typing import Union, Iterable, Callable, Any,  BinaryIO, Optional
+from typing import Union, Iterable, BinaryIO, Optional, IO, Any
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
-from shutil import copyfileobj
+from shutil import copyfileobj, get_terminal_size
 from time import time
 from sys import stderr, stdout, stdin
+import threading
+import queue
 from importlib import import_module
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
+
+from .resources import RESOURCES
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
+class Batch(ABC):
+    """
+    Abstract base class for all batch containers.
+    Enforces the Sequence protocol (len, getitem, iter).
+    """
+    __slots__ = ()
+    @abstractmethod
+    def __len__(self) -> int: ...
+    @abstractmethod
+    def empty(self) -> 'Batch': ...
+    @abstractmethod
+    def __getitem__(self, item): ...
+    def __iter__(self):
+        for i in range(len(self)): yield self[i]
+
+
+class RaggedBatch(Batch):
+    """
+    Base class for batches that store variable-length items in a flattened format (CSR-like).
+    Manages the offsets array and length calculation.
+    """
+    __slots__ = ('_offsets', '_length')
+    def __init__(self, offsets: np.ndarray): 
+        self._offsets = offsets
+        self._length = len(offsets) - 1
+    def __len__(self) -> int: return self._length
+
+    def empty(self) -> 'RaggedBatch':
+        return self.__class__(np.array([0], dtype=self._offsets.dtype))
+
+    def _get_slice_info(self, item: slice) -> tuple[np.ndarray, int, int]:
+        start, stop, step = item.indices(len(self))
+        if step != 1: raise NotImplementedError("Batch slicing with step != 1 not supported")
+        val_start = self._offsets[start]
+        val_end = self._offsets[stop]
+        new_offsets = self._offsets[start:stop+1] - val_start
+        return new_offsets, val_start, val_end
+
+
+class ThreadedChunkReader:
+    """
+    Reads data from a file handle in a background thread and yields chunks.
+    Useful for hiding IO latency (e.g. decompression) during parsing.
+    """
+    def __init__(self, handle: BinaryIO, chunk_size: int = 65536, queue_size: int = 4):
+        self._handle = handle
+        self._chunk_size = chunk_size
+        self._queue = queue.Queue(maxsize=queue_size)
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        try:
+            while True:
+                chunk = self._handle.read(self._chunk_size)
+                self._queue.put(chunk)
+                if not chunk: break
+        except Exception as e:
+            self._queue.put(e)
+
+    def __iter__(self):
+        while True:
+            item = self._queue.get()
+            if isinstance(item, Exception): raise item
+            yield item
+            if not item: break
+
+
+class ThreadedChunkWriter:
+    """
+    Writes data to a file handle in a background thread.
+    Buffers small writes into chunks to reduce queue overhead and lock contention.
+    """
+    def __init__(self, handle: BinaryIO, chunk_size: int = 65536, queue_size: int = 4):
+        self._handle = handle
+        self._chunk_size = chunk_size
+        self._queue = queue.Queue(maxsize=queue_size)
+        self._buffer = []
+        self._buffer_len = 0
+        self._error = None
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        try:
+            while True:
+                chunk = self._queue.get()
+                if chunk is None: break
+                self._handle.write(chunk)
+                self._queue.task_done()
+        except Exception as e:
+            self._error = e
+
+    def write(self, data: bytes):
+        if self._error: raise self._error
+        self._buffer.append(data)
+        self._buffer_len += len(data)
+        if self._buffer_len >= self._chunk_size:
+            self._flush_buffer()
+
+    def _flush_buffer(self):
+        if not self._buffer: return
+        data = b"".join(self._buffer)
+        self._buffer = []
+        self._buffer_len = 0
+        self._queue.put(data)
+
+    def close(self):
+        self._flush_buffer()
+        self._queue.put(None)
+        self._thread.join()
+        if self._error: raise self._error
+
+
 class PeekableHandle:
     """
     A wrapper around a BinaryIO stream that allows peeking at the beginning of the
@@ -234,63 +355,140 @@ class Xopen:
         except (AttributeError, ValueError, OSError):
             pass
 
-        # Non-Seekable (stdin, pipes) -> Use PeekableHandle
-        peekable = PeekableHandle(raw_stream)
-        start = peekable.peek(self._MIN_N_BYTES)
+        # Non-Seekable (stdin, pipes)
+        # Optimization: Use native peek if available (e.g. BufferedReader) to avoid Python-level buffering overhead
+        stream_to_use = raw_stream
+        if hasattr(raw_stream, 'peek'):
+            start = raw_stream.peek(self._MIN_N_BYTES)[:self._MIN_N_BYTES]
+        else:
+            stream_to_use = PeekableHandle(raw_stream)
+            start = stream_to_use.peek(self._MIN_N_BYTES)
 
         for magic, pkg in self._MAGIC.items():
             if start.startswith(magic):
                 self._close_on_exit = True
-                return self._get_opener(pkg)(peekable, mode='rb')
+                return self._get_opener(pkg)(stream_to_use, mode='rb')
 
         if should_close: self._close_on_exit = True
-        return peekable
+        return stream_to_use
 
 
-@dataclass(slots=True)  # (kw_only=True) https://medium.com/@aniscampos/python-dataclass-inheritance-finally-686eaf60fbb5
+@dataclass(slots=True, frozen=True, kw_only=True)
 class Config:
     """
     Config parent class that can conveniently set attributes from CLI args
     """
     @classmethod
-    def from_args(cls, args: Namespace):
-        return cls(**{f.name: getattr(args, f.name) for f in fields(cls) if hasattr(args, f.name)})
+    def from_obj(cls, obj: Any) -> 'Config':
+        return cls(**{f.name: val for f in fields(cls) if (val := getattr(obj, f.name, None)) is not None})
 
 
-class LiteralFile:
-    """Class for handling real files"""
+class LiteralFile(type(Path())):
+    """
+    A Path wrapper that evaluates to False if the file is missing or empty.
+    Inherits from the concrete Path type (PosixPath/WindowsPath) to ensure correct instantiation.
+    """
     _MIN_SIZE = 1
+    
+    def __bool__(self):
+        try: return self.is_file() and self.stat().st_size >= self._MIN_SIZE
+        except OSError: return False
 
-    def __init__(self, path: Path, size):
-        self._path = path
-        self._size = size
-        self._name_parts = path.name.split('.')
 
-    @classmethod
-    def from_path(cls, path: Union[str, Path], return_bool: bool = False):
-        if not isinstance(path, Path): path = Path(path)
-        if not path.exists():
-            if return_bool: return False
-            raise FileNotFoundError(f'File {path} does not exist')
-        if not path.is_file():
-            if return_bool: return False
-            raise FileNotFoundError(f'File {path} is not a file')
-        size = path.stat().st_size
-        if size < cls._MIN_SIZE:
-            if return_bool: return False
-            raise FileNotFoundError(f'File {path} is too small')
-        return cls(path, size)
+class Downloader:
+    """
+    High-performance downloader supporting parallel chunk retrieval.
+    """
+    _MAX_WORKERS = (RESOURCES.available_cpus or 1) * 4
+    _CHUNK_SIZE = 10 * 1024 * 1024
 
-    @property
-    def path(self): return self._path
-    @property
-    def size(self): return self._size
-    @property
-    def name(self): return self._path.name
-    @property
-    def stem(self): return self._name_parts[0]
-    @property
-    def suffix(self): return self._name_parts[1]
+    def __enter__(self):
+        self._pool = ThreadPoolExecutor(max_workers=self._MAX_WORKERS)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if hasattr(self, '_pool'):
+            self._pool.shutdown(wait=True)
+            del self._pool
+
+    def fetch(self, url: Union[str, Request], dest: Union[str, Path] = None, data=None, 
+              encode_data: bool = False) -> Union[Path, bytes]:
+        if data is not None and encode_data: data = urlencode(data).encode('utf-8')
+        if not isinstance(url, Request): 
+            url = Request(url, headers={'User-Agent': 'Mozilla/5.0'}, data=data)
+
+        # Fallback for POST or small files
+        if url.data is not None:
+            return self._single_thread_download(url, dest)
+
+        try:
+            size, accept_ranges, real_url = self._get_info(url)
+        except Exception:
+            return self._single_thread_download(url, dest)
+
+        if accept_ranges and size and size > self._CHUNK_SIZE:
+            return self._parallel_download(real_url, dest, size, url.headers)
+        
+        return self._single_thread_download(url, dest)
+    
+    @staticmethod
+    def _get_info(req: Request):
+        head_req = Request(req.full_url, headers=req.headers, method='HEAD')
+        with urlopen(head_req) as response:
+            size = int(response.headers.get('Content-Length', 0))
+            accept_ranges = response.headers.get('Accept-Ranges', 'none') == 'bytes'
+            return size, accept_ranges, response.geturl()
+    
+    @staticmethod
+    def _single_thread_download(url, dest):
+        with urlopen(url) as response:
+            if dest:
+                dest = Path(dest)
+                with open(dest, 'wb') as f: copyfileobj(response, f)
+                return dest
+            return response.read()
+    
+    
+    def _parallel_download(self, url_str, dest, size, headers):
+        chunks = []
+        for i in range(0, size, self._CHUNK_SIZE):
+            start = i
+            end = min(i + self._CHUNK_SIZE - 1, size - 1)
+            chunks.append((start, end))
+
+        if dest:
+            dest = Path(dest)
+            # Create sparse file
+            with open(dest, 'wb') as f: f.truncate(size)
+            
+            def _worker(start, end):
+                req = Request(url_str, headers=headers)
+                req.add_header('Range', f'bytes={start}-{end}')
+                with urlopen(req) as response:
+                    data = response.read()
+                with open(dest, 'r+b') as f:
+                    f.seek(start)
+                    f.write(data)
+        else:
+            buffer = bytearray(size)
+            def _worker(start, end):
+                req = Request(url_str, headers=headers)
+                req.add_header('Range', f'bytes={start}-{end}')
+                with urlopen(req) as response:
+                    data = response.read()
+                buffer[start:end+1] = data
+
+        # Use existing pool if available (Context Manager), else create one
+        pool = getattr(self, '_pool', None)
+        if pool:
+            futures = [pool.submit(_worker, s, e) for s, e in chunks]
+            for f in as_completed(futures): f.result()
+        else:
+            with ThreadPoolExecutor(max_workers=self._MAX_WORKERS) as pool:
+                futures = [pool.submit(_worker, s, e) for s, e in chunks]
+                for f in as_completed(futures): f.result()
+
+        return dest if dest else bytes(buffer)
 
 
 class GitRepo:
@@ -322,7 +520,7 @@ class GitRepo:
         Lazy-loaded property for repository metadata.
         Only downloads from API once per instance.
         """
-        if self._meta_cache is None: self._meta_cache = json_loads(download(self._api_url))
+        if self._meta_cache is None: self._meta_cache = json_loads(Downloader().fetch(self._api_url))
         return self._meta_cache
 
     def clone(self) -> Path:
@@ -333,18 +531,18 @@ class GitRepo:
         # If already cloned, just return the path
         if self.local_path and self.local_path.exists(): return self.local_path
         zip_url = f'{self._api_url}/zipball/{self.branch}'
-        # Stream download to avoid memory spikes if repo is large
-        # (Modified logic to handle streaming would go here, keeping your simple logic for now)
-        data = download(zip_url)
+        
         # Create the temp directory explicitly
         self._temp_dir_obj = TemporaryDirectory()
         base_temp_path = Path(self._temp_dir_obj.name)
-        with BytesIO(data) as zip_buffer:
-            with ZipFile(zip_buffer, 'r') as zfile:
-                zfile.extractall(base_temp_path)
-                # GitHub zips wrap everything in a single top-level folder
-                # We want self.local_path to point INSIDE that folder
-                root_folder = zfile.namelist()[0].split('/')[0]
+        zip_path = base_temp_path / "repo.zip"
+        with Downloader() as dl:
+            dl.fetch(zip_url, zip_path)
+        
+        with ZipFile(zip_path, 'r') as zfile:
+            zfile.extractall(base_temp_path)
+            root_folder = zfile.namelist()[0].split('/')[0]
+        zip_path.unlink()
         self.local_path = base_temp_path / root_folder
         return self.local_path
 
@@ -363,139 +561,139 @@ class GitRepo:
 
 class ProgressBar:
     """
-    A CLI progress bar that wraps an iterable and calls a function for each item.
-
-    This class acts as an iterator, yielding results from the callable while
-    printing a dynamic progress bar to stderr.
-
-    Args:
-        iterable (Iterable): An iterable of items to process.
-        callable (Callable): A function to call for each item from the iterable.
-        desc (str): A description to display before the progress bar.
-        bar_length (int): The character length of the progress bar.
-        bar_character (str): The character used to fill the progress bar.
-        silence (bool): Silence the bar
+    A high-performance, zero-overhead progress bar.
+    Supports automatic iteration, manual updates, and byte-counting.
     """
-    __slots__ = ('iterable', 'total', 'callable', 'desc', 'bar_length', 'bar_character', 'silence', '_iterator',
-                 'start_time', '_processed_count')
-    def __init__(self, iterable: Iterable, callable: Callable[[Any], Any], desc: str = "Processing items",
-                 bar_length: int = 40, bar_character: str = '█', silence: bool = False):
-        # Eagerly consume the iterable to get a total count for the progress bar.
-        assert len(bar_character) == 1, "Bar character must be a single character"
-        self.items = list(iterable)
-        self.total = len(self.items)
-        self.callable = callable
-        self.desc = desc
-        self.bar_length = bar_length
-        self.bar_character = bar_character
-        self.silence = silence
-        self._iterator: Iterable = None
-        self.start_time: float = None
-        self._processed_count: int = 0
+    __slots__ = ('_iterable', '_total', '_desc', '_unit', '_scale', '_leave',
+                 '_file', '_cols', '_min_interval', '_last_print_t', '_start_t',
+                 '_n', '_last_n', '_avg_rate', '_smoothing', '_bar_char', '_lock')
 
-    def __len__(self): return self.total
+    def __init__(self, iterable: Iterable = None, total: int = None, desc: str = None, 
+                 unit: str = 'it', scale: bool = False, leave: bool = True, 
+                 file: IO = stderr, min_interval: float = 0.1, bar_char: str = '█',
+                 cols: int = None):
+        self._iterable = iterable
+        self._total = total
+        if total is None and iterable is not None:
+            try: self._total = len(iterable)
+            except (TypeError, AttributeError): pass
+        
+        self._desc = desc + ": " if desc else ""
+        self._unit = unit
+        self._scale = scale
+        self._leave = leave
+        self._file = file
+        self._min_interval = min_interval
+        self._bar_char = bar_char
+        self._cols = cols
+        
+        self._n = 0
+        self._last_n = 0
+        self._start_t = time()
+        self._last_print_t = self._start_t
+        self._avg_rate = 0.0
+        self._smoothing = 0.3
+        self._lock = threading.Lock()
 
     def __iter__(self):
-        self._iterator = iter(self.items)
-        self.start_time = time()
-        self._processed_count = 0
-        if not self.silence: self._update_progress()  # Display the initial (0%) bar
+        if self._iterable is None: return
+        
+        # Localize for speed
+        n = self._n
+        min_int = self._min_interval
+        last_t = self._last_print_t
+        
+        for item in self._iterable:
+            yield item
+            n += 1
+            self._n = n
+            curr_t = time()
+            if curr_t - last_t >= min_int:
+                self._update(curr_t)
+                last_t = curr_t
+        
+        self._update(time(), final=True)
+
+    def __enter__(self):
+        self._start_t = time()
+        self._last_print_t = self._start_t
+        self._update(self._start_t)
         return self
 
-    def __next__(self):
-        # The for-loop protocol will handle the StopIteration from next()
-        item = next(self._iterator)
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._update(time(), final=True)
 
-        # The core of the wrapper: call the provided callable for one item.
-        result = self.callable(item)
-        self._processed_count += 1
-        if not self.silence:
-            self._update_progress()
-        return result
+    def update(self, n: int = 1):
+        with self._lock:
+            self._n += n
+            curr_t = time()
+            if curr_t - self._last_print_t >= self._min_interval:
+                self._update(curr_t)
 
-    def _format_time(self, seconds: float) -> str:
-        """Formats seconds into a HH:MM:SS string."""
-        if not isinstance(seconds, (int, float)) or seconds < 0:
-            return "00:00:00"
+    def _format_num(self, n):
+        if not self._scale: return str(int(n))
+        factor = 1024.0 if self._unit == 'B' else 1000.0
+        if n < factor: return f"{n:.0f}"
+        for u in ['k', 'M', 'G', 'T', 'P']:
+            n /= factor
+            if n < factor: return f"{n:.1f}{u}"
+        return f"{n:.1f}E"
+
+    def _format_time(self, seconds):
+        if not seconds or seconds < 0 or seconds == float('inf'): return "??:??"
+        seconds = int(seconds)
         m, s = divmod(seconds, 60)
         h, m = divmod(m, 60)
-        return f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+        if h: return f"{h}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
 
-    def _update_progress(self):
-        """Calculates and prints the progress bar to stderr."""
-        if self.total == 0: return
-        percent_complete = self._processed_count / self.total
-        filled_length = int(self.bar_length * percent_complete)
-        bar = self.bar_character * filled_length + '-' * (self.bar_length - filled_length)
-        elapsed_time = time() - self.start_time
-        # Calculate Estimated Time of Arrival (ETA)
-        if self._processed_count > 0:
-            avg_time_per_item = elapsed_time / self._processed_count
-            remaining_items = self.total - self._processed_count
-            eta = avg_time_per_item * remaining_items
-        else: eta = float('inf')
-        # Format time strings
-        elapsed_str = self._format_time(elapsed_time)
-        eta_str = self._format_time(eta) if eta != float('inf') else '??:??:??'
-        # Use carriage return '\r' to stay on the same line
-        stderr.write(
-            (f'\r{self.desc}: {int(percent_complete * 100):>3}%|{bar}| '
-             f'{self._processed_count}/{self.total} '
-             f'[{elapsed_str}<{eta_str}]')
-        )
-        # When the loop is finished, print a newline to move to the next line
-        if self._processed_count == self.total: stderr.write('\n')
-        stderr.flush()
+    def _update(self, curr_t, final=False):
+        dt = curr_t - self._last_print_t
+        dn = self._n - self._last_n
+        
+        # Rate calculation (EMA)
+        if dt > 0 and dn >= 0:
+            curr_rate = dn / dt
+            if self._avg_rate == 0: self._avg_rate = curr_rate
+            else: self._avg_rate = (self._avg_rate * (1 - self._smoothing)) + (curr_rate * self._smoothing)
+        
+        self._last_print_t = curr_t
+        self._last_n = self._n
 
+        # Dimensions
+        cols = self._cols or get_terminal_size().columns
+        
+        # Stats
+        elapsed = curr_t - self._start_t
+        rate_str = self._format_num(self._avg_rate) if self._avg_rate else "?"
+        
+        if self._total:
+            frac = self._n / self._total
+            pct = frac * 100
+            rem = self._total - self._n
+            eta = rem / self._avg_rate if self._avg_rate > 0 else float('inf')
+            
+            l_bar = f"{self._desc}{pct:3.0f}%|"
+            r_bar = f"| {self._format_num(self._n)}/{self._format_num(self._total)} [{self._format_time(elapsed)}<{self._format_time(eta)}, {rate_str}{self._unit}/s]"
+            
+            bar_len = max(1, cols - len(l_bar) - len(r_bar) - 1)
+            fill = int(frac * bar_len)
+            bar = self._bar_char * fill + '-' * (bar_len - fill)
+            
+            line = f"\r{l_bar}{bar}{r_bar}"
+        else:
+            # Indeterminate
+            l_bar = f"{self._desc}"
+            r_bar = f" {self._format_num(self._n)} [{self._format_time(elapsed)}, {rate_str}{self._unit}/s]"
+            line = f"\r{l_bar}{r_bar}"
 
-# Functions ------------------------------------------------------------------------------------------------------------
-
-
-
-def download(url: Union[str, Request], dest: Union[str, Path] = None, data = None, encode_data: bool = False) -> Union[Path, bytes, None]:
-    """
-    Downloads a file from a URL to a destination or returns the data as bytes.
-
-    :param url: URL to download from.
-    :param dest: Destination path to save the file to. If None, returns the data as bytes.
-    :return: Path to the downloaded file or the data as bytes.
-    :raises ValueError: If no data is written to the destination file.
-    """
-    if data is not None and encode_data: data = urlencode(data).encode('utf-8')
-    if not isinstance(url, Request): url = Request(url, headers={'User-Agent': 'Mozilla/5.0'}, data=data)
-    with urlopen(url) as response:
-        if dest:
-            dest = Path(dest)  # stream copy to disk
-            with open(dest, 'wb') as f_out: copyfileobj(response, f_out)
-            return dest
-        else: return response.read()
-
-
-
-# def otsu(similarity_matrix) -> float:
-#     """
-#     Calculates Otsu's threshold for a similarity matrix.
-#
-#     Args:
-#         similarity_matrix (np.ndarray): Array of similarity scores.
-#
-#     Returns:
-#         float: The calculated threshold.
-#     """
-#     if len(similarity_matrix) == 0: return 0.5
-#     hist, bin_edges = np.histogram(similarity_matrix, bins=256, range=(0.0, 1.0))
-#     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-#     weight = hist.cumsum()
-#     mean = (hist * bin_centers).cumsum()
-#     total_mean = mean[-1]
-#     total_weight = weight[-1]
-#     with np.errstate(divide='ignore', invalid='ignore'):
-#         mean_bg = mean / weight
-#         mean_fg = (total_mean - mean) / (total_weight - weight)
-#     mean_bg[np.isnan(mean_bg)] = 0.0
-#     mean_fg[np.isnan(mean_fg)] = 0.0
-#     w0 = weight
-#     w1 = total_weight - weight
-#     between_class_variance = w0 * w1 * (mean_bg - mean_fg) ** 2
-#     idx = np.argmax(between_class_variance)
-#     return bin_centers[idx]
+        # Pad to clear previous
+        if len(line) < cols: line += " " * (cols - len(line))
+        
+        self._file.write(line)
+        self._file.flush()
+        
+        if final:
+            if self._leave: self._file.write('\n')
+            else: self._file.write(f"\r{' ' * cols}\r")
+            self._file.flush()

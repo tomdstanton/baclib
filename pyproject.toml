@@ -4,11 +4,7 @@ authors = [{name="Tom Stanton", email="tomdstanton@gmail.com" }]
 description = "Lightweight Python Library for Bacterial Genomics"
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.11"
-dependencies = [
-    "numba==0.63.1",
-    "numpy",
-    "scipy",
-]
+dependencies = ["numpy", "scipy"]
 dynamic = ["version"]
 urls = {Homepage = "https://tomdstanton.github.io/baclib/", Repository = "https://github.com/tomdstanton/baclib", Documentation = "https://tomdstanton.github.io/baclib/"}
 keywords = ["bioinformatics", "microbiology", "genomics"]
@@ -28,6 +24,8 @@ classifiers = [
 [project.optional-dependencies]
 test = ["pytest"]
 docs = ["mkdocs-material", "mkdocs-api-autonav", "mkdocs-include-markdown-plugin"]
+perf = ["numba"]
+dev = ["pytest", "mkdocs-material", "mkdocs-api-autonav", "mkdocs-include-markdown-plugin", "numba", "ruff"]
 
 [build-system]
 build-backend = "hatchling.build"
@@ -49,3 +47,5 @@ testpaths = ["tests", "src"]
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

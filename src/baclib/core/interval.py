@@ -1,9 +1,10 @@
-from typing import Union, Any, Match, Iterable
-from enum import IntEnum
+from typing import Union, Any, Match, Iterable, ClassVar
+from enum import IntEnum, auto
 
 import numpy as np
 
 from baclib.utils.resources import RESOURCES, jit
+from baclib.utils import Batch
 
 if RESOURCES.has_module('numba'):
     from numba import prange
@@ -12,6 +13,16 @@ else:
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
+
+class Context(IntEnum):
+    UPSTREAM = auto()
+    DOWNSTREAM = auto()
+    INSIDE = auto()
+    OVERLAPPING = auto()
+    OVERLAPPING_START = auto()
+    OVERLAPPING_END = auto()
+
+
 class Strand(IntEnum):
     """
     Enumeration for genomic strands.
@@ -19,41 +30,36 @@ class Strand(IntEnum):
     FORWARD = 1
     REVERSE = -1
     UNSTRANDED = 0
+    _STR_CACHE: ClassVar[dict]
+    _BYTES_CACHE: ClassVar[dict]
+    _FROM_BYTES_CACHE: ClassVar[dict]
 
+    def __str__(self): return self._STR_CACHE[self]
     @property
-    def token(self) -> bytes:
-        """Returns the byte representation of the strand (+, -, .)."""
-        if self.value == 1: return b'+'
-        if self.value == -1: return b'-'
-        return b'.'
+    def bytes(self) -> bytes: return self._BYTES_CACHE[self]
 
     @classmethod
-    def from_symbol(cls, symbol: Any) -> 'Strand':
-        """
-        Creates a Strand from various symbols.
+    def from_bytes(cls, b: bytes) -> 'Strand':
+        return cls._FROM_BYTES_CACHE.get(b, cls.UNSTRANDED)
 
-        Args:
-            symbol: The symbol to convert (e.g., '+', '-', 1, -1, b'+').
-
-        Returns:
-            A Strand enum member.
-        """
-        if symbol is None: return cls.UNSTRANDED
-        if isinstance(symbol, cls): return symbol
-        # Fast path for integers (including numpy scalars)
-        if symbol in (1, -1, 0): return cls(int(symbol))
-
-        # Handle bytes specifically to avoid str(b'+') -> "b'+'"
-        if isinstance(symbol, bytes):
-            if symbol in (b'+', b'1'): return cls.FORWARD
-            if symbol in (b'-', b'-1'): return cls.REVERSE
-            return cls.UNSTRANDED
-
-        # String parsing for everything else
-        s = str(symbol)
-        if s in ('+', '1'): return cls.FORWARD
-        if s in ('-', '-1'): return cls.REVERSE
+    @classmethod
+    def from_symbol(cls, s: Any) -> 'Strand':
+        if s is None: return cls.UNSTRANDED
+        if isinstance(s, cls): return s
+        if isinstance(s, int):
+            try: return cls(s)
+            except ValueError: return cls.UNSTRANDED
+        if isinstance(s, bytes): return cls.from_bytes(s)
+        if isinstance(s, str): return cls.from_bytes(s.encode('ascii'))
         return cls.UNSTRANDED
+
+    @classmethod
+    def _init_caches(cls):
+        cls._STR_CACHE = {cls.FORWARD: '+', cls.REVERSE: '-', cls.UNSTRANDED: '.'}
+        cls._BYTES_CACHE = {cls.FORWARD: b'+', cls.REVERSE: b'-', cls.UNSTRANDED: b'.'}
+        cls._FROM_BYTES_CACHE = { b'+': cls.FORWARD, b'-': cls.REVERSE, b'.': cls.UNSTRANDED}
+
+Strand._init_caches()
 
 
 class Interval:
@@ -64,13 +70,6 @@ class Interval:
         start: The start position (0-based, inclusive).
         end: The end position (0-based, exclusive).
         strand: The strand (FORWARD, REVERSE, or UNSTRANDED).
-
-    Examples:
-        >>> i = Interval(10, 20, '+')
-        >>> len(i)
-        10
-        >>> i.strand
-        <Strand.FORWARD: 1>
     """
     # 1. Use private slots
     __slots__ = ('_start', '_end', '_strand')
@@ -95,7 +94,7 @@ class Interval:
     @property
     def strand(self) -> Strand: return self._strand
     def __hash__(self): return hash((self._start, self._end, self._strand))
-    def __repr__(self): return f"{self._start}:{self._end}({self._strand.token.decode('ascii')})"
+    def __repr__(self): return f"{self._start}:{self._end}({self._strand})"
     def __len__(self): return max(0, self._end - self._start)
     def __iter__(self): return iter((self._start, self._end, self._strand))
 
@@ -160,17 +159,46 @@ class Interval:
         """
         return Interval(self._start + x, self._end + (y if y is not None else x), self._strand)
 
-    def reverse_complement(self, parent_length: int) -> 'Interval':
+    def reverse_complement(self, length: int = None) -> 'Interval':
         """
         Returns the interval coordinates on the reverse complement strand.
 
         Args:
-            parent_length: The length of the parent sequence.
+            length: The length of the parent sequence.
 
         Returns:
             A new Interval on the opposite strand.
         """
-        return Interval(parent_length - self._end, parent_length - self._start, self._strand * -1)
+        if length is None: length = self._end  # - self._start
+        return Interval(length - self._end, length - self._start, self._strand * -1)
+
+    def relate(self, other: Union[slice, int, 'Interval']) -> Context:
+        """
+        Determines the spatial relationship of another interval relative to this one,
+        respecting the strand of this interval.
+
+        Args:
+            other: The other interval to compare.
+
+        Returns:
+            A Context enum member.
+        """
+        other = Interval.from_item(other)
+        
+        # Determine absolute orientation
+        if other.end <= self._start:
+            return Context.UPSTREAM if self._strand >= 0 else Context.DOWNSTREAM
+        if other.start >= self._end:
+            return Context.DOWNSTREAM if self._strand >= 0 else Context.UPSTREAM
+        
+        # Overlap cases
+        if other.start >= self._start and other.end <= self._end: return Context.INSIDE
+        
+        if other.start < self._start:
+            if other.end > self._end: return Context.OVERLAPPING
+            return Context.OVERLAPPING_START if self._strand >= 0 else Context.OVERLAPPING_END
+        
+        return Context.OVERLAPPING_END if self._strand >= 0 else Context.OVERLAPPING_START
 
     @classmethod
     def random(cls, rng: np.random.Generator = None, length: int = None, min_len: int = 1, max_len: int = 10_000,
@@ -238,35 +266,27 @@ class Interval:
         raise TypeError(f"Cannot coerce {type(item)} to Interval")
 
 
-class IntervalIndex:
+class IntervalBatch(Batch):
     """
-    High-performance index for genomic intervals, powered by NumPy.
+    High-performance batch of genomic intervals, powered by NumPy.
 
     This class provides efficient querying, intersection, and manipulation of
     large sets of genomic intervals.
-
-    Examples:
-        >>> i1 = Interval(0, 100, '+')
-        >>> i2 = Interval(50, 150, '-')
-        >>> idx = IntervalIndex.from_intervals(i1, i2)
-        >>> len(idx)
-        2
-        >>> idx.coverage()
-        150
     """
     __slots__ = ('_starts', '_ends', '_strands', '_original_indices', '_max_len')
     _DTYPE = np.int32  # int32 allows up to 2.14 Billion bp (fits all bacterial genomes)
 
     def __init__(self, starts: np.ndarray = None, ends: np.ndarray = None, strands: np.ndarray = None,
-                 original_indices: np.ndarray = None):
+                 original_indices: np.ndarray = None, sort: bool = True):
         """
-        Initializes an IntervalIndex.
+        Initializes an IntervalBatch.
 
         Args:
             starts: Array of start positions.
             ends: Array of end positions.
             strands: Array of strands.
             original_indices: Array of original indices (for tracking after sort).
+            sort: Whether to sort the intervals (default: True).
         """
         if starts is None:
             self._starts = np.empty(0, dtype=self._DTYPE)
@@ -281,64 +301,81 @@ class IntervalIndex:
             # Calculate max length for query optimization
             self._max_len = np.max(self._ends - self._starts) if len(self._starts) > 0 else 0
 
-        if original_indices is None and starts is not None:
-            self._original_indices = np.arange(len(self._starts), dtype=np.int32)
-        else:
-            self._original_indices = original_indices
-        self.sort()
+        self._original_indices = original_indices
+        if sort: self.sort()
 
     def sort(self):
         """Sorts the intervals by start position, then end position."""
         # Sort both data and the index tracker
-        if len(self._starts) > 0:
+        if len(self._starts) > 1:
+            # Optimization: Check if already sorted to avoid expensive lexsort
+            if _is_sorted_kernel(self._starts, self._ends): return
+
             # Lexsort: Primary key is last in the tuple (starts), Secondary is ends
             order = np.lexsort((self._ends, self._starts))
+
             self._starts = self._starts[order]
             self._ends = self._ends[order]
             self._strands = self._strands[order]
-            self._original_indices = self._original_indices[order]
+            
+            if self._original_indices is not None:
+                self._original_indices = self._original_indices[order]
+            else:
+                # Create the mapping only now that we know we are scrambling the order
+                self._original_indices = order.astype(np.int32)
 
     @classmethod
-    def from_intervals(cls, *intervals: Interval):
+    def from_intervals(cls, *intervals: Interval) -> 'IntervalBatch':
         """
-        Creates an IntervalIndex from a list of Interval objects.
+        Creates an IntervalBatch from a list of Interval objects.
 
         Args:
             *intervals: Variable number of Interval objects.
 
         Returns:
-            An IntervalIndex.
+            An IntervalBatch.
         """
         if not intervals: return cls()
         # Handle single iterable argument
         if len(intervals) == 1 and isinstance(intervals[0], Iterable) and not isinstance(intervals[0], Interval):
             intervals = intervals[0]
-        # Optimization: Avoid intermediate tuple list creation
-        n = len(intervals)
-        starts = np.empty(n, dtype=cls._DTYPE)
-        ends = np.empty(n, dtype=cls._DTYPE)
-        strands = np.empty(n, dtype=cls._DTYPE)
-        for i, iv in enumerate(intervals):
-            starts[i] = iv._start
-            ends[i] = iv._end
-            strands[i] = iv._strand
-        return cls(starts, ends, strands)
+            
+        # Vectorized construction using list comprehension is generally faster than explicit loops
+        data = [(x._start, x._end, x._strand) for x in intervals]
+        arr = np.array(data, dtype=cls._DTYPE)
+        if len(arr) == 0: return cls()
+        return cls(arr[:, 0], arr[:, 1], arr[:, 2])
 
     @classmethod
-    def from_features(cls, *features):
+    def from_features(cls, *features) -> 'IntervalBatch':
         """
-        Creates an IntervalIndex from a list of Feature objects.
+        Creates an IntervalBatch from a list of Feature objects.
 
         Args:
             *features: Variable number of Feature objects (must have .interval attribute).
 
         Returns:
-            An IntervalIndex.
+            An IntervalBatch.
         """
         if not features: return cls()
-        # Handle single iterable argument
-        if len(features) == 1 and not hasattr(features[0], 'interval') and isinstance(features[0], Iterable):
-            features = features[0]
+        
+        # Handle single argument (list, batch, iterator)
+        if len(features) == 1:
+            obj = features[0]
+            
+            # 1. Fast Path: Container with cached batch (e.g. FeatureList, Record)
+            if batch := getattr(obj, 'interval_batch', None): return batch
+            
+            # 2. Fast Path: Container with intervals property (e.g. FeatureBatch, AlignmentBatch)
+            if batch := getattr(obj, 'intervals', None):
+                if isinstance(batch, cls): return batch
+            
+            # 3. Unwrap Iterable if it's not a single Feature (Features are iterable)
+            if isinstance(obj, Iterable) and not hasattr(obj, 'interval'):
+                features = list(obj)
+
+        # Fallback: Iteration (Optimized for list of objects)
+        # We assume objects have .interval attribute (duck typing) for speed
         n = len(features)
         starts = np.empty(n, dtype=cls._DTYPE)
         ends = np.empty(n, dtype=cls._DTYPE)
@@ -351,27 +388,81 @@ class IntervalIndex:
         return cls(starts, ends, strands)
 
     @classmethod
-    def from_items(cls, *items: Union[slice, int, 'Interval', Match]):
+    def from_items(cls, *items: Union[slice, int, 'Interval', Match]) -> 'IntervalBatch':
         """
-        Creates an IntervalIndex from various items.
+        Creates an IntervalBatch from various items.
 
         Args:
             *items: Items to convert to intervals.
 
         Returns:
-            An IntervalIndex.
+            An IntervalBatch.
         """
         if not items: return cls()
         arr = np.array([tuple(Interval.from_item(i)) for i in items], dtype=cls._DTYPE)
         return cls(arr[:, 0], arr[:, 1], arr[:, 2])
 
+    @classmethod
+    def concat(cls, batches: Iterable['IntervalBatch']) -> 'IntervalBatch':
+        """
+        Concatenates multiple IntervalBatches.
+        """
+        batches = list(batches)
+        if not batches: return cls()
+        
+        starts = np.concatenate([b._starts for b in batches])
+        ends = np.concatenate([b._ends for b in batches])
+        strands = np.concatenate([b._strands for b in batches])
+        
+        return cls(starts, ends, strands, sort=True)
+
+    def empty(self) -> 'IntervalBatch':
+        return IntervalBatch()
+
+    def __repr__(self): return f"<IntervalBatch: {len(self)} intervals>"
+
     def __len__(self): return len(self._starts)
-    def __iter__(self): return iter(zip(self.starts, self.ends, self.strands))
-    def copy(self):
-        """Returns a deep copy of the IntervalIndex."""
-        return IntervalIndex(
+    
+    def __getitem__(self, item):
+        if isinstance(item, (int, np.integer)):
+            return Interval(self._starts[item], self._ends[item], self._strands[item])
+        elif isinstance(item, (slice, np.ndarray, list)):
+            # Slicing or boolean masking a sorted batch preserves sort order
+            is_slice = isinstance(item, slice)
+            is_mask = isinstance(item, np.ndarray) and item.dtype == bool
+            return IntervalBatch(self._starts[item], self._ends[item], self._strands[item], 
+                                 sort=not (is_slice or is_mask))
+        raise TypeError(f"Invalid index type: {type(item)}")
+
+    def filter(self, mask: Union[np.ndarray, Iterable, slice]) -> 'IntervalBatch':
+        """
+        Filters the batch using a boolean mask, integer indices, or slice.
+        Always returns an IntervalBatch.
+
+        Args:
+            mask: Boolean array, integer indices, slice, or iterable.
+
+        Returns:
+            A new IntervalBatch.
+        """
+        if isinstance(mask, (slice, int, np.integer)):
+            if isinstance(mask, (int, np.integer)):
+                mask = [mask]
+            return self[mask]
+
+        # Ensure mask is a numpy array (handles lists of bools correctly as masks)
+        return self[np.asarray(mask)]
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield Interval(self._starts[i], self._ends[i], self._strands[i])
+
+    def copy(self) -> 'IntervalBatch':
+        """Returns a deep copy of the IntervalBatch."""
+        return IntervalBatch(
             self._starts.copy(), self._ends.copy(), self._strands.copy(),
-            self._original_indices.copy() if self._original_indices is not None else None
+            self._original_indices.copy() if self._original_indices is not None else None,
+            sort=False
         )
 
     @property
@@ -380,46 +471,56 @@ class IntervalIndex:
     def ends(self): return self._ends
     @property
     def strands(self): return self._strands
+    
+    @property
+    def centers(self) -> np.ndarray:
+        """Returns the center points of the intervals."""
+        return (self._starts + self._ends) / 2
 
-    @staticmethod
-    def _generate_intervals(s, e, st): yield from (Interval(*i) for i in zip(s, e, st))
+    @property
+    def lengths(self) -> np.ndarray:
+        """Returns the lengths of the intervals."""
+        return self._ends - self._starts
 
     def query(self, start: int, end: int) -> np.ndarray:
         """Returns indices of intervals overlapping [start, end)."""
         if len(self) == 0: return np.empty(0, dtype=np.int32)
-        # Use Numba kernel for fast search
-        return _query_kernel(self.starts, self.ends, self._original_indices,
+        
+        if self._original_indices is not None:
+            return _query_kernel(self.starts, self.ends, self._original_indices, start, end, self._max_len)
+        
+        return _query_kernel_identity(self.starts, self.ends,
                              start, end, self._max_len)
 
-    def intersect(self, other: 'IntervalIndex', stranded: bool = False) -> 'IntervalIndex':
+    def intersect(self, other: 'IntervalBatch', stranded: bool = False) -> 'IntervalBatch':
         """
-        Computes the intersection with another IntervalIndex.
+        Computes the intersection with another IntervalBatch.
 
         Args:
-            other: The other IntervalIndex.
+            other: The other IntervalBatch.
             stranded: If True, only intersects intervals on the same strand.
 
         Returns:
-            A new IntervalIndex representing the intersection.
+            A new IntervalBatch representing the intersection.
         """
-        if len(self) == 0 or len(other) == 0: return IntervalIndex()
+        if len(self) == 0 or len(other) == 0: return IntervalBatch()
         # Call Numba Kernel
         out = _intersect_kernel(self.starts, self.ends, self.strands,
                                 other.starts, other.ends, other.strands, stranded)
         # Kernel returns tuple of arrays
-        if len(out[0]) == 0: return IntervalIndex()
-        return IntervalIndex(out[0], out[1], out[2])
+        if len(out[0]) == 0: return IntervalBatch()
+        return IntervalBatch(out[0], out[1], out[2], sort=False)
 
-    def subtract(self, other: 'IntervalIndex', stranded: bool = False) -> 'IntervalIndex':
+    def subtract(self, other: 'IntervalBatch', stranded: bool = False) -> 'IntervalBatch':
         """
         Subtracts regions in 'other' from this index.
 
         Args:
-            other: The IntervalIndex to subtract.
+            other: The IntervalBatch to subtract.
             stranded: If True, only subtracts intervals on the same strand.
 
         Returns:
-            A new IntervalIndex.
+            A new IntervalBatch.
         """
         if len(other) == 0: return self.copy()
         # Merge B to simplify subtraction
@@ -427,10 +528,10 @@ class IntervalIndex:
 
         out = _subtract_kernel(self.starts, self.ends, self.strands,
                                b_merged.starts, b_merged.ends, b_merged.strands, stranded)
-        if len(out[0]) == 0: return IntervalIndex()
-        return IntervalIndex(out[0], out[1], out[2])
+        if len(out[0]) == 0: return IntervalBatch()
+        return IntervalBatch(out[0], out[1], out[2], sort=False)
 
-    def promoters(self, upstream: int = 100, downstream: int = 0) -> 'IntervalIndex':
+    def promoters(self, upstream: int = 100, downstream: int = 0) -> 'IntervalBatch':
         """
         Extracts promoter regions relative to strand.
         Forward: [Start - Up, Start + Down]
@@ -441,11 +542,35 @@ class IntervalIndex:
             downstream: Bases downstream of the start.
 
         Returns:
-            A new IntervalIndex of promoters.
+            A new IntervalBatch of promoters.
         """
-        return self.flank(upstream, downstream, direction='upstream')
+        if len(self) == 0: return IntervalBatch()
 
-    def flank(self, left: int, right: int = None, direction: str = 'both') -> 'IntervalIndex':
+        s = self._starts
+        e = self._ends
+        st = self._strands
+
+        new_s = np.empty_like(s)
+        new_e = np.empty_like(e)
+
+        # Forward (+ or 0)
+        mask_fwd = st >= 0
+        if np.any(mask_fwd):
+            fwd_s = s[mask_fwd]
+            new_s[mask_fwd] = fwd_s - upstream
+            new_e[mask_fwd] = fwd_s + downstream
+
+        # Reverse (-)
+        mask_rev = ~mask_fwd
+        if np.any(mask_rev):
+            rev_e = e[mask_rev]
+            new_s[mask_rev] = rev_e - downstream
+            new_e[mask_rev] = rev_e + upstream
+
+        np.maximum(new_s, 0, out=new_s)
+        return IntervalBatch(new_s, new_e, st.copy(), sort=True)
+
+    def flank(self, left: int, right: int = None, direction: str = 'both') -> 'IntervalBatch':
         """
         Generates flanking regions.
 
@@ -455,17 +580,15 @@ class IntervalIndex:
             direction: 'both', 'upstream', or 'downstream'.
 
         Returns:
-            A new IntervalIndex.
+            A new IntervalBatch.
         """
         if right is None: right = left
-        if len(self) == 0: return IntervalIndex()
+        if len(self) == 0: return IntervalBatch()
 
         # Map string direction to int for Numba
         d_code = 0  # both
-        if direction == 'upstream':
-            d_code = 1
-        elif direction == 'downstream':
-            d_code = 2
+        if direction == 'upstream': d_code = 1
+        elif direction == 'downstream': d_code = 2
 
         # Deterministic output size calculation
         factor = 2 if d_code == 0 else 1
@@ -479,17 +602,17 @@ class IntervalIndex:
         # Filter empty intervals (length <= 0) resulting from boundary clipping
         mask = out_e > out_s
         if not np.all(mask):
-            return IntervalIndex(out_s[mask], out_e[mask], out_st[mask])
+            return IntervalBatch(out_s[mask], out_e[mask], out_st[mask], sort=True)
 
-        return IntervalIndex(out_s, out_e, out_st)
+        return IntervalBatch(out_s, out_e, out_st, sort=True)
 
-    def jaccard(self, other: 'IntervalIndex') -> float:
+    def jaccard(self, other: 'IntervalBatch') -> float:
         """
         Calculates Jaccard Index (Intersection / Union) in bp.
         Useful for comparing gene predictions or annotations.
 
         Args:
-            other: The other IntervalIndex.
+            other: The other IntervalBatch.
 
         Returns:
             The Jaccard index (0.0 to 1.0).
@@ -504,7 +627,35 @@ class IntervalIndex:
         if real_union == 0: return 0.0
         return intersect_len / real_union
 
-    def merge(self, tolerance: int = 0) -> 'IntervalIndex':
+    def relate(self, other: Union['Interval', 'IntervalBatch']) -> np.ndarray:
+        """
+        Vectorized determination of spatial relationships.
+
+        Args:
+            other: An Interval or IntervalBatch.
+
+        Returns:
+            np.ndarray: Array of Context values (int32).
+        """
+        if isinstance(other, Interval):
+            s2 = np.full(len(self), other.start, dtype=self._DTYPE)
+            e2 = np.full(len(self), other.end, dtype=self._DTYPE)
+        elif isinstance(other, IntervalBatch):
+            if len(self) != len(other):
+                raise ValueError(f"Batch length mismatch: {len(self)} vs {len(other)}")
+            s2 = other.starts
+            e2 = other.ends
+        else:
+            try:
+                iv = Interval.from_item(other)
+                s2 = np.full(len(self), iv.start, dtype=self._DTYPE)
+                e2 = np.full(len(self), iv.end, dtype=self._DTYPE)
+            except TypeError:
+                raise TypeError(f"Cannot relate IntervalBatch with {type(other)}")
+
+        return _relate_kernel(self.starts, self.ends, self.strands, s2, e2)
+
+    def merge(self, tolerance: int = 0) -> 'IntervalBatch':
         """
         Merges overlapping or adjacent intervals.
 
@@ -512,7 +663,7 @@ class IntervalIndex:
             tolerance: Maximum distance between intervals to merge.
 
         Returns:
-            A new merged IntervalIndex.
+            A new merged IntervalBatch.
         """
         if len(self) == 0: return self
         # Note: self.sort() must be guaranteed before calling this kernel
@@ -520,9 +671,9 @@ class IntervalIndex:
 
         out = _merge_kernel(self.starts, self.ends, self.strands, tolerance)
 
-        return IntervalIndex(out[0], out[1], out[2])
+        return IntervalBatch(out[0], out[1], out[2], sort=False)
 
-    def tile(self, width: int, step: int = None) -> 'IntervalIndex':
+    def tile(self, width: int, step: int = None) -> 'IntervalBatch':
         """
         Splits intervals into sliding windows of 'width'.
         Keeps windows strictly INSIDE the original intervals.
@@ -532,15 +683,15 @@ class IntervalIndex:
             step: Step size (defaults to width).
 
         Returns:
-            A new IntervalIndex of tiles.
+            A new IntervalBatch of tiles.
         """
         if step is None: step = width
-        if len(self) == 0: return IntervalIndex()
+        if len(self) == 0: return IntervalBatch()
 
         # Pass 1: Count tiles per interval (Parallel)
         counts = _tile_count_kernel(self.starts, self.ends, width, step)
         total_tiles = counts.sum()
-        if total_tiles == 0: return IntervalIndex()
+        if total_tiles == 0: return IntervalBatch()
 
         # Calculate Offsets
         offsets = np.zeros(len(counts), dtype=np.int32)
@@ -553,13 +704,13 @@ class IntervalIndex:
 
         _tile_fill_kernel(self.starts, self.ends, self.strands, width, step, offsets, out_s, out_e, out_st)
 
-        return IntervalIndex(out_s, out_e, out_st)
+        return IntervalBatch(out_s, out_e, out_st, sort=False)
 
     def coverage(self) -> int:
         """Returns total unique bases covered."""
         return _coverage_kernel(self.starts, self.ends)
 
-    def pad(self, upstream: int, downstream: int = None) -> 'IntervalIndex':
+    def pad(self, upstream: int, downstream: int = None) -> 'IntervalBatch':
         """
         Expands intervals by 'upstream' and 'downstream' bp.
         Respects strand (upstream is 5', downstream is 3').
@@ -569,7 +720,7 @@ class IntervalIndex:
             downstream: Bases to add downstream (defaults to upstream).
 
         Returns:
-            A new padded IntervalIndex.
+            A new padded IntervalBatch.
         """
         if downstream is None: downstream = upstream
         if len(self) == 0: return self
@@ -593,63 +744,68 @@ class IntervalIndex:
         # 4. Re-sort required?
         # Padding can cause re-ordering (e.g. a small interval expanding past a large one)
         # It's safest to create a new index which enforces sort/validation
-        return IntervalIndex(s, e, st)
+        return IntervalBatch(s, e, st, sort=True)
 
-    def complement(self, length: int) -> 'IntervalIndex':
+    def reverse_complement(self, length: Union[int, np.ndarray]) -> 'IntervalBatch':
+        """
+        Returns a new IntervalBatch on the reverse complement strand.
+
+        Args:
+            length: Length of the parent sequence(s). Can be a scalar or an array.
+
+        Returns:
+            A new IntervalBatch.
+        """
+        if len(self) == 0: return IntervalBatch()
+        return IntervalBatch(length - self._ends, length - self._starts, self._strands * -1, sort=True)
+
+    def complement(self, length: int = None) -> 'IntervalBatch':
         """
         Returns the 'gaps' in the index up to 'length'.
         Essential for finding intergenic regions.
 
         Args:
             length: The total length of the region (e.g., genome size).
+                    If None, defaults to the maximum end position in the batch.
 
         Returns:
-            A new IntervalIndex representing the gaps.
+            A new IntervalBatch representing the gaps.
         """
         if len(self) == 0:
-            return IntervalIndex.from_intervals(Interval(0, length))
+            if length is None: return IntervalBatch()
+            return IntervalBatch.from_intervals(Interval(0, length))
 
-        # Merge first to remove overlaps
+        # Merge first to remove overlaps and sort
         merged = self.merge()
-        s, e = merged.starts, merged.ends
+        
+        if length is None:
+            length = merged.ends[-1]
 
-        gap_starts = []
-        gap_ends = []
-
-        # Gap before first interval
-        if s[0] > 0:
-            gap_starts.append(0)
-            gap_ends.append(s[0])
-
-        # Gaps between intervals (Start[i+1] > End[i])
-        # Since merged, we know Start[i+1] >= End[i], strictly > means gap.
-        # Vectorized check:
-        gap_mask = s[1:] > e[:-1]
-        if np.any(gap_mask):
-            gap_starts.extend(e[:-1][gap_mask])
-            gap_ends.extend(s[1:][gap_mask])
-
-        # Gap after last interval
-        if e[-1] < length:
-            gap_starts.append(e[-1])
-            gap_ends.append(length)
-
-        if not gap_starts:
-            return IntervalIndex()
-
-        # Gaps are unstranded (0)
-        gap_starts = np.array(gap_starts, dtype=self._DTYPE)
-        gap_ends = np.array(gap_ends, dtype=self._DTYPE)
-        gap_strands = np.zeros(len(gap_starts), dtype=self._DTYPE)
-
-        return IntervalIndex(gap_starts, gap_ends, gap_strands)
+        out = _complement_kernel(merged.starts, merged.ends, length)
+        return IntervalBatch(out[0], out[1], out[2], sort=False)
 
     def span(self) -> int:
         """Returns the distance from the very start to the very end."""
         if len(self) == 0: return 0
-        # Since we are sorted, this is easy O(1)
-        # Note: If self.sort() isn't guaranteed, use .min()/.max()
-        return self._ends[-1] - self._starts[0]
+        # Starts are sorted, but ends are not necessarily sorted by the last element
+        return np.max(self._ends) - self._starts[0]
+
+    def cover_linear(self, length: int = None, min_coverage: float = 0.0, max_overlap: float = 0.1) -> np.ndarray:
+        """
+        Identifies a linear chain of intervals that covers the range [0, length] with minimal overlap.
+        Useful for scaffolding or filtering overlapping features.
+
+        Args:
+            length: The total length of the region (e.g. contig length). Required if min_coverage > 0.
+            min_coverage: Minimum fraction of 'length' covered by the chain.
+            max_overlap: Maximum allowed fractional overlap between adjacent intervals.
+
+        Returns:
+            Indices of the selected intervals (relative to the original unsorted input).
+        """
+        kept_sorted_indices = _cover_linear_kernel(self.starts, self.ends, length or 0, min_coverage, max_overlap)
+        if self._original_indices is not None: return self._original_indices[kept_sorted_indices]
+        return kept_sorted_indices
 
 
 # Kernels --------------------------------------------------------------------------------------------------------------
@@ -681,6 +837,27 @@ def _query_kernel(starts, ends, original_indices, q_start, q_end, max_len):
             
     # The backward scan produces indices in reverse sorted order. 
     # Usually we want sorted order.
+    return out[::-1]
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _query_kernel_identity(starts, ends, q_start, q_end, max_len):
+    """Optimized query kernel for when original_indices is identity (0..N)."""
+    limit = np.searchsorted(starts, q_end, side='left')
+    count = 0
+    min_start_check = q_start - max_len
+    
+    for i in range(limit - 1, -1, -1):
+        if starts[i] < min_start_check: break
+        if ends[i] > q_start: count += 1
+            
+    out = np.empty(count, dtype=np.int32)
+    idx = 0
+    for i in range(limit - 1, -1, -1):
+        if starts[i] < min_start_check: break
+        if ends[i] > q_start:
+            out[idx] = i  # Direct index
+            idx += 1
     return out[::-1]
 
 
@@ -973,3 +1150,137 @@ def _coverage_kernel(starts, ends):
             
     total_len += (curr_end - curr_start)
     return total_len
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _cover_linear_kernel(starts, ends, length, min_cov, max_overlap):
+    """
+    Filters a sorted list of intervals to form a consistent linear chain.
+    Returns indices into the sorted arrays.
+    """
+    n = len(starts)
+    if n == 0: return np.empty(0, dtype=np.int32)
+
+    # 1. Greedy Filter (Keep first, then append if non-overlapping)
+    kept = np.empty(n, dtype=np.int32)
+    k = 0
+
+    last_end = -1
+    total_cov = 0
+
+    for i in range(n):
+        s, e = starts[i], ends[i]
+        l = e - s
+
+        # Check overlap with previous
+        if k > 0:
+            overlap = last_end - s
+            if overlap > 0:
+                # If overlap is too large relative to the current alignment, skip
+                if (overlap / l) > max_overlap: continue
+                # Adjust coverage calculation for overlap
+                total_cov -= overlap
+
+        kept[k] = i
+        k += 1
+        last_end = e
+        total_cov += l
+
+    # 2. Check Total Coverage
+    if length > 0:
+        frac = total_cov / length
+        if frac < min_cov: return np.empty(0, dtype=np.int32)
+
+    return kept[:k]
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _relate_kernel(s1, e1, st1, s2, e2):
+    n = len(s1)
+    out = np.empty(n, dtype=np.int32)
+    
+    # Context Enum Values (auto starts at 1)
+    UPSTREAM = 1
+    DOWNSTREAM = 2
+    INSIDE = 3
+    OVERLAPPING = 4
+    OVERLAPPING_START = 5
+    OVERLAPPING_END = 6
+    
+    for i in range(n):
+        _s1 = s1[i]
+        _e1 = e1[i]
+        _st1 = st1[i]
+        _s2 = s2[i]
+        _e2 = e2[i]
+        
+        if _e2 <= _s1:
+            out[i] = UPSTREAM if _st1 >= 0 else DOWNSTREAM
+        elif _s2 >= _e1:
+            out[i] = DOWNSTREAM if _st1 >= 0 else UPSTREAM
+        else:
+            if _s2 >= _s1 and _e2 <= _e1:
+                out[i] = INSIDE
+            elif _s2 < _s1:
+                if _e2 > _e1: out[i] = OVERLAPPING
+                else: out[i] = OVERLAPPING_START if _st1 >= 0 else OVERLAPPING_END
+            else:
+                out[i] = OVERLAPPING_END if _st1 >= 0 else OVERLAPPING_START
+                
+    return out
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _complement_kernel(starts, ends, length):
+    n = len(starts)
+    
+    # Pass 1: Count
+    count = 0
+    curr = 0
+    for i in range(n):
+        s = starts[i]
+        e = ends[i]
+        if s > curr:
+            if curr >= length: break
+            count += 1
+        curr = max(curr, e)
+        if curr >= length: break
+        
+    if curr < length:
+        count += 1
+        
+    # Pass 2: Fill
+    out_s = np.empty(count, dtype=starts.dtype)
+    out_e = np.empty(count, dtype=ends.dtype)
+    out_st = np.zeros(count, dtype=starts.dtype)
+    
+    idx = 0
+    curr = 0
+    for i in range(n):
+        s = starts[i]
+        e = ends[i]
+        if s > curr:
+            if curr >= length: break
+            out_s[idx] = curr
+            out_e[idx] = min(s, length)
+            idx += 1
+        curr = max(curr, e)
+        if curr >= length: break
+        
+    if curr < length:
+        out_s[idx] = curr
+        out_e[idx] = length
+        idx += 1
+        
+    return out_s[:idx], out_e[:idx], out_st[:idx]
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _is_sorted_kernel(starts, ends):
+    """Checks if the arrays are already sorted by start, then end."""
+    n = len(starts)
+    for i in range(n - 1):
+        if starts[i] > starts[i+1]: return False
+        if starts[i] == starts[i+1]:
+            if ends[i] > ends[i+1]: return False
+    return True

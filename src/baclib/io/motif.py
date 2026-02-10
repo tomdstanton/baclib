@@ -2,8 +2,8 @@ from typing import Generator, BinaryIO
 
 import numpy as np
 
-from baclib.align.motif import Motif, Background
-from baclib.core.seq import Alphabet
+from baclib.engines.motif import Motif, Background, MotifBatch
+from baclib.core.alphabet import Alphabet
 from baclib.io import BaseReader, SeqFile
 
 
@@ -13,6 +13,9 @@ class MotifReader(BaseReader):
     def __init__(self, handle: BinaryIO, background: Background = None, **kwargs):
         super().__init__(handle, **kwargs)
         self.background: Background = background or self._DEFAULT_BACKGROUND
+
+    def _make_batch(self, items: list) -> MotifBatch:
+        return MotifBatch(items)
 
 
 @SeqFile.register('meme')

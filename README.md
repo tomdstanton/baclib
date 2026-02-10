@@ -82,7 +82,7 @@ with SeqFile("genome.fasta.gz") as reader:
 with SeqFile("annotation.gbk") as reader:
     for record in reader:
         for feature in record.features:
-            if feature.kind == b'CDS':
+            if feature.key == b'CDS':
                 # Access qualifiers using bytes keys
                 gene = feature.get(b'gene')
                 print(f"Gene: {gene}")
@@ -96,7 +96,7 @@ from baclib.core.seq import Alphabet, GeneticCode
 dna = Alphabet.dna()
 
 # Create a sequence from string
-seq = dna.seq("ATGCGTAGCTAG")
+seq = dna.seq_from("ATGCGTAGCTAG")
 
 # Or generate a random sequence
 seq = dna.random_seq(length=100)
@@ -116,7 +116,7 @@ print(protein)
 Perform local, global, or glocal alignment using the built-in high-performance aligner.
 
 ```python
-from baclib.align.pairwise import Aligner
+from baclib.engines.pairwise import Aligner
 from baclib.core.seq import Alphabet, SeqBatch
 
 dna = Alphabet.dna()

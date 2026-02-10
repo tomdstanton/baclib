@@ -6,9 +6,9 @@ import numpy as np
 
 from baclib.utils.resources import RESOURCES
 from baclib.io import SeqFile
-from baclib.core.seq import Alphabet
-from baclib.containers.record import Record, RecordBatch
-from baclib.containers.graph import Graph, Edge
+from baclib.core.alphabet import Alphabet
+from baclib.containers.record import Record, RecordBatch, FeatureKey
+from baclib.containers.graph import Graph, Edge, EdgeBatch
 
 
 # Exceptions and Warnings ----------------------------------------------------------------------------------------------
@@ -25,16 +25,9 @@ class Genome:
         id (bytes): The genome identifier.
         contigs (Dict[bytes, Record]): A dictionary mapping contig IDs to Record objects.
         edges (list[Edge]): A list of edges representing the assembly graph.
-
-    Examples:
-        >>> g = Genome(id_=b'Ecoli_K12')
-        >>> r = Record(Alphabet.dna().seq("ACGT"), id_=b'contig1')
-        >>> g.contigs[b'contig1'] = r
-        >>> len(g)
-        4
     """
     __slots__ = ('id', 'contigs', 'edges', '_cached_graph')
-    _ALPHABET = Alphabet.dna()
+    _ALPHABET = Alphabet.DNA
     def __init__(self, id_: bytes = b'unknown', contigs: Dict[bytes, Record] = None, edges: list[Edge] = None):
         """Represents a single bacterial genome to be loaded into memory from a file"""
         self.id: bytes = id_
@@ -46,6 +39,8 @@ class Genome:
     def __iter__(self): return iter(self.contigs.values())
     def __str__(self): return self.id
     def __getitem__(self, item: bytes) -> 'Record': return self.contigs[item]
+    def __contains__(self, item: bytes): return item in self.contigs
+    def __repr__(self): return f"<Genome: {self.id.decode()}, {len(self.contigs)} contigs, {len(self.edges)} edges>"
 
     @classmethod
     def from_file(cls, file: Union[str, Path, BinaryIO, SeqFile], annotations: Union[str, Path, BinaryIO, SeqFile] = None):
@@ -71,20 +66,29 @@ class Genome:
         elif isinstance(file, BinaryIO):
             self.id = file.name.encode()
             file = SeqFile(file)
+        elif isinstance(file, SeqFile):
+            # Try to infer ID from the underlying file handle/opener
+            if hasattr(file, '_opener') and hasattr(file._opener, 'name') and file._opener.name:
+                self.id = Path(file._opener.name).stem.encode()
 
-        for record in file:
-            if isinstance(record, Record):
-                self.contigs[record.id] = record
-                # Auto-circularize if topology=circular
-                is_circular = False
-                for k, v in record.qualifiers:
-                    if k == b'topology' and v == b'circular':
-                        is_circular = True
-                        break
-                if is_circular and file.format != 'gfa':
-                    self.edges.append(Edge(record.id, record.id, {b'type': b'circular'}))
+        # Use batch processing for speed
+        for batch in file.batches():
+            if isinstance(batch, RecordBatch):
+                for i in range(len(batch)):
+                    record = batch[i]
+                    self.contigs[record.id] = record
+                    
+                    # Auto-circularize if topology=circular
+                    # Check qualifiers efficiently
+                    is_circular = False
+                    for k, v in record.qualifiers:
+                        if k == b'topology' and v == b'circular':
+                            is_circular = True
+                            break
+                    if is_circular and file.format != 'gfa':
+                        self.edges.append(Edge(record.id, record.id, attributes={b'type': b'circular'}))
 
-            elif isinstance(record, Edge): self.edges.append(record)
+            elif isinstance(batch, EdgeBatch): self.edges.extend(batch)
 
         # 2. Load Annotations
         if annotations:
@@ -105,6 +109,24 @@ class Genome:
                 if target_id and target_id in self.contigs: self.contigs[target_id].features.append(feature)
 
         return self
+
+    def write(self, file: Union[str, Path], format: str = 'fasta', **kwargs):
+        """
+        Writes the genome to a file.
+        """
+        from baclib.io.seq import FastaWriter, GfaWriter
+
+        if format == 'fasta':
+            with FastaWriter(file, **kwargs) as w:
+                w.write(self.to_batch())
+        elif format == 'gfa':
+            with GfaWriter(file, **kwargs) as w:
+                w.write(self.to_batch())
+                if self.edges:
+                    # GfaWriter handles lists of Edges
+                    w.write(self.edges)
+        else:
+            raise ValueError(f"Unsupported write format: {format}")
 
     @classmethod
     def random(cls, rng: np.random.Generator = None, n_contigs: int = None, min_contigs: int = 1,
@@ -176,3 +198,15 @@ class Genome:
     def to_batch(self) -> RecordBatch:
         """Converts the Genome into a read-only, optimized BatchRecord."""
         return RecordBatch(self.contigs.values())
+
+    def extract_features(self, key: FeatureKey = FeatureKey.CDS) -> 'SeqBatch':
+        """
+        Extracts sequences for all features of a specific kind across the genome.
+        Returns a single concatenated SeqBatch.
+        """
+        batches = []
+        for record in self.contigs.values():
+            # We can't easily use RecordBatch.extract_features here because records are separate.
+            # But we can collect features and batch them.
+            batches.extend(f.extract(record.seq) for f in record.features if f.key == key)
+        return self._ALPHABET.batch_from(batches)
