@@ -191,7 +191,7 @@ motifs = client.search_motifs("LexA")
 for m in motifs:
     print(f"Found motif: {m.name} ({m.accession})")
 
-# Get a matrix details
+# Get motif details
 motif = client.get_motif(motifs[0].accession)
 print(motif.name)
 ```
