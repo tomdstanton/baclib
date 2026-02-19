@@ -8,7 +8,7 @@ import tempfile
 import json
 from enum import Enum
 
-from baclib.apis import ApiClient
+from baclib.apis import ApiClient, Token
 from baclib.io import SeqFile, Record
 
 
@@ -40,6 +40,19 @@ class VirusTag(str, Enum):
     ANNOTATION = "ANNOTATION"
 
 
+class NcbiToken(Token):
+    """Base class for NCBI tokens."""
+    pass
+
+class GenomeAccession(NcbiToken):
+    """NCBI Genome Accession (e.g. GCF_000005845.2)."""
+    pass
+
+class GeneId(NcbiToken):
+    """NCBI Gene ID."""
+    pass
+
+
 class DatasetsClient(ApiClient):
     """
     Client for NCBI Datasets v2 API.
@@ -51,7 +64,7 @@ class DatasetsClient(ApiClient):
             requests_per_second=10 if api_key else 3
         )
 
-    def download_genome(self, accessions: Union[str, List[str]], 
+    def download_genome(self, accessions: Union[str, GenomeAccession, List[Union[str, GenomeAccession]]], 
                         output_file: Union[str, Path, None] = None,
                         include: List[Union[str, GenomeTag]] = None,
                         chromosomes: List[str] = None,
@@ -95,7 +108,7 @@ class DatasetsClient(ApiClient):
         
         return DatasetPackage(output_file)
 
-    def get_genome_report(self, accessions: Union[str, List[str]]) -> Any:
+    def get_genome_report(self, accessions: Union[str, GenomeAccession, List[Union[str, GenomeAccession]]]) -> Any:
         """
         Get genome metadata report.
         """
@@ -108,7 +121,7 @@ class DatasetsClient(ApiClient):
         return self.post(endpoint, json=payload)
 
 
-    def download_gene(self, gene_ids: Union[int, str, List[Union[int, str]]],
+    def download_gene(self, gene_ids: Union[int, str, GeneId, List[Union[int, str, GeneId]]],
                       output_file: Union[str, Path, None] = None,
                       include: List[Union[str, GeneTag]] = None,
                       filename: str = None) -> 'DatasetPackage':
@@ -139,7 +152,7 @@ class DatasetsClient(ApiClient):
         self.download(endpoint, output_file, method='POST', json=payload)
         return DatasetPackage(output_file)
 
-    def download_virus(self, accessions: Union[str, List[str]] = None,
+    def download_virus(self, accessions: Union[str, GenomeAccession, List[Union[str, GenomeAccession]]] = None,
                        taxon: str = None,
                        output_file: Union[str, Path, None] = None,
                        include: List[Union[str, VirusTag]] = None) -> 'DatasetPackage':

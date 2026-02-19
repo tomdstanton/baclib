@@ -5,13 +5,47 @@ import urllib.parse
 from enum import Enum
 import numpy as np
 
-from baclib.apis import ApiClient
+from baclib.apis import ApiClient, Token
 from baclib.containers.motif import Motif, Background
 from baclib.containers.graph import Graph, Edge
 from baclib.core.alphabet import Alphabet
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
+class ProdoricToken(Token):
+    """Base class for PRODORIC tokens."""
+    pass
+
+class MatrixAccession(ProdoricToken):
+    """PRODORIC Matrix Accession (e.g. MX000001)."""
+    
+    @property
+    def id(self) -> int:
+        """Returns the numeric ID part of the accession."""
+        if self.startswith("MX"):
+            return int(self[2:])
+        if self.isdigit():
+             return int(self)
+        raise ValueError(f"Invalid matrix accession format: {self}")
+
+    @classmethod
+    def from_id(cls, mx_id: Union[int, str]) -> 'MatrixAccession':
+        """Create a MatrixAccession from an integer ID or string."""
+        if isinstance(mx_id, int):
+             return cls(f"MX{mx_id:06d}")
+        # If string is just digits, prepend MX
+        s = str(mx_id)
+        if s.isdigit():
+             return cls(f"MX{s.zfill(6)}") 
+        if not s.startswith("MX"):
+             return cls(f"MX{s}")
+        return cls(s)
+
+class OrganismAccession(ProdoricToken):
+    """PRODORIC Organism Accession."""
+    pass
+
+
 class ProdoricClient(ApiClient):
     """
     Client for the PRODORIC API.
@@ -37,13 +71,41 @@ class ProdoricClient(ApiClient):
         except Exception:
             return []
 
-    def get_motif(self, accession: str) -> Optional[Motif]:
+    def get_organisms(self) -> List[Dict[str, Any]]:
+        """
+        Retrieve a list of all available organisms.
+        Returns a list of dicts with keys: name, short, accession.
+        Accessions are converted to OrganismAccession tokens.
+        """
+        try:
+            data = self.get("organism")
+            # Convert accessions to tokens
+            if isinstance(data, list):
+                for item in data:
+                    if "accession" in item:
+                        item["accession"] = OrganismAccession(item["accession"])
+            return data
+        except Exception:
+            # Return empty list on failure or log?
+            return []
+
+    def get_motif(self, accession: Union[str, MatrixAccession]) -> Optional[Motif]:
         """
         Retrieve a matrix by accession (e.g. MX000001) and return a Motif object.
         """
-        clean_id = accession
-        if accession.startswith("MX"):
-            clean_id = accession[2:]
+        if isinstance(accession, MatrixAccession):
+            # Use the ID property from our token class if available, 
+            # but since endpoint expects MX + id, we can just use string representation 
+            # if we trust the token (which is MX+ID).
+            # But the endpoint code in `get_motif` manually strips 'MX'.
+            # Let's rely on string representation first.
+            accession_str = str(accession)
+        else:
+            accession_str = accession
+
+        clean_id = accession_str
+        if accession_str.startswith("MX"):
+            clean_id = accession_str[2:]
         
         # Validation: check if clean_id is integer-like
         if not clean_id.isdigit():
@@ -72,7 +134,7 @@ class ProdoricClient(ApiClient):
         endpoint = f"prodonet/MX{clean_id}"
         return self._fetch_graph(endpoint)
 
-    def get_network(self, organism_acc: str) -> Optional[Graph]:
+    def get_network(self, organism_acc: Union[str, OrganismAccession]) -> Optional[Graph]:
         """
         Retrieve the regulatory network for an organism.
         """
