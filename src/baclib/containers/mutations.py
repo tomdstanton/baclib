@@ -1,6 +1,4 @@
-"""
-Module for managing mutations.
-"""
+"""Containers for representing and batch-processing genomic mutations (SNPs, indels)."""
 from typing import Iterable, Any, Optional
 from enum import IntEnum, auto
 
@@ -8,6 +6,7 @@ import numpy as np
 
 from baclib.containers.feature import Feature, FeatureKey
 from baclib.core.interval import IntervalBatch, Interval
+from baclib.core.alphabet import Alphabet
 from baclib.containers.seq import Seq, SeqBatch
 from baclib.containers import Batch
 from baclib.lib.protocols import HasIntervals
@@ -17,7 +16,11 @@ from baclib.containers.qualifier import QualifierList, QualifierBatch, Qualifier
 # Classes --------------------------------------------------------------------------------------------------------------
 class MutationEffect(IntEnum):
     """
-    Enum for efficient integer storage of mutation effects.
+    Predicted functional impact of a mutation on the gene product.
+
+    Examples:
+        >>> MutationEffect.MISSENSE
+        <MutationEffect.MISSENSE: 3>
     """
     UNKNOWN = auto()
     SYNONYMOUS = auto()
@@ -30,13 +33,23 @@ class MutationEffect(IntEnum):
 
 class Mutation(Feature):
     """
-    Represents a discrete change: SNP, Insertion, or Deletion.
+    A discrete sequence change: SNP, insertion, or deletion.
 
-    Attributes:
-        interval (Interval): The location on the REFERENCE sequence.
-        ref_seq (Seq): The reference sequence content.
-        alt_seq (Seq): The alternative sequence content.
-        effect (MutationEffect): The predicted functional impact.
+    Extends ``Feature`` with reference and alternative allele sequences,
+    a predicted functional effect, and an optional amino acid change string.
+
+    Args:
+        interval: Location on the reference sequence.
+        ref_seq: The reference allele.
+        alt_seq: The alternative allele.
+        effect: Predicted functional impact (default ``UNKNOWN``).
+        aa_change: Optional amino acid change annotation (e.g. ``b'S123A'``).
+        qualifiers: Optional ``(key, value)`` qualifier tuples.
+
+    Examples:
+        >>> mut = Mutation(Interval(100, 101, 1), ref, alt)
+        >>> mut.is_snp
+        True
     """
     __slots__ = ('ref_seq', 'alt_seq', 'effect', 'aa_change')
 
@@ -50,26 +63,62 @@ class Mutation(Feature):
         self.effect = effect
         self.aa_change = aa_change
 
-    # def __repr__(self):
-    #     # VCF-style notation: Pos Ref>Alt (1-based for display)
-    #     return f"{self.interval.start + 1}:{self.ref_seq}>{self.alt_seq}"
+    @property
+    def is_snp(self) -> bool:
+        """Returns ``True`` if the mutation is a single-nucleotide polymorphism.
+
+        Returns:
+            ``True`` when both ref and alt are exactly 1 base long.
+        """
+        return len(self.ref_seq) == 1 and len(self.alt_seq) == 1
 
     @property
-    def is_snp(self): return len(self.ref_seq) == 1 and len(self.alt_seq) == 1
+    def is_indel(self) -> bool:
+        """Returns ``True`` if the mutation is an insertion or deletion.
+
+        Returns:
+            ``True`` when ref and alt differ in length.
+        """
+        return len(self.ref_seq) != len(self.alt_seq)
+
     @property
-    def is_indel(self): return len(self.ref_seq) != len(self.alt_seq)
-    @property
-    def batch(self) -> type['Batch']: return MutationBatch
+    def batch(self) -> type['Batch']:
+        """Returns the batch type for this class.
+
+        Returns:
+            The ``MutationBatch`` class.
+        """
+        return MutationBatch
+
     @property
     def diff(self) -> int:
-        """Returns the net change in sequence length (Alt - Ref)."""
+        """Returns the net change in sequence length (alt − ref).
+
+        Returns:
+            Positive for insertions, negative for deletions, zero for SNPs.
+        """
         return len(self.alt_seq) - len(self.ref_seq)
 
 
 class MutationBatch(Batch, HasIntervals):
     """
-    Efficient storage for a collection of mutations.
-    Can be used to reconstruct sequences via SparseSeq.
+    Columnar batch of mutations for efficient bulk operations.
+
+    Stores intervals, ref/alt sequences, effects, and qualifiers in
+    parallel numpy arrays for vectorized filtering and application.
+
+    Args:
+        intervals: An ``IntervalBatch`` of mutation positions.
+        ref_seqs: A ``SeqBatch`` of reference alleles.
+        alt_seqs: A ``SeqBatch`` of alternative alleles.
+        effects: Optional ``uint8`` array of ``MutationEffect`` values.
+        aa_changes: Optional object array of amino acid change annotations.
+        qualifiers: Optional ``QualifierBatch`` of per-mutation qualifiers.
+
+    Examples:
+        >>> batch = MutationBatch.build([mut1, mut2])
+        >>> len(batch)
+        2
     """
     __slots__ = ('_intervals', '_ref_seqs', '_alt_seqs', '_effects', '_aa_changes', '_qualifiers')
 
@@ -84,18 +133,42 @@ class MutationBatch(Batch, HasIntervals):
         self._qualifiers = qualifiers if qualifiers is not None else QualifierBatch.zeros(n)
 
     @property
-    def component(self): return Mutation
+    def component(self):
+        """Returns the scalar type represented by this batch.
+
+        Returns:
+            The ``Mutation`` class.
+        """
+        return Mutation
 
     @classmethod
     def empty(cls) -> 'MutationBatch':
+        """Creates an empty MutationBatch with zero mutations.
+
+        Returns:
+            An empty ``MutationBatch``.
+        """
         return cls(
             IntervalBatch.empty(),
-            SeqBatch.empty(),
-            SeqBatch.empty()
+            Alphabet.DNA.empty_batch(),
+            Alphabet.DNA.empty_batch()
         )
 
     @classmethod
-    def build(cls, components: Iterable[object]) -> 'MutationBatch':
+    def build(cls, components: Iterable[Mutation]) -> 'MutationBatch':
+        """Constructs a MutationBatch from an iterable of Mutation objects.
+
+        Args:
+            components: An iterable of ``Mutation`` objects.
+
+        Returns:
+            A new ``MutationBatch``.
+
+        Examples:
+            >>> batch = MutationBatch.build([mut1, mut2])
+            >>> len(batch)
+            2
+        """
         mutations = list(components)
         if not mutations: return cls.empty()
         
@@ -119,12 +192,23 @@ class MutationBatch(Batch, HasIntervals):
         effects = np.array([m.effect for m in mutations], dtype=np.uint8)
         aa_changes = np.array([m.aa_change for m in mutations], dtype=object)
         
-        qualifiers = QualifierBatch.from_qualifiers((m.qualifiers for m in mutations))
+        qualifiers = QualifierBatch.build(m.qualifiers for m in mutations)
 
         return cls(intervals, ref_seqs, alt_seqs, effects, aa_changes, qualifiers)
 
     @classmethod
     def concat(cls, batches: Iterable['MutationBatch']) -> 'MutationBatch':
+        """Concatenates multiple MutationBatch objects into one.
+
+        Args:
+            batches: An iterable of ``MutationBatch`` objects.
+
+        Returns:
+            A single concatenated ``MutationBatch``.
+
+        Examples:
+            >>> combined = MutationBatch.concat([batch_a, batch_b])
+        """
         batches = list(batches)
         if not batches: return cls.empty()
         
@@ -145,11 +229,21 @@ class MutationBatch(Batch, HasIntervals):
 
     @property
     def nbytes(self) -> int:
+        """Returns the total memory usage in bytes.
+
+        Returns:
+            Total bytes consumed by all internal arrays.
+        """
         return (self._intervals.nbytes + self._ref_seqs.nbytes + 
                 self._alt_seqs.nbytes + self._effects.nbytes + 
                 self._aa_changes.nbytes + self._qualifiers.nbytes)
 
     def copy(self) -> 'MutationBatch':
+        """Returns a deep copy of this batch.
+
+        Returns:
+            A new ``MutationBatch`` with copied arrays.
+        """
         return MutationBatch(
             self._intervals.copy(),
             self._ref_seqs.copy(),
@@ -160,15 +254,6 @@ class MutationBatch(Batch, HasIntervals):
             self._qualifiers.copy()
         )
 
-    @classmethod
-    def empty(cls) -> 'MutationBatch':
-        return MutationBatch(
-            IntervalBatch.empty(),
-            SeqBatch.empty(),
-            SeqBatch.empty(),
-            qualifiers=QualifierBatch.empty()
-        )
-
     def __repr__(self):
         return f"<MutationBatch: {len(self)} mutations>"
 
@@ -177,6 +262,11 @@ class MutationBatch(Batch, HasIntervals):
 
     @property
     def intervals(self) -> IntervalBatch:
+        """Returns the interval array for all mutations.
+
+        Returns:
+            An ``IntervalBatch`` of mutation positions.
+        """
         return self._intervals
 
     def __iter__(self):
@@ -206,20 +296,38 @@ class MutationBatch(Batch, HasIntervals):
 
     @classmethod
     def zeros(cls, n: int) -> 'MutationBatch':
+        """Creates a MutationBatch with *n* zero-length placeholder mutations.
+
+        Args:
+            n: Number of placeholder slots.
+
+        Returns:
+            A ``MutationBatch`` with empty sequences and default effects.
+
+        Examples:
+            >>> batch = MutationBatch.zeros(5)
+            >>> len(batch)
+            5
+        """
         return cls(
             IntervalBatch.zeros(n),
-            SeqBatch.zeros(n),
-            SeqBatch.zeros(n),
+            Alphabet.DNA.zeros_batch(n),
+            Alphabet.DNA.zeros_batch(n),
             effects=None,
             aa_changes=None,
             qualifiers=QualifierBatch.zeros(n)
         )
 
     def apply_to(self, reference: Seq) -> Any:
+        """Applies the mutations to a reference sequence.
+
+        Args:
+            reference: The reference ``Seq`` to mutate.
+
+        Returns:
+            A ``SparseSeq`` representing the mutated sequence.
+
+        Raises:
+            NotImplementedError: SparseSeq is not yet implemented.
         """
-        Applies the mutations to a reference sequence, returning a SparseSeq.
-        """
-        # We can iterate self because __iter__ yields Mutation objects
-        # which SparseSeq accepts.
-        # return SparseSeq(reference, self)
         raise NotImplementedError("SparseSeq is not yet implemented.")

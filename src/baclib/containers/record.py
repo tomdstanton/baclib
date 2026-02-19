@@ -1,3 +1,4 @@
+"""Container for biological sequence records with metadata, features, and batch support."""
 from binascii import hexlify
 from operator import attrgetter
 from typing import Generator, Union, Iterator, Iterable
@@ -23,7 +24,24 @@ else:
 # Classes --------------------------------------------------------------------------------------------------------------
 class Record(HasIntervals, Batchable):
     """
-    Represents a sequence record, such as a contig or chromosome.
+    A biological sequence record with ID, description, qualifiers, and features.
+
+    Typically represents a contig, chromosome, or plasmid — a named sequence
+    annotated with genomic features (CDS, tRNA, etc.) and key-value qualifiers.
+
+    Args:
+        seq: The underlying ``Seq`` object.
+        id_: Record identifier as bytes (auto-generated UUID if omitted).
+        desc: Optional description line.
+        qualifiers: Optional iterable of ``(key, value)`` qualifier tuples.
+        features: Optional list of ``Feature`` objects.
+
+    Examples:
+        >>> rec = Record(Alphabet.DNA.seq(b'ATGCGA'), id_=b'contig_1')
+        >>> len(rec)
+        6
+        >>> rec.id
+        b'contig_1'
     """
     __slots__ = ('_seq', 'id', 'description', '_qualifiers', '_features')
     def __init__(self, seq: Seq, id_: bytes = None, desc: bytes = None, qualifiers: Iterable[tuple] = None,
@@ -34,64 +52,102 @@ class Record(HasIntervals, Batchable):
         self.qualifiers = qualifiers
         # FeatureList is a list subclass that likely handles parent linkage
         self._features = FeatureList(features)
-    def __str__(self): return self.id.decode(Alphabet.ENCODING)
+    def __str__(self): return self.id.decode(errors='ignore')
     def __repr__(self) -> str: return f'{self.id} {self._seq.__repr__()}'
     def __len__(self) -> int: return len(self._seq)
     def __hash__(self) -> int: return hash(self.id)
     def __iter__(self) -> Iterator['Feature']: return iter(self.features)
-    @property
-    def name(self) -> bytes: return self.id
-    @name.setter
-    def name(self, value: bytes): self.id = value
-
     def __eq__(self, other) -> bool: return self.id == other.id if isinstance(other, Record) else False
 
     @property
-    def batch(self) -> type['Batch']: return RecordBatch
+    def batch(self) -> type['Batch']:
+        """Returns the batch type for this class.
 
-    @classmethod
-    def from_seq(cls, seq: Seq, id_: bytes = None) -> 'Record': return cls(seq, id_=id_)
-    @classmethod
-    def from_batch(cls, batch: SeqBatch, ids: list[bytes] = None) -> Generator['Record', None, None]:
+        Returns:
+            The ``RecordBatch`` class.
         """
-        Generates Records from a SeqBatch.
-
-        Args:
-            batch: The SeqBatch.
-            ids: Optional list of IDs.
-
-        Yields:
-            Record objects.
-        """
-        if ids is None: ids = [b'Seq_%d' % i for i in range(len(batch))]
-        for id_, seq in zip(ids, batch): yield cls(seq, id_=id_)
+        return RecordBatch
 
     @property
-    def seq(self) -> Seq: return self._seq
+    def seq(self) -> Seq:
+        """Returns the underlying sequence.
+
+        Returns:
+            The ``Seq`` object.
+        """
+        return self._seq
+
     @property
-    def features(self) -> 'FeatureList': return self._features
+    def features(self) -> 'FeatureList':
+        """Returns the list of features annotated on this record.
+
+        Returns:
+            A ``FeatureList``.
+        """
+        return self._features
+
     @features.setter
     def features(self, value): self._features = FeatureList(value)
+
     @property
-    def qualifiers(self) -> QualifierList: return self._qualifiers
+    def qualifiers(self) -> QualifierList:
+        """Returns the record-level qualifiers.
+
+        Returns:
+            A ``QualifierList`` of ``(key, value)`` tuples.
+        """
+        return self._qualifiers
+
     @qualifiers.setter
     def qualifiers(self, value): self._qualifiers = QualifierList(value)
+
     @property
-    def intervals(self) -> 'IntervalBatch': return self.features.intervals
-    @property
-    def interval_batch(self) -> 'IntervalBatch': return self.features.intervals
+    def intervals(self) -> 'IntervalBatch':
+        """Returns the intervals of all features on this record.
+
+        Returns:
+            An ``IntervalBatch``.
+        """
+        return self.features.intervals
 
     def add_features(self, *features: 'Feature'):
-        """Adds features and sorts them by start position."""
+        """Adds features to this record, re-sorting by start position.
+
+        Args:
+            features: One or more ``Feature`` objects to add.
+        """
         self.features.extend(features)
         self.features.sort(key=attrgetter('interval.start'))
 
     def extract_feature(self, feature: Feature) -> Seq:
-        """Extracts the sequence of a specific feature."""
+        """Extracts the subsequence corresponding to a feature.
+
+        Uses the feature's interval (including strand) to slice the record's
+        sequence, applying reverse complement if on the minus strand.
+
+        Args:
+            feature: The ``Feature`` whose sequence to extract.
+
+        Returns:
+            A ``Seq`` of the feature's sequence.
+
+        Examples:
+            >>> cds = rec.features[0]
+            >>> rec.extract_feature(cds)
+            ATGCGA
+        """
         return feature.extract(self._seq)
 
     def reverse_complement(self) -> 'Record':
-        """Returns the reverse complement of the record and all its features."""
+        """Returns the reverse complement of this record and all its features.
+
+        Feature coordinates and strands are flipped relative to the new
+        sequence orientation.
+
+        Returns:
+            A new ``Record`` with the reverse-complemented sequence and
+            transformed feature coordinates.
+        """
         new_seq = self._seq.alphabet.reverse_complement(self._seq)
         parent_len = len(self)
         # Transform features: coordinates flip, strand flips
@@ -102,8 +158,13 @@ class Record(HasIntervals, Batchable):
 
     # --- Slicing & Access ---
     def __getitem__(self, item) -> 'Record':
-        """
-        Slices the record and correctly truncates overlapping features.
+        """Slices the record, truncating overlapping features to fit the new bounds.
+
+        Args:
+            item: A slice, integer, or ``Interval``.
+
+        Returns:
+            A new ``Record`` with the sliced sequence and adjusted features.
         """
         item = Interval.from_item(item, length=len(self._seq))
         new_record = Record(self._seq[item])
@@ -121,9 +182,6 @@ class Record(HasIntervals, Batchable):
             e = min(limit, feature.interval.end - offset)
 
             if s < e:
-                # Construct new feature directly, avoiding intermediate objects
-                # feature.qualifiers is a QualifierList, passing it to Feature constructor
-                # creates a shallow copy of the list structure, which is what we want.
                 new_f = Feature(Interval(s, e, feature.interval.strand), feature.key, feature.qualifiers)
                 new_features.append(new_f)
 
@@ -170,8 +228,13 @@ class Record(HasIntervals, Batchable):
         return Record(new_seq, features=features)
 
     def __delitem__(self, key: Union[slice, int]):
-        """
-        Deletes a slice. Handles overlapping features by TRUNCATING them.
+        """Deletes a slice from the record, truncating overlapping features.
+
+        Args:
+            key: A slice specifying the region to delete.
+
+        Raises:
+            TypeError: If *key* is not a slice.
         """
         if not isinstance(key, slice):
             raise TypeError("Deletion supported for slices only.")
@@ -183,10 +246,6 @@ class Record(HasIntervals, Batchable):
         if slice_len <= 0: return
 
         new_features = []
-
-        # We iterate existing features and decide: Keep, Drop, or Modify
-        # Since deletion breaks the coordinate system, binary search is tricky for *modifying*
-        # but useful for finding start points.
 
         for feature in self.features:
             f_start, f_end = feature.interval.start, feature.interval.end
@@ -202,16 +261,7 @@ class Record(HasIntervals, Batchable):
                 continue
 
             # Case 3: Feature is INSIDE or OVERLAPPING the cut (Modify)
-            # This handles:
-            #   - Enclosed: Cut [100:200], Feature [120:150] -> Deleted
-            #   - Left Overlap: Cut [100:200], Feature [50:150] -> [50:100]
-            #   - Right Overlap: Cut [100:200], Feature [150:250] -> [150-len:250-len] -> [100:150] (shifted)
-            #   - Spanning: Cut [100:200], Feature [50:250] -> [50:150] (Gap closed)
-
-            # Calculate new duration (remove the part that was cut)
-            # Overlap start
             ov_start = max(start, f_start)
-            # Overlap end
             ov_end = min(stop, f_end)
             overlap_len = max(0, ov_end - ov_start)
 
@@ -219,22 +269,11 @@ class Record(HasIntervals, Batchable):
                 # Entirely deleted
                 continue
 
-            # If we survive, we are effectively just "collapsing" the cut region
-            # It's easier to think about the new coordinates:
-            # - Start: min(f_start, start) if spanning left, else f_start - slice_len
-            # Actually, standard logic:
-
             new_f = feature.copy()
 
             if f_start < start:
-                # Starts before cut.
-                # New end = old_end - overlap_len
                 new_f.interval = Interval(new_f.interval.start, new_f.interval.end - overlap_len, new_f.interval.strand)
             else:
-                # Starts inside or after cut.
-                # Start must be shifted
-                # Since we are iterating all features, we know f_start < stop here (Case 2 handled)
-                # So f_start is inside. It becomes `start`.
                 new_start = start
                 new_end = start + (len(feature) - overlap_len)
                 new_f.interval = Interval(new_start, new_end, new_f.interval.strand)
@@ -246,31 +285,42 @@ class Record(HasIntervals, Batchable):
 
     # --- Utilities ---
     def insert(self, other: 'Record', at: int, replace: bool = False) -> 'Record':
-        """
-        Optimized insertion.
+        """Inserts another record's content at a given position.
+
+        Args:
+            other: The ``Record`` to insert.
+            at: The insertion position (0-indexed).
+            replace: If ``True``, overwrite ``len(other)`` bases starting at *at*.
+
+        Returns:
+            A new ``Record`` with the insertion applied.
+
+        Raises:
+            IndexError: If *at* is out of range.
+
+        Examples:
+            >>> result = rec.insert(insertion, at=100)
         """
         if not 0 <= at <= len(self): raise IndexError(f"Insert index {at} out of range.")
-        # Optimization: Don't slice everything if we don't have to.
-        # But Record is immutable-ish (returns new), so slicing is inevitable.
         suffix_start = at + (len(other) if replace else 0)
-        # If replace=True, we skip 'len(other)' from self.
-        # Wait, usually replace=True implies overwriting sequence of length len(other).
-        # Your previous logic: self[at if not replace else at + len(other):]
-        # This implies if replace=True, we delete `len(other)` from self.
         return self[:at] + other + self[suffix_start:]
 
     def shred(self, rng: np.random.Generator = None, n_breaks: int = None, break_points: list[int] = None
               ) -> Generator['Record', None, None]:
-        """
-        Shreds the record into smaller pieces.
+        """Randomly shreds the record into fragments at break points.
 
         Args:
-            rng: Random number generator.
-            n_breaks: Number of random breaks.
-            break_points: Specific break points.
+            rng: NumPy random generator (uses global default if omitted).
+            n_breaks: Number of random break points.
+            break_points: Explicit list of break positions (overrides *n_breaks*).
 
         Yields:
-            Record fragments.
+            ``Record`` fragments.
+
+        Examples:
+            >>> fragments = list(rec.shred(n_breaks=3))
+            >>> len(fragments)
+            4
         """
         if rng is None: rng = RESOURCES.rng
         if not n_breaks and not break_points:
@@ -292,23 +342,24 @@ class Record(HasIntervals, Batchable):
 
 class RecordBatch(Batch, HasIntervals):
     """
-    A high-performance, read-only container for a collection of Records.
-    
-    Uses Structure-of-Arrays (SoA) layout to store sequences and features contiguously,
-    enabling vectorized operations and Numba compatibility.
+    High-performance, read-only columnar container for a collection of Records.
+
+    Uses Structure-of-Arrays (SoA) layout: sequences, IDs, qualifiers, and features
+    are stored in contiguous arrays for vectorized operations and Numba compatibility.
+
+    Args:
+        records: An iterable of ``Record`` objects to batch.
+        deduplicate: If ``True``, deduplicates identical sequences.
+
+    Examples:
+        >>> batch = RecordBatch([rec1, rec2, rec3])
+        >>> len(batch)
+        3
+        >>> batch[0]
+        Record(...)
     """
     __slots__ = ('_seqs', '_ids', '_features', '_feature_rec_indices', '_feature_offsets', '_qualifiers')
 
-    @classmethod
-    def empty(cls) -> 'RecordBatch':
-        obj = cls.__new__(cls)
-        obj._seqs = SeqBatch.empty()
-        obj._ids = np.empty(0, dtype=object)
-        obj._features = FeatureBatch.empty()
-        obj._feature_offsets = np.zeros(1, dtype=np.int32)
-        obj._feature_rec_indices = np.empty(0, dtype=np.int32)
-        obj._qualifiers = QualifierBatch.empty()
-        return obj
 
     def __init__(self, records: Iterable[Record], deduplicate: bool = False):
         # 1. Materialize list to avoid multiple passes if iterator
@@ -317,23 +368,36 @@ class RecordBatch(Batch, HasIntervals):
         self._seqs = recs[0].seq.alphabet.batch_from((r.seq for r in recs), deduplicate=deduplicate)
         # 3. Batch IDs (Fixed length numpy array for speed, or object array)
         # We use object array of bytes to handle variable length IDs safely
-        self._ids = np.array([r.id for r in recs], dtype=object)
+        self._ids = np.array([r.id for r in recs])
         # 4. Batch Qualifiers
-        self._qualifiers = QualifierBatch.from_qualifiers((r.qualifiers for r in recs))
+        self._qualifiers = QualifierBatch.build(r.qualifiers for r in recs)
         self._build_features(recs)
 
     @classmethod
-    def random(cls, alphabet: Alphabet, rng: np.random.Generator = None, n: int = None, min_n: int = 1,
-               max_n: int = 1000, l: int = None, min_l: int = 10, max_l: int = 5_000_000, weights=None):
-        """
-        Generates a random genome assembly for testing purposes.
+    def random(cls, alphabet: Alphabet, rng: np.random.Generator = None, n_seqs: int = None, min_n: int = 1,
+               max_n: int = 1000, length: int = None, min_length: int = 10, max_length: int = 5_000_000, weights=None):
+        """Generates a random RecordBatch for testing purposes.
+
+        Args:
+            alphabet: The ``Alphabet`` to use (e.g. ``Alphabet.DNA``).
+            rng: NumPy random generator.
+            n_seqs: Exact number of records (overrides *min_n*/*max_n*).
+            min_n: Minimum number of random records.
+            max_n: Maximum number of random records.
+            length: Exact sequence length (overrides *min_length*/*max_length*).
+            min_length: Minimum random sequence length.
+            max_length: Maximum random sequence length.
+            weights: Symbol frequency weights for random generation.
+
+        Returns:
+            A new ``RecordBatch`` with random sequences and UUID IDs.
         """
         if rng is None: rng = RESOURCES.rng
-        seqs = alphabet.random_batch(rng=rng, n_seqs=n, min_seqs=min_n, max_seqs=max_n, length=l, min_len=min_l,
-                                     max_len=max_l, weights=weights)
+        seqs = alphabet.random_batch(rng=rng, n_seqs=n_seqs, min_seqs=min_n, max_seqs=max_n, length=length, min_len=min_length,
+                                     max_len=max_length, weights=weights)
 
         # Generate random UUIDs (Standard for Records)
-        ids = np.array([hexlify(uuid4().bytes) for _ in range(len(seqs))], dtype=object)
+        ids = np.array([hexlify(uuid4().bytes) for _ in range(len(seqs))])
 
         # Construct the batch manually for performance
         obj = cls.__new__(cls)
@@ -342,25 +406,42 @@ class RecordBatch(Batch, HasIntervals):
         obj._features = FeatureBatch.empty()
         obj._feature_offsets = np.zeros(len(seqs) + 1, dtype=np.int32)
         obj._feature_rec_indices = np.empty(0, dtype=np.int32)
-        obj._qualifiers = QualifierBatch.from_qualifiers((() for _ in range(len(seqs))))
+        obj._qualifiers = QualifierBatch.zeros(len(seqs))
         return obj
 
 
     @classmethod
     def from_aligned_batch(cls, batch: SeqBatch, records: list[Record]):
-        """
-        Efficiently creates a RecordBatch from a pre-computed SeqBatch and a list of Records.
-        Assumes records[i] corresponds to batch[i].
+        """Creates a RecordBatch from a pre-computed SeqBatch and matching Records.
+
+        Assumes ``records[i]`` corresponds to ``batch[i]``. Useful when sequences
+        have already been aligned or deduplicated externally.
+
+        Args:
+            batch: A pre-computed ``SeqBatch``.
+            records: A list of ``Record`` objects providing IDs, qualifiers,
+                and features.
+
+        Returns:
+            A new ``RecordBatch``.
         """
         obj = cls.__new__(cls)
         obj._seqs = batch
-        obj._ids = np.array([r.id for r in records], dtype=object)
-        obj._qualifiers = QualifierBatch.from_qualifiers((r.qualifiers for r in records))
+        obj._ids = np.array([r.id for r in records])
+        obj._qualifiers = QualifierBatch.build(r.qualifiers for r in records)
         obj._build_features(records)
         return obj
 
     @classmethod
     def build(cls, components: Iterable[Record]) -> 'RecordBatch':
+        """Constructs a RecordBatch from an iterable of Record objects.
+
+        Args:
+            components: An iterable of ``Record`` objects.
+
+        Returns:
+            A new ``RecordBatch``.
+        """
         return cls(components)
 
     def _build_features(self, recs):
@@ -402,22 +483,41 @@ class RecordBatch(Batch, HasIntervals):
                 for f in r.features:
                     yield f.qualifiers
 
-        qualifiers = QualifierBatch.from_qualifiers(qual_gen())
+        qualifiers = QualifierBatch.build(qual_gen())
         
         self._features = FeatureBatch(intervals, keys, qualifiers)
 
     @classmethod
-    def empty(cls) -> 'RecordBatch':
-        return cls.zeros(0)
+    def empty(cls, alphabet: Alphabet) -> 'RecordBatch':
+        """Creates an empty RecordBatch with zero records.
+
+        Args:
+            alphabet: The ``Alphabet`` for the (empty) sequence batch.
+
+        Returns:
+            An empty ``RecordBatch``.
+        """
+        return cls.zeros(0, alphabet)
 
     @classmethod
-    def zeros(cls, n: int) -> 'RecordBatch':
-        """
-        Creates a batch of n empty records.
+    def zeros(cls, n: int, alphabet: Alphabet) -> 'RecordBatch':
+        """Creates a batch of *n* placeholder records with empty sequences.
+
+        Args:
+            n: Number of placeholder records.
+            alphabet: The ``Alphabet`` for the sequences.
+
+        Returns:
+            A ``RecordBatch`` with empty sequences and no features.
+
+        Examples:
+            >>> batch = RecordBatch.zeros(5, Alphabet.DNA)
+            >>> len(batch)
+            5
         """
         obj = cls.__new__(cls)
-        obj._seqs = SeqBatch.zeros(n)
-        obj._ids = np.full(n, b'', dtype=object)
+        obj._seqs = alphabet.zeros_batch(n)
+        obj._ids = np.full(n, b'', dtype='S1') # Empty bytes, will grow if needed or stay empty
         obj._qualifiers = QualifierBatch.zeros(n)
         obj._features = FeatureBatch.empty()
         obj._feature_offsets = np.zeros(n + 1, dtype=np.int32)
@@ -425,7 +525,25 @@ class RecordBatch(Batch, HasIntervals):
         return obj
 
     @classmethod
-    def concat(cls, batches: Iterable['RecordBatch']) -> 'RecordBatch':
+    def concat(cls, batches: Iterable['RecordBatch'], deduplicate: bool = False) -> 'RecordBatch':
+        """Concatenates multiple RecordBatch objects into one.
+
+        Correctly adjusts feature-to-record index mappings and offset arrays
+        across batch boundaries.
+
+        Args:
+            batches: An iterable of ``RecordBatch`` objects.
+            deduplicate: Whether to deduplicate identical records.
+
+        Returns:
+            A single concatenated ``RecordBatch``.
+
+        Raises:
+            ValueError: If the list is empty.
+
+        Examples:
+            >>> combined = RecordBatch.concat([batch_a, batch_b])
+        """
         batches = list(batches)
         if not batches: raise ValueError("Cannot concatenate empty list")
         
@@ -448,12 +566,9 @@ class RecordBatch(Batch, HasIntervals):
         ])
         
         # Stack offsets (using RaggedBatch logic manually here as this isn't a RaggedBatch subclass)
-        # offsets[0] is 0. We take offsets[1:] + total_feats_prev
         feat_counts = [b.n_features for b in batches]
         feat_shifts = np.cumsum([0] + feat_counts[:-1])
         
-        # [0, 2, 5] + [0, 3] -> [0, 2, 5, 8]
-        # We need to construct the full offset array
         offset_parts = [batches[0]._feature_offsets]
         for i in range(1, len(batches)):
             # Take offsets[1:] and add the cumulative feature count
@@ -468,35 +583,85 @@ class RecordBatch(Batch, HasIntervals):
 
     @property
     def nbytes(self) -> int:
+        """Returns the total memory usage in bytes.
+
+        Returns:
+            Total bytes consumed by all internal arrays.
+        """
         return (self._seqs.nbytes + self._ids.nbytes + self._features.nbytes + 
                 self._qualifiers.nbytes + self._feature_offsets.nbytes + self._feature_rec_indices.nbytes)
 
     def copy(self) -> 'RecordBatch':
+        """Returns a deep copy of this batch.
+
+        Returns:
+            A new ``RecordBatch`` with copied arrays.
+        """
         return self._reconstruct(
             self._seqs.copy(), self._ids.copy(), self._features.copy(), 
             self._feature_rec_indices.copy(), self._feature_offsets.copy(), self._qualifiers.copy())
 
     @property
-    def component(self): return Record
+    def component(self):
+        """Returns the scalar type represented by this batch.
+
+        Returns:
+            The ``Record`` class.
+        """
+        return Record
 
     def __repr__(self): return f"<RecordBatch: {len(self)} records>"
-
     def __len__(self): return len(self._seqs)
+
     @property
-    def ids(self) -> np.ndarray: return self._ids
+    def ids(self) -> np.ndarray:
+        """Returns the record IDs as a numpy object array.
+
+        Returns:
+            A numpy array of ``bytes`` IDs.
+        """
+        return self._ids
+
     @property
-    def seqs(self) -> SeqBatch: return self._seqs
+    def seqs(self) -> SeqBatch:
+        """Returns the underlying sequence batch.
+
+        Returns:
+            A ``SeqBatch``.
+        """
+        return self._seqs
+
     @property
     def intervals(self) -> IntervalBatch:
-        """Returns the intervals of all features in this batch."""
+        """Returns the intervals of all features across all records.
+
+        Returns:
+            An ``IntervalBatch``.
+        """
         return self._features.intervals
 
     @property
-    def n_features(self) -> int: return len(self._features)
+    def n_features(self) -> int:
+        """Returns the total number of features across all records.
+
+        Returns:
+            Feature count.
+        """
+        return len(self._features)
 
     def get_record(self, idx: int) -> 'Record':
-        """
-        Reconstructs a full Record object with features from the batch.
+        """Reconstructs a full Record object from the batch at index *idx*.
+
+        Args:
+            idx: Zero-based record index.
+
+        Returns:
+            A ``Record`` with its sequence, features, and qualifiers.
+
+        Examples:
+            >>> rec = batch.get_record(0)
+            >>> rec.id
+            b'contig_1'
         """
         seq = self.seqs[idx]
         rec_id = self.ids[idx]
@@ -509,7 +674,14 @@ class RecordBatch(Batch, HasIntervals):
         return Record(seq, id_=rec_id, features=features, qualifiers=quals)
 
     def get_qualifiers(self, idx: int) -> list[tuple]:
-        """Returns the qualifiers for the record at idx."""
+        """Returns the qualifiers for the record at *idx*.
+
+        Args:
+            idx: Zero-based record index.
+
+        Returns:
+            A list of ``(key, value)`` tuples.
+        """
         return self._qualifiers[idx]
     
     def __getitem__(self, item):
@@ -548,24 +720,130 @@ class RecordBatch(Batch, HasIntervals):
         obj._qualifiers = qualifiers
         return obj
 
-    def features_for(self, record_idx: int) -> 'IntervalBatch':
-        """Returns the IntervalBatch for a specific record."""
-        start = self._feature_offsets[record_idx]
-        end = self._feature_offsets[record_idx+1]
-        
-        intervals = self._features.intervals
-        # Slicing IntervalBatch is not yet implemented in your code, 
-        # but assuming standard numpy slicing on internal arrays:
-        return IntervalBatch(
-            intervals.starts[start:end],
-            intervals.ends[start:end],
-            intervals.strands[start:end]
+    def add_features(self, features: 'FeatureBatch', pivot_key: FeatureKey = FeatureKey.SOURCE) -> 'RecordBatch':
+        """Returns a new RecordBatch with additional features mapped via a pivot qualifier.
+
+        Each feature is assigned to a record by matching a qualifier value
+        (identified by *pivot_key*) against record IDs. Uses vectorized
+        qualifier lookup through ``QualifierBatch._key_ids``.
+
+        Args:
+            features: A ``FeatureBatch`` of features to add.
+            pivot_key: The ``FeatureKey`` whose qualifier value identifies
+                the target record (default ``SOURCE``).
+
+        Returns:
+            A new ``RecordBatch`` with the matched features merged in.
+
+        Raises:
+            ValueError: If *pivot_key* is not found in the feature qualifiers.
+
+        Examples:
+            >>> annotated = batch.add_features(gff_features, pivot_key=FeatureKey.SOURCE)
+        """
+        if len(features) == 0: return self.copy()
+
+        # 1. Build id → record index lookup
+        id_to_idx = {self._ids[i]: i for i in range(len(self))}
+
+        # 2. Find the pivot key in the qualifier vocabulary
+        quals = features._qualifiers
+        pivot_bytes = pivot_key.bytes
+        pivot_vocab_idx = -1
+        for i, k in enumerate(quals._key_vocab):
+            if k == pivot_bytes:
+                pivot_vocab_idx = i
+                break
+
+        if pivot_vocab_idx == -1:
+            raise ValueError(f"Pivot key '{pivot_key}' not found in feature qualifiers")
+
+        # 3. Vectorized: find all qualifier entries matching the pivot key
+        is_pivot = (quals._key_ids == pivot_vocab_idx)
+
+        # 4. Map each qualifier position to its feature index
+        n_new = len(features)
+        feat_of_qual = np.repeat(np.arange(n_new, dtype=np.int32), np.diff(quals._offsets))
+
+        # 5. Extract the first pivot value per feature
+        pivot_positions = np.where(is_pivot)[0]
+        pivot_feat_indices = feat_of_qual[pivot_positions]
+        pivot_values = quals._values[pivot_positions]
+
+        # Take only first match per feature
+        _, first_idx = np.unique(pivot_feat_indices, return_index=True)
+        matched_feat_indices = pivot_feat_indices[first_idx]
+        matched_values = pivot_values[first_idx]
+
+        # 6. Map pivot values to record indices
+        rec_indices = np.array([id_to_idx.get(v, -1) for v in matched_values], dtype=np.int32)
+        valid = rec_indices >= 0
+        matched_feat_indices = matched_feat_indices[valid]
+        new_rec_indices = rec_indices[valid]
+
+        if len(matched_feat_indices) == 0: return self.copy()
+
+        # 7. Slice matched features from the input batch
+        new_features = FeatureBatch.concat([features[int(i):int(i)+1] for i in matched_feat_indices])
+
+        # 8. Merge with existing features, grouped by record
+        # Sort new features by record index for offset construction
+        sort_order = np.argsort(new_rec_indices)
+        new_rec_indices = new_rec_indices[sort_order]
+        sorted_feat_indices = np.arange(len(new_rec_indices))
+        # Rebuild new_features in sorted order
+        reordered = [matched_feat_indices[sort_order[j]] for j in range(len(sort_order))]
+        new_features = FeatureBatch.concat([features[int(i):int(i)+1] for i in reordered])
+
+        # 9. Combine: interleave existing and new features per record
+        n_recs = len(self)
+        combined_features = FeatureBatch.concat([self._features, new_features])
+        combined_rec_indices = np.concatenate([self._feature_rec_indices, new_rec_indices])
+
+        # Rebuild offsets from combined rec_indices
+        new_offsets = np.zeros(n_recs + 1, dtype=np.int32)
+        if len(combined_rec_indices) > 0:
+            counts = np.bincount(combined_rec_indices, minlength=n_recs)
+            np.cumsum(counts, out=new_offsets[1:])
+
+        # Sort combined features by (rec_index, position) for proper grouping
+        order = np.argsort(combined_rec_indices, kind='stable')
+        combined_rec_indices = combined_rec_indices[order]
+
+        # Reorder the FeatureBatch by the sort order
+        reordered_intervals = IntervalBatch(
+            combined_features.intervals.starts[order],
+            combined_features.intervals.ends[order],
+            combined_features.intervals.strands[order],
+            sort=False
+        )
+        reordered_keys = combined_features.keys[order]
+        reordered_quals = QualifierBatch.build(combined_features._qualifiers[int(i)] for i in order)
+        combined_features = FeatureBatch(reordered_intervals, reordered_keys, reordered_quals)
+
+        return self._reconstruct(
+            self._seqs, self._ids, combined_features,
+            combined_rec_indices, new_offsets, self._qualifiers
         )
 
     def extract_features(self, kind: bytes = None) -> 'SeqBatch':
-        """
-        Extracts sequences for ALL features in the batch, optionally filtered by kind.
-        Returns a new SeqBatch of the feature sequences.
+        """Extracts sequences for all features, optionally filtered by type.
+
+        Uses a Numba-accelerated kernel for parallel extraction with
+        automatic reverse complement for minus-strand features.
+
+        Args:
+            kind: Optional ``FeatureKey`` bytes value to filter by
+                (e.g. ``FeatureKey.CDS.bytes``). Extracts all features
+                if ``None``.
+
+        Returns:
+            A ``SeqBatch`` of the extracted feature sequences.
+
+        Examples:
+            >>> cds_seqs = batch.extract_features(FeatureKey.CDS.bytes)
+            >>> len(cds_seqs)
+            42
         """
         if kind is not None:
             # Find ID for kind
@@ -605,14 +883,6 @@ class RecordBatch(Batch, HasIntervals):
         )
         
         return self.seqs.alphabet.new_batch(out_data, out_starts, lengths)
-
-    def get_feature_key(self, idx: int) -> FeatureKey:
-        """Returns the kind of the feature at the global index."""
-        return self._features.get_key(idx)
-
-    def get_feature_qualifiers(self, idx: int) -> list[tuple]:
-        """Returns the qualifiers of the feature at the global index."""
-        return self._features.get_qualifiers(idx)
 
 
 # TODO: There should be no kernels in the containers module - move elsewhere or consider moving module

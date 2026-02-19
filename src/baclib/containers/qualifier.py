@@ -1,3 +1,4 @@
+"""List and batch containers for key-value qualifier annotations on genomic features."""
 from typing import Union, MutableSequence, Iterable
 import itertools
 
@@ -13,7 +14,21 @@ QualifierType = Union[int, float, bytes, bool]
 class QualifierList(MutableSequence):
     """
     A list-like container for (key, value) tuples that also supports dictionary-style access.
-    Maintains insertion order and allows duplicate keys.
+
+    Maintains insertion order and allows duplicate keys. Used to store
+    feature and record qualifiers from formats like GenBank and GFF.
+
+    Args:
+        items: Initial qualifier data as an iterable of ``(key, value)`` tuples
+            or a dictionary.
+
+    Examples:
+        >>> quals = QualifierList([(b'gene', b'dnaA'), (b'product', b'replication initiator')])
+        >>> quals[b'gene']
+        b'dnaA'
+        >>> quals.add(b'note', b'essential')
+        >>> len(quals)
+        3
     """
     __slots__ = ('_data',)
 
@@ -50,39 +65,129 @@ class QualifierList(MutableSequence):
         if len(self) > 6:
             return f"[{', '.join(repr(x) for x in self[:3])}, ..., {', '.join(repr(x) for x in self[-3:])}]"
         return repr(self._data)
-    def insert(self, index, value): self._data.insert(index, value)
+
+    def insert(self, index, value):
+        """Inserts a ``(key, value)`` tuple at the given index.
+
+        Args:
+            index: Position to insert at.
+            value: A ``(key, value)`` tuple to insert.
+
+        Examples:
+            >>> quals = QualifierList([(b'gene', b'dnaA')])
+            >>> quals.insert(0, (b'locus_tag', b'b0001'))
+            >>> quals[0]
+            (b'locus_tag', b'b0001')
+        """
+        self._data.insert(index, value)
 
     def __eq__(self, other):
         if isinstance(other, QualifierList): return self._data == other._data
         if isinstance(other, list): return self._data == other
         return False
 
-    def get(self, key, default=None):
-        """Returns the first value for a key, or default."""
+    def get(self, key: bytes, default=None) -> QualifierType:
+        """Returns the first value for a key, or *default* if not found.
+
+        Args:
+            key: The qualifier key to look up.
+            default: Value to return if key is absent.
+
+        Returns:
+            The first matching value, or *default*.
+
+        Examples:
+            >>> quals = QualifierList([(b'gene', b'dnaA')])
+            >>> quals.get(b'gene')
+            b'dnaA'
+            >>> quals.get(b'missing', b'N/A')
+            b'N/A'
+        """
         for k, v in self._data:
             if k == key: return v
         return default
 
     def get_all(self, key: bytes) -> list[QualifierType]:
-        """Returns all values for a key."""
+        """Returns all values for a key.
+
+        Args:
+            key: The qualifier key to look up.
+
+        Returns:
+            A list of all matching values (empty if key is absent).
+
+        Examples:
+            >>> quals = QualifierList([(b'db_xref', b'GI:123'), (b'db_xref', b'UniProt:P0A')])
+            >>> quals.get_all(b'db_xref')
+            [b'GI:123', b'UniProt:P0A']
+        """
         return [v for k, v in self._data if k == key]
 
     def add(self, key: bytes, value: QualifierType):
-        """Adds a new key-value pair."""
+        """Appends a new key-value pair.
+
+        Args:
+            key: The qualifier key.
+            value: The qualifier value.
+
+        Examples:
+            >>> quals = QualifierList()
+            >>> quals.add(b'gene', b'dnaA')
+            >>> len(quals)
+            1
+        """
         self._data.append((key, value))
 
     def to_dict(self) -> dict[bytes, QualifierType]:
-        """Converts the list to a standard dictionary (lossy for duplicates)."""
+        """Converts to a standard dictionary (lossy for duplicate keys).
+
+        Returns:
+            A dict mapping each key to its *last* value.
+
+        Examples:
+            >>> quals = QualifierList([(b'gene', b'dnaA'), (b'product', b'initiator')])
+            >>> quals.to_dict()
+            {b'gene': b'dnaA', b'product': b'initiator'}
+        """
         return {k: v for k, v in self._data}
 
     def items(self):
-        """Returns occurrances of (key, value) tuples."""
+        """Returns an iterator over ``(key, value)`` tuples.
+
+        Returns:
+            An iterator of ``(key, value)`` tuples.
+
+        Examples:
+            >>> quals = QualifierList([(b'gene', b'dnaA')])
+            >>> list(quals.items())
+            [(b'gene', b'dnaA')]
+        """
         return iter(self._data)
 
 
 class QualifierBatch(RaggedBatch):
     """
-    A batch of qualifier lists, stored in a columnar format (Structure-of-Arrays).
+    A batch of qualifier lists stored in columnar format (Structure-of-Arrays).
+
+    Internally uses a shared vocabulary for keys (``_key_vocab``), integer key IDs
+    (``_key_ids``), and an object array of values (``_values``), with ragged offsets
+    to delineate each qualifier list.
+
+    Args:
+        key_vocab: Array of unique qualifier key bytes.
+        key_ids: Integer array mapping each qualifier entry to its vocab index.
+        values: Object array of qualifier values.
+        offsets: Integer array of cumulative offsets (length = n_items + 1).
+
+    Examples:
+        >>> batch = QualifierBatch.build([
+        ...     [(b'gene', b'dnaA')],
+        ...     [(b'gene', b'dnaN'), (b'product', b'polymerase')],
+        ... ])
+        >>> len(batch)
+        2
+        >>> batch[0]
+        [(b'gene', b'dnaA')]
     """
     __slots__ = ('_key_vocab', '_key_ids', '_values')
 
@@ -94,6 +199,23 @@ class QualifierBatch(RaggedBatch):
 
     @classmethod
     def build(cls, qualifiers_list: Iterable[Iterable[tuple[bytes, QualifierType]]]) -> 'QualifierBatch':
+        """Constructs a QualifierBatch from an iterable of qualifier iterables.
+
+        Args:
+            qualifiers_list: An iterable where each element is an iterable of
+                ``(key, value)`` tuples representing one qualifier list.
+
+        Returns:
+            A new QualifierBatch.
+
+        Examples:
+            >>> batch = QualifierBatch.build([
+            ...     [(b'gene', b'dnaA')],
+            ...     [(b'gene', b'dnaN')],
+            ... ])
+            >>> len(batch)
+            2
+        """
         key_to_id = {}
         key_vocab = []
         flat_key_ids = []
@@ -113,7 +235,7 @@ class QualifierBatch(RaggedBatch):
             offsets.append(curr_idx)
 
         return cls(
-            np.array(key_vocab, dtype=object),
+            np.array(key_vocab),
             np.array(flat_key_ids, dtype=np.int32),
             np.array(flat_values, dtype=object),
             np.array(offsets, dtype=np.int32)
@@ -121,8 +243,23 @@ class QualifierBatch(RaggedBatch):
 
     @classmethod
     def concat(cls, batches: Iterable['QualifierBatch']) -> 'QualifierBatch':
-        # Rebuild strategy to handle vocabulary merging
-        # This iterates all items, which is O(N), but safe.
+        """Concatenates multiple QualifierBatch objects into one.
+
+        Rebuilds the shared vocabulary to handle merging across batches.
+
+        Args:
+            batches: An iterable of QualifierBatch objects.
+
+        Returns:
+            A single concatenated QualifierBatch.
+
+        Examples:
+            >>> a = QualifierBatch.build([[(b'gene', b'dnaA')]])
+            >>> b = QualifierBatch.build([[(b'gene', b'dnaN')]])
+            >>> combined = QualifierBatch.concat([a, b])
+            >>> len(combined)
+            2
+        """
         def iterator():
             for b in batches:
                 for item in b:
@@ -131,15 +268,35 @@ class QualifierBatch(RaggedBatch):
 
     @classmethod
     def nbytes(self) -> int:
+        """Returns the total memory usage in bytes.
+
+        Returns:
+            Total bytes consumed by vocabulary, key IDs, values, and offsets.
+        """
         return super().nbytes + self._key_vocab.nbytes + self._key_ids.nbytes + self._values.nbytes
 
     def copy(self) -> 'QualifierBatch':
+        """Returns a deep copy of this batch.
+
+        Returns:
+            A new QualifierBatch with copied arrays.
+        """
         return self.__class__(self._key_vocab.copy(), self._key_ids.copy(), self._values.copy(), self._offsets.copy())
 
     @classmethod
     def empty(cls) -> 'QualifierBatch':
+        """Creates an empty QualifierBatch with zero items.
+
+        Returns:
+            An empty QualifierBatch.
+
+        Examples:
+            >>> batch = QualifierBatch.empty()
+            >>> len(batch)
+            0
+        """
         return cls(
-            np.array([], dtype=object),
+            np.array([], dtype='S1'),
             np.array([], dtype=np.int32),
             np.array([], dtype=object),
             np.zeros(1, dtype=np.int32)
@@ -147,15 +304,36 @@ class QualifierBatch(RaggedBatch):
 
     @classmethod
     def zeros(cls, n: int) -> 'QualifierBatch':
+        """Creates a QualifierBatch with *n* empty qualifier lists.
+
+        Args:
+            n: Number of empty qualifier slots.
+
+        Returns:
+            A QualifierBatch where each of the *n* items has zero qualifiers.
+
+        Examples:
+            >>> batch = QualifierBatch.zeros(3)
+            >>> len(batch)
+            3
+            >>> batch[0]
+            []
+        """
         return cls(
-            np.array([], dtype=object),
+            np.array([], dtype='S1'),
             np.array([], dtype=np.int32),
             np.array([], dtype=object),
             np.zeros(n + 1, dtype=np.int32)
         )
 
     @property
-    def component(self): return tuple # Qualifiers are usually lists of tuples
+    def component(self):
+        """Returns the scalar type represented by this batch.
+
+        Returns:
+            The ``tuple`` type.
+        """
+        return tuple
 
     def __getitem__(self, item):
         if isinstance(item, (int, np.integer)):

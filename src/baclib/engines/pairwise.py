@@ -1,3 +1,4 @@
+"""Pairwise sequence alignment engine with seeding, chaining, and dynamic programming."""
 from typing import Union, Iterable
 from enum import IntEnum
 
@@ -15,12 +16,14 @@ else:
 
 # Constants ------------------------------------------------------------------------------------------------------------
 class AlignmentMode(IntEnum):
+    """Alignment strategy controlling how terminal gaps are scored."""
     LOCAL = 0
     GLOBAL = 1
     GLOCAL = 2
 
 
 class Trace(IntEnum):
+    """Traceback pointer flags stored in the DP matrix during alignment."""
     MATCH = 0
     E = 1
     F = 2

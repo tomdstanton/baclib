@@ -1,5 +1,5 @@
 """
-Module for managing alignments.
+Module for managing alignments and alignment batches using Structure-of-Arrays layout.
 """
 from typing import Generator, Iterable, Any, Union, NamedTuple
 from itertools import chain
@@ -18,6 +18,7 @@ from baclib.lib.resources import jit
 
 # Classes --------------------------------------------------------------------------------------------------------------
 class CigarOp(IntEnum):
+    """CIGAR alignment operation codes (SAM specification)."""
     M = 0
     I = 1
     D = 2
@@ -81,15 +82,28 @@ class Cigar:
 
 class Alignment(Feature):
     """
-    Represents a pairwise sequence alignment.
+    Represents a pairwise sequence alignment between a query and a target.
 
-    Attributes:
-        query (bytes): Query sequence ID.
-        query_interval (Interval): Interval on the query.
-        target (bytes): Target sequence ID.
-        interval (Interval): Interval on the target (inherited from Feature).
-        score (float): Alignment score.
-        cigar (bytes): CIGAR string.
+    Inherits from ``Feature`` to represent the alignment interval on the target sequence.
+
+    Args:
+        query: Query sequence ID (bytes).
+        query_interval: Interval on the query sequence.
+        target: Target sequence ID (bytes).
+        interval: Interval on the target sequence.
+        query_length: Total length of the query sequence.
+        target_length: Total length of the target sequence.
+        length: Alignment length (including gaps).
+        cigar: CIGAR string (bytes).
+        n_matches: Number of matching bases.
+        quality: Mapping quality (Phred).
+        qualifiers: Optional qualifiers/tags.
+        score: Alignment score.
+
+    Examples:
+        >>> aln = Alignment(b'read1', Interval(0, 100), b'ref', Interval(500, 600), score=50.0)
+        >>> aln.query
+        b'read1'
     """
     __slots__ = (
         'query', 'query_interval', 'query_length', 'target', 'target_length', 'length', 'cigar', 'score',
@@ -112,7 +126,13 @@ class Alignment(Feature):
         self.quality = quality
 
     @property
-    def batch(self) -> type['Batch']: return AlignmentBatch
+    def batch(self) -> type['Batch']:
+        """Returns the batch type for this class.
+
+        Returns:
+            The ``AlignmentBatch`` class.
+        """
+        return AlignmentBatch
 
     def __repr__(self):
         return (f"Alignment({self.query.decode(Alphabet.ENCODING, 'ignore')}->"
@@ -128,6 +148,7 @@ class Alignment(Feature):
         return False
 
     def copy(self) -> 'Alignment':
+        """Returns a deep copy of the alignment."""
         return Alignment(
             query=self.query, query_interval=self.query_interval, target=self.target,
             interval=self.interval, query_length=self.query_length, target_length=self.target_length,
@@ -136,6 +157,15 @@ class Alignment(Feature):
         )
 
     def shift(self, x: int, y: int = None) -> 'Alignment':
+        """Shifts the alignment coordinates on the target sequence.
+
+        Args:
+            x: Amount to shift the start.
+            y: Amount to shift the end (defaults to *x*).
+
+        Returns:
+            A new shifted ``Alignment``.
+        """
         return Alignment(
             query=self.query, query_interval=self.query_interval, target=self.target,
             interval=self.interval.shift(x, y),
@@ -145,6 +175,14 @@ class Alignment(Feature):
         )
 
     def reverse_complement(self, parent_length: int) -> 'Alignment':
+        """Reverse complements the alignment relative to a parent sequence of given length.
+
+        Args:
+            parent_length: Length of the target sequence.
+
+        Returns:
+            A new ``Alignment`` with transformed coordinates and strand.
+        """
         return Alignment(
             query=self.query, query_interval=self.query_interval, target=self.target,
             interval=self.interval.reverse_complement(parent_length),
@@ -166,7 +204,11 @@ class Alignment(Feature):
         return self.n_matches / self.length if self.length > 0 else 0.0
 
     def flip(self) -> 'Alignment':
-        """Swaps query and target."""
+        """Swaps query and target roles.
+
+        Returns:
+            A new ``Alignment`` where query becomes target and vice versa.
+        """
         return Alignment(
             query=self.target, query_interval=self.interval, query_length=self.target_length,
             target=self.query, interval=self.query_interval, target_length=self.query_length,
@@ -178,6 +220,14 @@ class Alignment(Feature):
 class AlignmentSide(NamedTuple):
     """
     A view of one side (Query or Target) of an AlignmentBatch.
+
+    Attributes:
+        indices: Indices into the ID array.
+        starts: Start coordinates.
+        ends: End coordinates.
+        lengths: Sequence lengths.
+        strands: Strand orientations.
+        ids: Resolved ID strings (bytes).
     """
     indices: np.ndarray
     starts: np.ndarray
@@ -188,6 +238,7 @@ class AlignmentSide(NamedTuple):
 
     @property
     def coords(self) -> np.ndarray:
+        """Returns a (N, 2) array of [start, end] coordinates."""
         return np.stack((self.starts, self.ends), axis=1)
 
     def to_intervals(self, sort: bool = True) -> 'IntervalBatch':
@@ -197,8 +248,17 @@ class AlignmentSide(NamedTuple):
 
 class AlignmentBatch(Batch, HasIntervals):
     """
-    High-performance container for alignment batches.
-    Stores data in Structure-of-Arrays (SoA) layout.
+    High-performance columnar container for batches of pairwise alignments.
+
+    Stores data in Structure-of-Arrays (SoA) layout for efficiency. Handles
+    query/target IDs using integer indices and lookup arrays.
+
+    Args:
+        data: Structured numpy array containing all alignment fields.
+        cigars: Object array of CIGAR strings.
+        qualifiers: Object array of qualifier lists.
+        query_ids: Array of unique query IDs.
+        target_ids: Array of unique target IDs.
     """
 
     class Field(str, Enum):
@@ -236,8 +296,8 @@ class AlignmentBatch(Batch, HasIntervals):
             self._cigars = np.zeros(0, dtype=object)
             self._qualifiers = np.zeros(0, dtype=object)
             # Default empty IDs arrays should be empty
-            if query_ids is None: self.query_ids = np.empty(0, dtype=object)
-            if target_ids is None: self.target_ids = np.empty(0, dtype=object)
+            if query_ids is None: self.query_ids = np.empty(0, dtype='S1')
+            if target_ids is None: self.target_ids = np.empty(0, dtype='S1')
         else:
             self._data = data
             n = len(data)
@@ -255,7 +315,7 @@ class AlignmentBatch(Batch, HasIntervals):
                   q_lens: np.ndarray, t_lens: np.ndarray,
                   cigars: np.ndarray = None,
                   q_strands: np.ndarray = None, t_strands: np.ndarray = None):
-        """Zero-copy construction from Aligner output arrays."""
+        """Zero-copy construction from raw Aligner output arrays."""
         n = len(q_idx)
         data = np.zeros(n, dtype=cls._DTYPE)
 
@@ -284,6 +344,12 @@ class AlignmentBatch(Batch, HasIntervals):
     def build(cls, alignments: Iterable[Alignment]) -> 'AlignmentBatch':
         """
         Creates an AlignmentBatch from an iterable of Alignment objects.
+
+        Args:
+            alignments: An iterable of ``Alignment`` objects.
+
+        Returns:
+            A new ``AlignmentBatch``.
         """
         # Avoid copy if already a list/tuple
         if isinstance(alignments, (list, tuple)):
@@ -352,16 +418,18 @@ class AlignmentBatch(Batch, HasIntervals):
 
     @classmethod
     def zeros(cls, n: int) -> 'AlignmentBatch':
+        """Creates a batch of *n* empty placeholder alignments."""
         return cls(
             data=np.zeros(n, dtype=cls._DTYPE),
             cigars=np.full(n, None, dtype=object),
             qualifiers=np.full(n, None, dtype=object),
-            query_ids=np.empty(0, dtype=object),  # No ID mapping by default
-            target_ids=np.empty(0, dtype=object)
+            query_ids=np.empty(0, dtype='S1'),  # No ID mapping by default
+            target_ids=np.empty(0, dtype='S1')
         )
 
     @classmethod
     def empty(cls) -> 'AlignmentBatch':
+        """Creates an empty AlignmentBatch."""
         return cls.zeros(0)
 
     @property
@@ -369,6 +437,7 @@ class AlignmentBatch(Batch, HasIntervals):
 
     @classmethod
     def concat(cls, batches: Iterable['AlignmentBatch']) -> 'AlignmentBatch':
+        """Concatenates multiple alignment batches."""
         batches = list(batches)
         if not batches: return cls.zeros(0)
         
@@ -379,33 +448,19 @@ class AlignmentBatch(Batch, HasIntervals):
         
         # 2. ID Mapping Resolution
         # We need to unify the ID maps if they differ.
-        # Strict approach: If maps differ, we must re-map indices.
-        # Heuristic: Check if all share same map (common case in pipe).
         first = batches[0]
-        remapping_needed = False
-        
-        # Simple check: are maps identical objects or content?
-        # For now, fast path only if objects are identical or None
-        # TODO: Implement robust ID unification for mixed sources
-        
-        # Naive implementation: just take the first non-empty map or merge?
-        # For safety/correctness in this refactor, if we detect potential mismatch,
-        # we might fallback to object rebuild OR (better) unification.
-        # But `from_alignments` (build) does full deduplication.
-        
-        # Let's assume consistent IDs for the "fast path" optimization context
-        # If heterogeneous, we might need a slower path.
-        
-        # For now, we use the first valid ID map.
         q_ids = first.query_ids
         t_ids = first.target_ids
         
         return cls(data, cigars, qualifiers, q_ids, t_ids)
 
     @property
-    def nbytes(self) -> int: return self._data.nbytes + self._cigars.nbytes + self._qualifiers.nbytes
+    def nbytes(self) -> int:
+        """Returns the total memory usage in bytes."""
+        return self._data.nbytes + self._cigars.nbytes + self._qualifiers.nbytes
 
     def copy(self) -> 'AlignmentBatch':
+        """Returns a deep copy of the batch."""
         return self.__class__(self._data.copy(), self._cigars.copy(), self._qualifiers.copy(), 
                               self.query_ids, self.target_ids)
 
@@ -531,7 +586,11 @@ class AlignmentBatch(Batch, HasIntervals):
             A new sorted AlignmentBatch.
         """
         # Now we map the 'by' string to our internal fields safely
-        perm = np.argsort(self._data[self.Field(by)])
+        try:
+            perm = np.argsort(self._data[self.Field(by)])
+        except ValueError: # Fallback for unknown fields or properties
+             raise ValueError(f"Unknown sort key: {by}")
+             
         if not ascending: perm = perm[::-1]
         return self[perm]
 

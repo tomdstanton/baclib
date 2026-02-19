@@ -30,6 +30,7 @@ class Aggregator(IntEnum):
 
 
 class AttributeSource(IntEnum):
+    """Whether a graph weight is sourced from an edge or a node attribute."""
     EDGE = 0
     NODE = 1
 
@@ -81,6 +82,10 @@ class CsGraphPolicy:
 
 
 class CsGraphBuilder:
+    """Constructs scipy CSR matrices from a ``Graph`` according to a ``CsGraphPolicy``.
+
+    Results are cached on the ``Graph`` for repeated queries.
+    """
     _MAX_PENALTY = 1e12
 
     @classmethod
@@ -156,6 +161,7 @@ class CsGraphBuilder:
 
 
 class PathAlgorithm(str, Enum):
+    """Shortest-path algorithm selector wrapping scipy.sparse.csgraph routines."""
     DIJKSTRA = 'D'
     BELLMAN_FORD = 'BF'
     JOHNSON = 'J'
@@ -173,6 +179,10 @@ class PathAlgorithm(str, Enum):
 
 
 class PathFinder(CsGraphBuilder):
+    """Shortest-path and traversal queries over a weighted ``Graph``.
+
+    Inherits ``CsGraphBuilder`` to transparently build and cache CSR matrices.
+    """
     _REGISTRY: dict[PathAlgorithm, Callable] = {
         PathAlgorithm.DIJKSTRA: csgraph.dijkstra,
         PathAlgorithm.FLOYD_WARSHALL: csgraph.floyd_warshall,

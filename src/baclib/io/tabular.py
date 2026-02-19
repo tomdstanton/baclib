@@ -1,3 +1,4 @@
+"""Readers and writers for tabular bioinformatics formats: BED, GFF3, PAF, and VCF."""
 from abc import abstractmethod
 from typing import Union, Generator
 
@@ -8,7 +9,7 @@ from baclib.containers.record import Record, Feature, FeatureBatch, FeatureKey, 
 from baclib.containers.mutations import Mutation, MutationBatch
 from baclib.containers.seq import Seq, SeqBatch
 from baclib.core.interval import Interval, IntervalBatch
-from baclib.io import BaseWriter, BaseReader, SeqFile, Qualifier
+from baclib.io import BaseWriter, BaseReader, SeqFile, Qualifier, SeqFileFormat
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
@@ -63,6 +64,11 @@ class TabularReader(BaseReader):
         for parts in self._read_parts(): yield parse(parts)
 
     def batches(self, size: int = 1024):
+        """Yields batches of parsed items.
+
+        Args:
+           size: Maximum items per batch.
+        """
         batch_parts = []
         for parts in self._read_parts():
             batch_parts.append(parts)
@@ -72,9 +78,7 @@ class TabularReader(BaseReader):
         if batch_parts: yield self._make_batch_from_parts(batch_parts)
 
     def _make_batch(self, items: list):
-        """
-        Creates a batch from a list of items.
-        """
+        """Creates a batch from a list of items."""
         return items
     
     def _make_batch_from_parts(self, parts_list: list[list[bytes]]):
@@ -96,7 +100,7 @@ class TabularReader(BaseReader):
         pass
 
 
-@SeqFile.register(SeqFile.Format.BED, extensions=['.bed'])
+@SeqFile.register(SeqFileFormat.BED, extensions=['.bed'])
 class BedReader(TabularReader):
     """
     Reader for BED format files.
@@ -131,6 +135,7 @@ class BedReader(TabularReader):
 
     @classmethod
     def sniff(cls, s: bytes) -> bool:
+        """Checks if input bytes look like BED format."""
         try:
             for line in s.splitlines():
                 if not line.strip() or line.startswith((b'track', b'browser', b'#')): continue
@@ -173,12 +178,12 @@ class BedReader(TabularReader):
             qualifiers_collection.append(quals)
             
         intervals = IntervalBatch(starts, ends, strands, sort=False)
-        qualifiers = QualifierBatch.from_qualifiers(qualifiers_collection)
+        qualifiers = QualifierBatch.build(qualifiers_collection)
         
         return FeatureBatch(intervals, keys, qualifiers)
 
 
-@SeqFile.register(SeqFile.Format.BED)
+@SeqFile.register(SeqFileFormat.BED)
 class BedWriter(BaseWriter):
     """
     Writer for BED format files.
@@ -210,7 +215,7 @@ class BedWriter(BaseWriter):
             self._handle.write(line)
 
 
-@SeqFile.register(SeqFile.Format.GFF, extensions=['.gff', '.gff3'])
+@SeqFile.register(SeqFileFormat.GFF, extensions=['.gff', '.gff3'])
 class GffReader(TabularReader):
     """
     Reader for GFF3 format files.
@@ -242,7 +247,9 @@ class GffReader(TabularReader):
         return Feature(Interval(start, end, parts[6]), parts[2], qualifiers=quals)
     
     @classmethod
-    def sniff(cls, s: bytes) -> bool: return s.startswith(b'##gff')
+    def sniff(cls, s: bytes) -> bool:
+        """Checks if input bytes look like GFF3 format."""
+        return s.startswith(b'##gff')
 
     def _make_batch(self, items: list) -> FeatureBatch:
         return FeatureBatch.from_features(items)
@@ -278,12 +285,12 @@ class GffReader(TabularReader):
             qualifiers_collection.append(quals)
             
         intervals = IntervalBatch(starts, ends, strands, sort=False)
-        qualifiers = QualifierBatch.from_qualifiers(qualifiers_collection)
+        qualifiers = QualifierBatch.build(qualifiers_collection)
         
         return FeatureBatch(intervals, keys, qualifiers)
 
 
-@SeqFile.register(SeqFile.Format.GFF)
+@SeqFile.register(SeqFileFormat.GFF)
 class GffWriter(BaseWriter):
     """
     Writer for GFF3 format files.
@@ -340,7 +347,7 @@ class GffWriter(BaseWriter):
             b"\t".join([seq_id, source, kind_bytes, str(start).encode('ascii'), str(end).encode('ascii'), str(score).encode('ascii'), strand, str(phase).encode('ascii'), attr_block]) + b"\n")
 
 
-@SeqFile.register(SeqFile.Format.PAF, extensions=['.paf'])
+@SeqFile.register(SeqFileFormat.PAF, extensions=['.paf'])
 class PafReader(TabularReader):
     """
     Reader for PAF (Pairwise mApping Format) files.
@@ -437,6 +444,7 @@ class PafReader(TabularReader):
     
     @classmethod
     def sniff(cls, s: bytes) -> bool:
+        """Checks if input bytes look like PAF format."""
         try:
             line = s.split(b'\n', 1)[0]
             parts = line.split(b'\t')
@@ -446,7 +454,7 @@ class PafReader(TabularReader):
             return False
     
 
-@SeqFile.register(SeqFile.Format.PAF)
+@SeqFile.register(SeqFileFormat.PAF)
 class PafWriter(BaseWriter):
     """
     Writer for PAF (Pairwise mApping Format) files.
@@ -456,6 +464,11 @@ class PafWriter(BaseWriter):
         ...     w.write(alignment_batch)
     """
     def write_one(self, item: Union[Alignment, AlignmentBatch]):
+        """Writes a single Alignment or a Batch.
+
+        Args:
+            item: ``Alignment`` or ``AlignmentBatch``.
+        """
         if isinstance(item, AlignmentBatch):
             self.write_batch(item)
         elif isinstance(item, Alignment):
@@ -493,6 +506,11 @@ class PafWriter(BaseWriter):
         self._handle.write(b"\t".join(parts) + b"\n")
 
     def write_batch(self, batch: AlignmentBatch):
+        """Writes an AlignmentBatch efficiently.
+
+        Args:
+           batch: ``AlignmentBatch`` to write.
+        """
         n = len(batch)
         if n == 0: return
         
@@ -574,7 +592,7 @@ class PafWriter(BaseWriter):
                 parts.append(k + b":" + type_char + b":" + val_bytes)
 
 
-@SeqFile.register(SeqFile.Format.VCF, extensions=['.vcf'])
+@SeqFile.register(SeqFileFormat.VCF, extensions=['.vcf'])
 class VcfReader(TabularReader):
     """
     Reader for VCF (Variant Call Format) files.
@@ -634,6 +652,7 @@ class VcfReader(TabularReader):
 
     @classmethod
     def sniff(cls, s: bytes) -> bool:
+        """Checks if input bytes look like VCF format."""
         return s.startswith(b'##fileformat=VCF')
 
     def _make_batch(self, items: list) -> MutationBatch:
@@ -675,21 +694,27 @@ class VcfReader(TabularReader):
             row_quals.append((b'source', parts[0]))
             qualifiers_collection.append(row_quals)
             
-        qualifiers = QualifierBatch.from_qualifiers(qualifiers_collection)
+        qualifiers = QualifierBatch.build(qualifiers_collection)
         
         return MutationBatch(intervals, ref_seqs, alt_seqs, qualifiers=qualifiers)
 
 
-@SeqFile.register(SeqFile.Format.VCF)
+@SeqFile.register(SeqFileFormat.VCF)
 class VcfWriter(BaseWriter):
     """
     Writer for VCF files.
     """
     def write_header(self):
+        """Writes a minimal VCF header."""
         self._handle.write(b"##fileformat=VCFv4.2\n")
         self._handle.write(b"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
 
     def write_one(self, item: Union[Mutation, MutationBatch]):
+        """Writes a Mutation or MutationBatch.
+
+        Args:
+            item: ``Mutation`` or ``MutationBatch``.
+        """
         if isinstance(item, MutationBatch):
             self.write_batch(item)
         elif isinstance(item, Mutation):
@@ -732,6 +757,7 @@ class VcfWriter(BaseWriter):
         self._handle.write(row)
 
     def write_batch(self, batch: MutationBatch):
+        """Writes a MutationBatch."""
         for i in range(len(batch)):
             # TODO: Optimize batch writing
             self._write_mutation(batch[i])

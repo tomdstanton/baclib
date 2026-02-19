@@ -1,3 +1,4 @@
+"""Readers and writers for GenBank and EMBL flat-file formats (INSDC feature table)."""
 from typing import List, BinaryIO, Generator, Tuple
 from re import compile as regex
 
@@ -5,18 +6,10 @@ from baclib.core.alphabet import Alphabet
 from baclib.containers.record import Record, Feature, RecordBatch, FeatureKey
 from baclib.containers.seq import Seq
 from baclib.core.interval import Interval
-from baclib.io import BaseReader, BaseWriter, SeqFile
+from baclib.io import BaseReader, BaseWriter, SeqFile, SeqFileFormat
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
-from baclib.containers.record import Record, Feature, RecordBatch, FeatureKey
-from baclib.containers.seq import Seq
-from baclib.core.interval import Interval
-from baclib.io import BaseReader, SeqFile
-
-
-# Classes --------------------------------------------------------------------------------------------------------------
-
 class InsdcReader(BaseReader):
     """
     Base reader for INSDC formats (GenBank, EMBL, DDBJ).
@@ -31,11 +24,22 @@ class InsdcReader(BaseReader):
     _FEATURE_TABLE_PREFIX = b'' # e.g. b'FT ' for EMBL, empty for GenBank
 
     def __init__(self, handle: BinaryIO, alphabet: Alphabet = None):
+        """Initializes the INSDC reader.
+
+        Args:
+            handle: Binary file handle.
+            alphabet: Alphabet to use detection if None).
+        """
         super().__init__(handle)
         self._alphabet = alphabet
         self._base = 1
 
     def __iter__(self) -> Generator[Record, None, None]:
+        """Iterates over records.
+
+        Yields:
+            ``Record`` objects.
+        """
         for chunk in self._read_chunks():
             try:
                 yield self._parse_record_chunk(chunk)
@@ -44,6 +48,14 @@ class InsdcReader(BaseReader):
                 pass
 
     def batches(self, size: int = 1024) -> Generator[RecordBatch, None, None]:
+        """Reads records in batches.
+
+        Args:
+            size: Maximum records per batch.
+
+        Yields:
+            ``RecordBatch`` objects.
+        """
         chunks = []
         for chunk in self._read_chunks():
             chunks.append(chunk)
@@ -343,7 +355,7 @@ class InsdcReader(BaseReader):
         commit_feature()
 
 
-@SeqFile.register(SeqFile.Format.GENBANK, extensions=['.gb', '.gbk', '.genbank'])
+@SeqFile.register(SeqFileFormat.GENBANK, extensions=['.gb', '.gbk', '.genbank'])
 class GenbankReader(InsdcReader):
     """
     GenBank Format Reader.
@@ -375,6 +387,7 @@ class GenbankReader(InsdcReader):
         return meta_data.splitlines(), []
 
     def _parse_header(self, lines: List[bytes]) -> Tuple[bytes, bytes, List[Tuple[bytes, bytes]]]:
+        """Parses the LOCUS, DEFINITION, and SOURCE lines."""
         name = b'unknown'
         description = b''
         qualifiers = []
@@ -389,10 +402,12 @@ class GenbankReader(InsdcReader):
         return name, description, qualifiers
     
     @classmethod
-    def sniff(cls, s: bytes) -> bool: return b'LOCUS' in s[:100]
+    def sniff(cls, s: bytes) -> bool:
+        """Checks if the input bytes look like a GenBank file."""
+        return b'LOCUS' in s[:100]
 
 
-@SeqFile.register(SeqFile.Format.EMBL, extensions=['.embl'])
+@SeqFile.register(SeqFileFormat.EMBL, extensions=['.embl'])
 class EmblReader(InsdcReader):
     """
     EMBL Format Reader.
@@ -437,6 +452,7 @@ class EmblReader(InsdcReader):
         return header, features
 
     def _parse_header(self, lines: List[bytes]) -> Tuple[bytes, bytes, List[Tuple[bytes, bytes]]]:
+        """Parses ID, DE, and OS lines from EMBL header."""
         name = b'unknown'
         description = b''
         qualifiers = []
@@ -456,6 +472,7 @@ class EmblReader(InsdcReader):
 
     @classmethod
     def sniff(cls, s: bytes) -> bool: 
+        """Checks if the input bytes look like an EMBL file."""
         return b'ID' in s[:100] and b'; SV' in s[:200]
 
 
@@ -520,6 +537,7 @@ class InsdcWriter(BaseWriter):
                 self._write_qualifier(key, val)
 
     def _format_location(self, interval: Interval) -> str:
+        """Formats an Interval into an INSDC location string (strings are 1-based inclusive)."""
         # 1-based inclusive
         start = interval.start + 1
         end = interval.end
@@ -609,12 +627,18 @@ class InsdcWriter(BaseWriter):
         self._handle.write(line + b'\n')
 
     def write_one(self, record: Record):
+        """Writes a single ``Record`` to the handle.
+
+        Args:
+            record: The record to write.
+        """
         # Implemented by subclasses (Header, Sequence, Terminator)
         raise NotImplementedError
 
 
-@SeqFile.register(SeqFile.Format.GENBANK, extensions=['.gb', '.gbk', '.genbank'])
+@SeqFile.register(SeqFileFormat.GENBANK, extensions=['.gb', '.gbk', '.genbank'])
 class GenbankWriter(InsdcWriter):
+    """Writer for GenBank flat-file format."""
     def write_one(self, record: Record):
         # Header
         # LOCUS       Action_17                671 bp    DNA     linear   PLN 18-FEB-2026
@@ -710,8 +734,9 @@ class GenbankWriter(InsdcWriter):
             self.write_line(line_start + seq_str)
 
 
-@SeqFile.register(SeqFile.Format.EMBL, extensions=['.embl'])
+@SeqFile.register(SeqFileFormat.EMBL, extensions=['.embl'])
 class EmblWriter(InsdcWriter):
+    """Writer for EMBL flat-file format."""
     _FT_PREFIX = b'FT'
     
     def write_one(self, record: Record):

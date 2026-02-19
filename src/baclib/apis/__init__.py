@@ -1,3 +1,4 @@
+"""REST API client base class with rate limiting, retries, and parallel request support."""
 import urllib.request
 import urllib.error
 import urllib.parse

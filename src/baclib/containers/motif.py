@@ -1,3 +1,4 @@
+"""Containers for sequence motifs (PSSMs), background models, and motif scan hits."""
 from typing import Union, Optional, Iterable, Any
 
 import numpy as np
@@ -16,12 +17,15 @@ class Background(HasAlphabet):
     """
     Represents the background nucleotide frequencies.
 
+    Used to calculate log-odds scores for motifs. Can be uniform or estimated
+    from sequences or counts.
+
     Attributes:
         alphabet (Alphabet): The alphabet used.
-        data (np.ndarray): Array of probabilities.
+        data (np.ndarray): Array of probabilities summing to 1.0.
 
     Examples:
-        >>> bg = Background.uniform(Alphabet.dna())
+        >>> bg = Background.uniform(Alphabet.DNA)
         >>> bg.data
         array([0.25, 0.25, 0.25, 0.25], dtype=float32)
     """
@@ -34,14 +38,34 @@ class Background(HasAlphabet):
         self._alphabet = None
 
     @property
-    def alphabet(self) -> Alphabet: return self._alphabet
+    def alphabet(self) -> Alphabet:
+        """Returns the alphabet.
+
+        Returns:
+            The ``Alphabet`` object.
+        """
+        return self._alphabet
 
     @property
-    def data(self) -> np.ndarray: return self._data
+    def data(self) -> np.ndarray:
+        """Returns the background probabilities.
+
+        Returns:
+            A read-only numpy array of floats.
+        """
+        return self._data
 
     @classmethod
     def from_counts(cls, counts: np.ndarray, alphabet: Alphabet = None) -> 'Background':
-        """Creates a Background from raw counts."""
+        """Creates a Background model from raw counts.
+
+        Args:
+            counts: Array of counts corresponding to alphabet symbols.
+            alphabet: The ``Alphabet`` (defaults to DNA).
+
+        Returns:
+            A new ``Background`` instance.
+        """
         alphabet = alphabet or cls._DEFAULT_ALPHABET
         assert len(counts) == len(alphabet)
         new = cls()
@@ -52,12 +76,26 @@ class Background(HasAlphabet):
 
     @classmethod
     def from_seq(cls, seq: Union[Seq, SeqBatch]) -> 'Background':
-        """Creates a Background from a sequence or batch."""
+        """Estimates background frequencies from a sequence or batch.
+
+        Args:
+            seq: A ``Seq`` or ``SeqBatch``.
+
+        Returns:
+            A new ``Background`` instance.
+        """
         return cls.from_counts(np.bincount(seq.encoded), seq.alphabet)
 
     @classmethod
     def uniform(cls, alphabet: Alphabet = None) -> 'Background':
-        """Creates a uniform Background."""
+        """Creates a uniform Background model (equal probability for all symbols).
+
+        Args:
+            alphabet: The ``Alphabet`` (defaults to DNA).
+
+        Returns:
+            A new ``Background`` instance.
+        """
         alphabet = alphabet or cls._DEFAULT_ALPHABET
         new = cls()
         new._alphabet = alphabet
@@ -72,19 +110,20 @@ class Background(HasAlphabet):
 
 class Motif:
     """
-    Standard Position Specific Scoring Matrix (PSSM).
+    Position Specific Scoring Matrix (PSSM) for sequence motifs.
+
+    Represents a motif model with log-odds scores relative to a background.
+    Supports P-value calculation using discretized dynamic programming.
 
     Attributes:
         name (bytes): Motif name.
-        background (Background): Background model.
-        pssm (np.ndarray): The scoring matrix.
+        background (Background): Background model used for scoring.
+        pssm (np.ndarray): The log-odds scoring matrix (Bases x Positions).
 
     Examples:
-        >>> bg = Background.uniform(Alphabet.dna())
-        >>> counts = np.array([[10, 0, 0, 0], [0, 10, 0, 0]]) # AA
-        >>> m = Motif.from_counts(b'polyA', counts.T, bg)
+        >>> m = Motif.sigma70_35()
         >>> len(m)
-        2
+        6
     """
     _DTYPE = np.float32
     _DEFAULT_GRANULARITY = 1000
@@ -122,22 +161,48 @@ class Motif:
         return len(self._scoring.shape[1])
 
     @property
-    def batch(self) -> type['Batch']: return MotifBatch
+    def batch(self) -> type['Batch']:
+        """Returns the batch type for this class.
+
+        Returns:
+            The ``MotifBatch`` class.
+        """
+        return MotifBatch
 
     @property
     def name(self) -> bytes:
+        """Returns the motif name as bytes.
+
+        Returns:
+            Motif name.
+        """
         return self._name
 
     @property
     def background(self) -> Background:
+        """Returns the background model.
+
+        Returns:
+            The ``Background`` object.
+        """
         return self._background
 
     @property
     def pssm(self) -> np.ndarray:
+        """Returns the log-odds scoring matrix.
+
+        Returns:
+            A (Bases, Positions) numpy array.
+        """
         return self._scoring
 
     @property
     def pssm_rc(self) -> Optional[np.ndarray]:
+        """Returns the reverse complement PSSM.
+
+        Returns:
+            A (Bases, Positions) numpy array or ``None`` if alphabet has no complement.
+        """
         comp = self.background.alphabet.complement
         if comp is None: return None
         return np.ascontiguousarray(self._scoring[comp, ::-1])
@@ -145,7 +210,18 @@ class Motif:
     @classmethod
     def from_counts(cls, name: bytes, counts: np.ndarray, background: Background,
                     granularity: int = _DEFAULT_GRANULARITY, pseudocount: float = _DEFAULT_PSEUDOCOUNT) -> 'Motif':
-        """Creates a Motif from a count matrix (Rows=Bases, Cols=Positions)."""
+        """Creates a Motif from a count matrix (Rows=Bases, Cols=Positions).
+
+        Args:
+            name: Motif name.
+            counts: Matrix of observation counts.
+            background: Background model.
+            granularity: Discretization factor for P-value calculation.
+            pseudocount: Pseudocount added to avoid zero probabilities.
+
+        Returns:
+            A new ``Motif``.
+        """
         adjusted = counts + pseudocount
         frequencies = adjusted / adjusted.sum(axis=0)
         return cls.from_frequencies(name, frequencies, background, granularity, pseudocount, counts)
@@ -154,7 +230,19 @@ class Motif:
     def from_frequencies(cls, name: bytes, frequencies: np.ndarray, background: Background,
                          granularity: int = _DEFAULT_GRANULARITY, pseudocount: float = _DEFAULT_PSEUDOCOUNT,
                          counts: np.ndarray = None) -> 'Motif':
-        """Creates a Motif from a frequency matrix."""
+        """Creates a Motif from a frequency matrix.
+
+        Args:
+            name: Motif name.
+            frequencies: Matrix of probabilities (columns sum to 1).
+            background: Background model.
+            granularity: Discretization factor for P-value calculation.
+            pseudocount: Pseudocount used in derivation (optional tracking).
+            counts: Original counts (optional tracking).
+
+        Returns:
+            A new ``Motif``.
+        """
         weights = frequencies / background.data[:, None]
         return cls.from_weights(name, weights, background, granularity, pseudocount, counts, frequencies)
 
@@ -163,7 +251,16 @@ class Motif:
                      granularity: int = _DEFAULT_GRANULARITY, pseudocount: float = _DEFAULT_PSEUDOCOUNT,
                      counts: np.ndarray = None,
                      frequencies: np.ndarray = None) -> 'Motif':
-        """Creates a Motif from a weight matrix."""
+        """Creates a Motif from a weight matrix (odds ratios).
+
+        Args:
+            name: Motif name.
+            weights: Matrix of odds ratios.
+            background: Background model.
+
+        Returns:
+            A new ``Motif``.
+        """
         with np.errstate(divide='ignore', invalid='ignore'):
             scores = np.log2(weights, dtype=cls._DTYPE)
 
@@ -180,11 +277,27 @@ class Motif:
     def from_scores(cls, name: bytes, scores: np.ndarray, background: Background,
                     granularity: int = _DEFAULT_GRANULARITY, pseudocount: float = _DEFAULT_PSEUDOCOUNT,
                     counts: np.ndarray = None, frequencies: np.ndarray = None, weights: np.ndarray = None) -> 'Motif':
-        """Creates a Motif from a log-odds score matrix."""
+        """Creates a Motif directly from a log-odds score matrix.
+
+        Args:
+            name: Motif name.
+            scores: Log-odds score matrix.
+            background: Background model.
+
+        Returns:
+            A new ``Motif``.
+        """
         return cls(name, scores, background, granularity, pseudocount, counts, frequencies, weights)
 
     def pdf(self) -> np.ndarray:
-        """Computes the probability density function of scores."""
+        """Computes the probability density function of scores.
+
+        Uses dynamic programming to compute the exact distribution of
+        discretized scores.
+
+        Returns:
+            An array where index corresponds to (score - min_score).
+        """
         if self._pdf is None:
             bg = self._background.data.astype(np.float64)
             self._pdf = _score_distribution_kernel(self._discrete, bg, self._min_score, self._max_score)
@@ -192,9 +305,13 @@ class Motif:
         return self._pdf
 
     def get_score(self, p_value: float) -> float:
-        """
-        Calculates the score threshold for a given P-value.
-        Uses discretized Dynamic Programming (TFM-PVALUE style).
+        """Calculates the score threshold for a given P-value.
+
+        Args:
+            p_value: Target P-value (e.g. 1e-4).
+
+        Returns:
+            The score threshold.
         """
         # Calculate CCDF (Survival Function) to find P-value
         # We walk backwards from the max score until sum(probs) >= p_value
@@ -210,9 +327,13 @@ class Motif:
         return threshold_int / self._granularity
 
     def get_pvalue(self, score: float) -> float:
-        """
-        Calculates the P-value for a given score.
-        Uses discretized Dynamic Programming (TFM-PVALUE style).
+        """Calculates the P-value for a given score.
+
+        Args:
+            score: The raw score.
+
+        Returns:
+            The probability of observing a score >= *score* by chance.
         """
         target_int = int(round(score * self._granularity))
         idx = target_int - self._min_score
@@ -222,13 +343,16 @@ class Motif:
         return pdf[idx:].sum()
 
     def scan(self, seqs: Union[Seq, SeqBatch], pvalue_threshold: float = 1e-4) -> 'MotifHitBatch':
-        """Scans sequences for this motif."""
-        from baclib.engines.motif import MotifScanner
-        if isinstance(seqs, Seq): seqs = seqs.batch.build([seqs])
-        return MotifScanner(self).scan(seqs, pvalue_threshold)
+        """Scans sequences for this motif. Use ``MotifScanner`` for batch scanning.
+
+        Raises:
+            TypeError: Direct scanning not supported here.
+        """
+        raise TypeError("Use baclib.engines.motif.MotifScanner(motif).scan(seqs) instead.")
 
     @classmethod
     def sigma70_35(cls, bg: Background = None) -> 'Motif':
+        """Returns a built-in Sigma70 -35 box motif (E. coli)."""
         # -35 Motif Consensus: T T G A C A
         # Strong conservation at pos 0, 1, 2. Weaker at 3, 4, 5.
         counts = np.array([
@@ -246,6 +370,7 @@ class Motif:
 
     @classmethod
     def sigma70_10(cls, bg: Background = None) -> 'Motif':
+        """Returns a built-in Sigma70 -10 box motif (E. coli)."""
         # -10 Motif Consensus: T A T A A T
         # Very strong conservation at pos 1 (A) and 5 (T).
         # Pos 2 (T) is often variable (T or C).
@@ -266,11 +391,17 @@ class Motif:
 class MotifBatch(Batch):
     """
     Efficiently stores and scans multiple motifs.
+
+    Concatenates PSSMs into a single large matrix for vectorized scanning.
+
+    Args:
+        motifs: Iterable of ``Motif`` objects (must share alphabet).
     """
     __slots__ = ('_motifs', '_pssm_combined', '_pssm_rc_combined', '_offsets', '_max_suffixes', '_max_suffixes_rc')
 
     @classmethod
     def empty(cls) -> 'MotifBatch':
+        """Creates an empty MotifBatch."""
         return cls([])
 
     def __init__(self, motifs: Iterable[Motif]):
@@ -318,10 +449,12 @@ class MotifBatch(Batch):
 
     @classmethod
     def build(cls, components: Iterable[object]) -> 'Batch':
+        """Constructs a MotifBatch from an iterable of Motifs."""
         return cls(components)
 
     @classmethod
     def concat(cls, batches: Iterable['MotifBatch']) -> 'MotifBatch':
+        """Concatenates multiple MotifBatch objects."""
         # Simple list concatenation and rebuild
         all_motifs = []
         for b in batches:
@@ -329,26 +462,30 @@ class MotifBatch(Batch):
         return cls(all_motifs)
 
     @property
-    def n_motifs(self) -> int: return len(self._motifs)
+    def n_motifs(self) -> int:
+        """Returns the number of motifs in the batch."""
+        return len(self._motifs)
 
     def scan(self, seqs: SeqBatch, pvalue_threshold: float = 1e-4) -> 'MotifHitBatch':
-        from baclib.engines.motif import MotifScanner
-        return MotifScanner(self).scan(seqs, pvalue_threshold)
+        """Scans sequences for these motifs. Use ``MotifScanner`` for batch scanning.
+
+        Raises:
+            TypeError: Direct scanning not supported.
+        """
+        raise TypeError("Use baclib.engines.motif.MotifScanner(batch).scan(seqs) instead.")
 
     @property
     def nbytes(self) -> int:
+        """Returns the total memory usage in bytes."""
         size = self._offsets.nbytes + self._max_suffixes.nbytes + self._pssm_combined.nbytes
         if self._pssm_rc_combined is not None: size += self._pssm_rc_combined.nbytes
         if self._max_suffixes_rc is not None: size += self._max_suffixes_rc.nbytes
         return size
 
     def copy(self) -> 'MotifBatch':
+        """Returns a copy of the batch."""
         # Motifs are effectively immutable, but we can return a new wrapper
         return self.__class__(list(self._motifs))
-
-    @classmethod
-    def empty(cls) -> 'MotifBatch':
-        return cls([])
 
     @property
     def component(self): return Motif
@@ -397,6 +534,7 @@ class MotifBatch(Batch):
 
     @classmethod
     def sigma70(cls, bg: Background = None) -> 'MotifBatch':
+        """Returns a batch containing Sigma70 -35 and -10 motifs."""
         dna = Alphabet.DNA
         if bg is not None:
             if bg.alphabet != dna: raise ValueError('Background alphabet must be dna for this motif')
@@ -407,7 +545,19 @@ class MotifBatch(Batch):
 
 class MotifHit(Feature):
     """
-    Represents a single occurrence of a Motif.
+    Represents a single occurrence of a Motif in a sequence.
+
+    Args:
+        interval: The location and strand of the hit.
+        score: The log-odds score.
+        motif: The matching ``Motif`` object.
+        pvalue: The P-value of the score (calculated lazily if ``None``).
+        qualifiers: Optional qualifiers.
+
+    Examples:
+        >>> hit = MotifHit(Interval(10, 20), 12.5, motif)
+        >>> hit.pvalue
+        1.2e-5
     """
     __slots__ = ('score', 'motif', '_pvalue')
 
@@ -419,14 +569,22 @@ class MotifHit(Feature):
         self._pvalue = pvalue
 
     @property
-    def batch(self) -> type['Batch']: return MotifHitBatch
+    def batch(self) -> type['Batch']:
+        """Returns the batch type for this class.
+
+        Returns:
+            The ``MotifHitBatch`` class.
+        """
+        return MotifHitBatch
 
     @property
     def name(self) -> bytes:
+        """Returns the motif name."""
         return self.motif.name
 
     @property
     def pvalue(self) -> float:
+        """Returns the P-value of the hit score."""
         if self._pvalue is None: self._pvalue = self.motif.get_pvalue(self.score)
         return self._pvalue
 
@@ -450,26 +608,29 @@ class MotifHit(Feature):
         return f"MotifHit({self.name.decode(Alphabet.ENCODING)}, score={self.score:.2f}, {self.interval})"
 
     def copy(self) -> 'MotifHit':
+        """Returns a deep copy of the hit."""
         return MotifHit(self.interval, self.score, self.motif, self._pvalue, list(self.qualifiers))
 
     def shift(self, x: int, y: int = None) -> 'MotifHit':
+        """Shifts the hit coordinates."""
         return MotifHit(self.interval.shift(x, y), self.score, self.motif, self._pvalue, list(self.qualifiers))
 
     def reverse_complement(self, parent_length: int) -> 'MotifHit':
+        """Reverse complements the hit."""
         return MotifHit(self.interval.reverse_complement(parent_length), self.score, self.motif, self._pvalue,
                         list(self.qualifiers))
 
 
 class MotifHitBatch(Batch):
     """
-    Container for motif scan results.
+    Columnar container for motif scan results.
 
     Attributes:
-        seq_indices (np.ndarray): Indices of sequences in the batch.
-        positions (np.ndarray): Start positions of hits.
-        scores (np.ndarray): Scores of hits.
-        strands (np.ndarray): Strands of hits.
-        motif_indices (np.ndarray): Indices of the motif in the MotifBatch (optional).
+        seq_indices: Index of the sequence in the scanned batch.
+        positions: Start position of the hit.
+        scores: Log-odds score.
+        strands: Strand of the hit.
+        motif_indices: Index of the motif in the scanner's batch (optional).
     """
     __slots__ = ('seq_indices', 'positions', 'scores', 'strands', 'motif_indices', '_source')
 
@@ -483,15 +644,21 @@ class MotifHitBatch(Batch):
 
     @classmethod
     def new_empty(cls, source):
+        """Creates an empty batch for a given source."""
         return cls(np.array([], dtype=np.int32), np.array([], dtype=np.int32),
                    np.array([], dtype=np.float32), np.array([], dtype=np.int8), source)
 
     @classmethod
     def build(cls, components: Iterable[object]) -> 'Batch':
+        """
+        Raises:
+            NotImplementedError: Hits should be created via scanning.
+        """
         raise NotImplementedError("MotifHitBatch should be created via Motif.scan()")
 
     @classmethod
     def concat(cls, batches: Iterable['MotifHitBatch']) -> 'MotifHitBatch':
+        """Concatenates multiple hit batches."""
         batches = list(batches)
         if not batches: raise ValueError("Cannot concat empty list")
         # Find first valid source
@@ -504,6 +671,8 @@ class MotifHitBatch(Batch):
         
         # Handle motif indices if present
         mi = None
+        # Check first non-empty batch for motif indices logic
+        first = batches[0]
         if first.motif_indices is not None:
              mi = np.concatenate([b.motif_indices for b in batches])
              
@@ -511,14 +680,17 @@ class MotifHitBatch(Batch):
 
     @property
     def nbytes(self) -> int:
+        """Returns total memory usage in bytes."""
         base = self.seq_indices.nbytes + self.positions.nbytes + self.scores.nbytes + self.strands.nbytes
         return base + (self.motif_indices.nbytes if self.motif_indices is not None else 0)
 
     def copy(self) -> 'MotifHitBatch':
+        """Returns a copy of the batch."""
         return self.__class__(self.seq_indices.copy(), self.positions.copy(), self.scores.copy(), self.strands.copy(), self._source, self.motif_indices.copy() if self.motif_indices is not None else None)
 
     @classmethod
     def empty(cls) -> 'MotifHitBatch':
+        """Creates an empty hit batch."""
         return cls.new_empty(None)
 
     @property
@@ -556,7 +728,12 @@ class MotifHitBatch(Batch):
     def to_features(self, seq_batch: SeqBatch) -> list[list[MotifHit]]:
         """
         Converts hits to Feature objects, grouped by sequence index.
-        Returns a list of lists, where list[i] contains features for seq_batch[i].
+
+        Args:
+            seq_batch: The ``SeqBatch`` that was scanned (for context).
+
+        Returns:
+            A list of lists, where `list[i]` contains features for `seq_batch[i]`.
         """
         n_seqs = len(seq_batch)
         features_by_seq = [[] for _ in range(n_seqs)]
@@ -576,40 +753,3 @@ class MotifHitBatch(Batch):
                 MotifHit(Interval(pos, pos + len(motif), strand), score, motif)
             )
         return features_by_seq
-
-
-# Functions ------------------------------------------------------------------------------------------------------------
-def _calc_max_suffix(pssm: np.ndarray) -> np.ndarray:
-    """Calculates the maximum possible remaining score for lookahead pruning."""
-    max_per_col = pssm.max(axis=0)
-    suffix = np.cumsum(max_per_col[::-1])[::-1]
-    return np.concatenate((suffix, np.array([0.0], dtype=pssm.dtype)))
-
-
-@jit(nopython=True, cache=True, nogil=True)
-def _score_distribution_kernel(int_pssm, bg_probs, min_score, max_score):
-    """
-    Computes the exact distribution of PSSM scores using Dynamic Programming.
-    Complexity: O(L * ScoreRange * 4)
-    """
-    n_bases, length = int_pssm.shape
-    # dp[s] = probability of getting score 's' (shifted by current_min)
-    # Start with score 0 having prob 1.0
-    current_dist = np.zeros(1, dtype=np.float64)
-    current_dist[0] = 1.0
-    current_min = 0
-
-    for col in range(length):
-        col_scores = int_pssm[:, col]
-        col_min = np.min(col_scores)
-        col_max = np.max(col_scores)
-        new_len = len(current_dist) + (col_max - col_min)
-        next_dist = np.zeros(new_len, dtype=np.float64)
-        for b in range(n_bases):
-            score = col_scores[b]
-            prob = bg_probs[b]
-            shift = score - col_min
-            next_dist[shift : shift + len(current_dist)] += current_dist * prob
-        current_dist = next_dist
-        current_min += col_min
-    return current_dist

@@ -16,10 +16,13 @@ else:
 
 
 # Exceptions and Warnings ----------------------------------------------------------------------------------------------
-class AlphabetError(Exception): pass
+class AlphabetError(Exception):
+    """Raised when an alphabet is invalid or an operation is incompatible with the alphabet."""
 
 
-class TranslationError(AlphabetError): pass
+class TranslationError(AlphabetError):
+    """Raised when nucleotide-to-amino-acid translation fails (e.g. invalid codon)."""
+
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
@@ -135,7 +138,11 @@ class Alphabet:
 
     @property
     def bits_per_symbol(self) -> int:
-        """Returns the number of bits required to represent a symbol in this alphabet."""
+        """Returns the number of bits required to represent a symbol in this alphabet.
+
+        Returns:
+            The number of bits (integer).
+        """
         return (len(self._data) - 1).bit_length()
 
     @property
@@ -242,14 +249,13 @@ class Alphabet:
         return np.frombuffer(text.translate(self._trans_table, delete=self._delete_bytes), dtype=self.DTYPE)
 
     def decode(self, encoded: np.ndarray) -> bytes:
-        """
-        Decodes an array of indices back to bytes.
+        """Decodes an array of indices back to bytes.
 
         Args:
-            encoded: The numpy array of indices.
+            encoded: The numpy array of indices (uint8).
 
         Returns:
-            The decoded bytes.
+            The decoded bytes string.
         """
         # Ensure uint8 for byte-wise translation
         if encoded.dtype != self.DTYPE:
@@ -299,7 +305,7 @@ class Alphabet:
 
         if isinstance(seq, Seq):
             packed = _pack_seq_kernel(seq.encoded, len(seq), bits)
-            return CompressedSeq(packed, len(seq), self, bits)
+            return self.new_compressed_seq(packed, len(seq), bits)
 
         if isinstance(seq, SeqBatch):
             data, starts, lengths = seq.arrays
@@ -313,7 +319,7 @@ class Alphabet:
                 np.cumsum(byte_lengths[:-1], out=packed_starts[1:])
 
             _pack_batch_fill_kernel(data, starts, lengths, packed_data, packed_starts, bits)
-            return CompressedSeqBatch(packed_data, packed_starts, lengths, self, bits)
+            return self.new_compressed_batch(packed_data, packed_starts, lengths, bits)
 
         raise TypeError(f"Cannot compress {type(seq)}")
 
@@ -340,6 +346,17 @@ class Alphabet:
         return Seq(data, self, _validation_token=self)
 
     def seq_from(self, data: Union['Seq', str, bytes, np.ndarray]) -> 'Seq':
+        """Creates a Seq object from various input types, ensuring correct encoding.
+
+        Args:
+            data: The input data. Can be a ``Seq``, string, bytes, or numpy array.
+
+        Returns:
+            A new ``Seq`` object with this alphabet.
+
+        Raises:
+            AlphabetError: If the input data contains symbols not in the alphabet.
+        """
         # 1. Handle Pre-encoded (Optimization for internal use)
         if isinstance(data, Seq):
             if data.alphabet != self: raise AlphabetError(f'Sequence has a different alphabet "{data.alphabet}"')
@@ -353,6 +370,11 @@ class Alphabet:
         return self.new_seq(self.encode(data))
 
     def empty_seq(self) -> 'Seq':
+        """Returns an empty sequence with this alphabet.
+
+        Returns:
+            An empty ``Seq``.
+        """
         return self.new_seq(np.empty(0, dtype=self.DTYPE))
 
     def random_seq(self, rng: np.random.Generator = None, length: int = None, min_len: int = 5, max_len: int = 5000,
@@ -393,6 +415,18 @@ class Alphabet:
         return SeqBatch(data, starts, lengths, self, _validation_token=self)
 
     def batch_from(self, data: Iterable['Seq'], deduplicate: bool = False) -> 'SeqBatch':
+        """Creates a SeqBatch from an iterable of sequences.
+
+        Args:
+            data: An iterable of ``Seq`` objects (must have this alphabet).
+            deduplicate: If ``True``, deduplicates identical sequences to save memory.
+
+        Returns:
+            A new ``SeqBatch``.
+
+        Raises:
+            AlphabetError: If any sequence has a different alphabet.
+        """
         # Optimization: Fast path for existing SeqBatch (Clone)
         if isinstance(data, SeqBatch):
             if data.alphabet != self: raise AlphabetError(
@@ -441,8 +475,46 @@ class Alphabet:
         return self.new_batch(data, starts, lengths)
 
     def empty_batch(self) -> 'SeqBatch':
+        """Returns an empty sequence batch with this alphabet.
+
+        Returns:
+            An empty ``SeqBatch``.
+        """
         return self.new_batch(
             np.empty(0, dtype=self.DTYPE), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32))
+
+    def zeros_batch(self, n: int) -> 'SeqBatch':
+        """Returns a SeqBatch of n zero-length sequences."""
+        return self.new_batch(
+            np.empty(0, dtype=self.DTYPE), np.zeros(n, dtype=np.int32), np.zeros(n, dtype=np.int32))
+
+    def new_compressed_seq(self, data: np.ndarray, length: int, bits: int) -> 'CompressedSeq':
+        """
+        Factory method. The ONLY valid way to create a CompressedSeq.
+        """
+        return CompressedSeq(data, length, self, bits, _validation_token=self)
+
+    def new_compressed_batch(self, data: np.ndarray, starts: np.ndarray, lengths: np.ndarray, bits: int) -> 'CompressedSeqBatch':
+        """
+        Factory method. The ONLY valid way to create a CompressedSeqBatch.
+        """
+        return CompressedSeqBatch(data, starts, lengths, self, bits, _validation_token=self)
+
+    def empty_compressed(self, bits: int = 2) -> 'CompressedSeqBatch':
+        """Returns an empty CompressedSeqBatch."""
+        return self.new_compressed_batch(
+            np.empty(0, dtype=np.uint8), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), bits
+        )
+
+    def zeros_compressed(self, n: int, bits: int = 2) -> 'CompressedSeqBatch':
+        """Returns a CompressedSeqBatch of n zero-length sequences."""
+        return self.new_compressed_batch(
+            np.empty(0, dtype=np.uint8),
+            np.zeros(n, dtype=np.int32),
+            np.zeros(n, dtype=np.int32),
+            bits
+        )
+
 
     def random_batch(self, rng: np.random.Generator = None, n_seqs: int = None, min_seqs: int = 1,
                      max_seqs: int = 1000, length: int = None, min_len: int = 10, max_len: int = 5_000_000,
@@ -498,8 +570,13 @@ class Alphabet:
         return self.new_batch(indices.astype(self.DTYPE, copy=False), starts, lengths_arr)
 
     def reverse_complement(self, seq: 'Seq') -> 'Seq':
-        """
-        Reverse complements the sequence if the alphabet has a complement.
+        """Returns the reverse complement of the sequence.
+
+        Args:
+            seq: The input sequence.
+
+        Returns:
+            A new ``Seq`` object (reverse complemented). Returns the input sequence unchanged if no complement is defined.
         """
         if self._complement is None: return seq
         # Use .encoded for direct numpy access (much faster than iterating reversed(seq))
@@ -541,6 +618,17 @@ class AlphabetProperty:
         self._data.flags.writeable = False
 
     def encode(self, seq: Union[Seq, SeqBatch]) -> np.ndarray:
+        """Encodes a sequence or batch into property values.
+
+        Args:
+            seq: The sequence or batch to encode.
+
+        Returns:
+            A numpy array of float values.
+
+        Raises:
+            ValueError: If the sequence alphabet does not match.
+        """
         if seq.alphabet != self._alphabet:
             raise ValueError(f"Seq alphabet {seq.alphabet} does not match alphabet {self._alphabet}")
         return self._data[seq.encoded]
@@ -581,6 +669,14 @@ class AlphabetConverter:
     TO_MURPHY_10: ClassVar['AlphabetConverter']
 
     def __init__(self, source: Alphabet, target: Alphabet, mapping: dict[bytes, bytes] = None, default: bytes = None):
+        """Initializes a converter between two alphabets.
+
+        Args:
+            source: Source alphabet.
+            target: Target alphabet.
+            mapping: Optional dictionary for custom symbol mapping.
+            default: Optional default value for unmapped symbols.
+        """
         self._source = source
         self._target = target
         self._table = self._build_table(source, target, mapping, default)
@@ -627,6 +723,18 @@ class AlphabetConverter:
         return table
 
     def convert(self, seq: Union[Seq, SeqBatch]) -> Union[Seq, SeqBatch]:
+        """Converts a sequence or batch to the target alphabet.
+
+        Args:
+            seq: Input sequence or batch.
+
+        Returns:
+            The converted sequence or batch.
+
+        Raises:
+            ValueError: If the input alphabet does not match source or target (for reverse conversion).
+            ValueError: If conversion results in invalid symbols.
+        """
         if seq.alphabet == self._source:
             table = self._table
             target_alpha = self._target
@@ -665,6 +773,12 @@ class GeneticCode:
     BACTERIA: ClassVar['GeneticCode']
 
     def __init__(self, table: bytes, starts: Iterable[bytes] = ()):
+        """Initializes a genetic code.
+
+        Args:
+            table: 64-byte ASCII string representing the translation table.
+            starts: Iterable of start codons (e.g. ``[b'ATG', b'GTG']``).
+        """
         # Optimization: Pre-encode the table to indices using lookup table directly
         self._data = self._AMINO._lookup_table[np.frombuffer(table, dtype=Alphabet.DTYPE)]
         # Populate stops and starts
@@ -691,10 +805,12 @@ class GeneticCode:
 
     @property
     def starts(self) -> np.ndarray:
+        """Boolean array indicating valid start codons (size 64)."""
         return self._starts
 
     @property
     def stops(self) -> np.ndarray:
+        """Boolean array indicating stop codons (size 64)."""
         return self._stops
 
     def __iter__(self):

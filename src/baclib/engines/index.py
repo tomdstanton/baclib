@@ -1,3 +1,4 @@
+"""Sequence indexing engines: MinHash sketching and sparse-map minimizer/syncmer indexes."""
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from typing import Union
@@ -122,6 +123,7 @@ class MinHashSketch(BaseIndex):
 
 
 class SparseMapIndexMode(IntEnum):
+    """Seeding strategy for sparse sequence indexing."""
     MINIMIZER = 0
     SYNCMER = 1
     DENSE = 2

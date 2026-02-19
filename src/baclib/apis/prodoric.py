@@ -1,3 +1,4 @@
+"""Client for the PRODORIC API, providing access to transcription factor binding site matrices and regulatory networks."""
 from typing import List, Optional, Union, Any, Dict, Iterator
 import json
 import urllib.parse
@@ -23,7 +24,7 @@ class ProdoricClient(ApiClient):
             requests_per_second=3
         )
 
-    def search_matrices(self, term: str) -> List[Dict[str, Any]]:
+    def search_motifs(self, term: str) -> List[Dict[str, Any]]:
         """
         Search for matrices by term (accession, name, organism).
         Returns a list of MatrixSearchResult objects (dicts).
@@ -36,7 +37,7 @@ class ProdoricClient(ApiClient):
         except Exception:
             return []
 
-    def get_matrix(self, accession: str) -> Optional[Motif]:
+    def get_motif(self, accession: str) -> Optional[Motif]:
         """
         Retrieve a matrix by accession (e.g. MX000001) and return a Motif object.
         """

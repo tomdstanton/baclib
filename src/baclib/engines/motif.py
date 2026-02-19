@@ -1,3 +1,4 @@
+"""Engines for motif scanning and de novo motif discovery using k-mer enrichment analysis."""
 from typing import Union, Iterable
 
 import numpy as np
@@ -169,7 +170,7 @@ class MotifFinder:
             if refine:
                 # 3b. Refine (The EM Step)
                 # Scan with a modest threshold to find variations of the motif
-                hits = m.scan(self.fg, pvalue_threshold=1e-3)
+                hits = MotifScanner(m).scan(self.fg, pvalue_threshold=1e-3)
 
                 if len(hits) > 5:  # Only update if we found decent support
                     # Accumulate actual sequences from hits into a new Count Matrix

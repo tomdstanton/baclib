@@ -1,3 +1,4 @@
+"""Variant calling engine for identifying SNPs, indels, and pileup-based consensus variants from alignments."""
 import numpy as np
 
 from baclib.containers.seq import SeqBatch

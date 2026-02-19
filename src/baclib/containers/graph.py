@@ -1,3 +1,4 @@
+"""Graph data structures for representing directed and undirected networks of genomic segments."""
 from typing import Any, Union, List, Dict, Set, Iterable
 
 import numpy as np
@@ -9,27 +10,27 @@ from baclib.core.interval import Strand
 # Classes --------------------------------------------------------------------------------------------------------------
 class Edge:
     """
-    Represents a directed edge between two nodes with optional attributes.
+    A directed edge between two nodes with strand orientation and attributes.
 
-    Attributes:
-        u (bytes): Source node ID.
-        v (bytes): Target node ID.
-        u_strand (Strand): Orientation of the source node.
-        v_strand (Strand): Orientation of the target node.
-        attributes (dict): Edge attributes.
+    Nodes can be specified as ``bytes`` IDs, strings, or objects with an
+    ``.id`` attribute — they are coerced to ``bytes`` internally.
+
+    Args:
+        u: Source node ID (or object with ``.id``).
+        v: Target node ID (or object with ``.id``).
+        u_strand: Orientation of the source node (default ``FORWARD``).
+        v_strand: Orientation of the target node (default ``FORWARD``).
+        attributes: Optional dictionary of edge attributes.
+
+    Examples:
+        >>> e = Edge(b'contig_1', b'contig_2')
+        >>> e.reverse()
+        Edge(contig_2(+)->contig_1(+))
     """
     __slots__ = ('_u', '_v', '_u_strand', '_v_strand', 'attributes')
 
     def __init__(self, u: Any, v: Any, u_strand: Union[Strand, int] = Strand.FORWARD, 
                  v_strand: Union[Strand, int] = Strand.FORWARD, attributes: dict[bytes, Any] = None):
-        """
-        Initializes an Edge.
-
-        Args:
-            u: Source node (or object with .id).
-            v: Target node (or object with .id).
-            attributes: Dictionary of edge attributes.
-        """
         self._u: bytes = self._coerce_node(u)  # Extract the pointer
         self._v: bytes = self._coerce_node(v)  # Extract the pointer
         self._u_strand = Strand(u_strand)
@@ -37,15 +38,49 @@ class Edge:
         self.attributes = attributes or {}
 
     @property
-    def batch(self) -> type['Batch']: return EdgeBatch
+    def batch(self) -> type['Batch']:
+        """Returns the batch type for this class.
+
+        Returns:
+            The ``EdgeBatch`` class.
+        """
+        return EdgeBatch
+
     @property
-    def u(self) -> bytes: return self._u
+    def u(self) -> bytes:
+        """Returns the source node ID.
+
+        Returns:
+            Source node as ``bytes``.
+        """
+        return self._u
+
     @property
-    def v(self) -> bytes: return self._v
+    def v(self) -> bytes:
+        """Returns the target node ID.
+
+        Returns:
+            Target node as ``bytes``.
+        """
+        return self._v
+
     @property
-    def u_strand(self) -> Strand: return self._u_strand
+    def u_strand(self) -> Strand:
+        """Returns the source node strand orientation.
+
+        Returns:
+            A ``Strand`` value.
+        """
+        return self._u_strand
+
     @property
-    def v_strand(self) -> Strand: return self._v_strand
+    def v_strand(self) -> Strand:
+        """Returns the target node strand orientation.
+
+        Returns:
+            A ``Strand`` value.
+        """
+        return self._v_strand
 
     @staticmethod
     def _coerce_node(obj: Any) -> bytes:
@@ -54,8 +89,16 @@ class Edge:
         if isinstance(obj, str): return obj.encode('ascii')
         return str(obj).encode('ascii')
 
-    def reverse(self):
-        """Returns a reversed copy of the edge."""
+    def reverse(self) -> 'Edge':
+        """Returns a new edge with swapped source and target.
+
+        Returns:
+            A reversed ``Edge`` with copied attributes.
+
+        Examples:
+            >>> Edge(b'A', b'B').reverse()
+            Edge(B(+)->A(+))
+        """
         return Edge(self.v, self.u, self.v_strand, self.u_strand, self.attributes.copy())
 
     def __eq__(self, other):
@@ -78,16 +121,30 @@ class Edge:
 
 class EdgeBatch(Batch):
     """
-    A columnar container for edges, optimized for batch processing and IO.
-    Stores source/target nodes and attributes as numpy arrays.
+    Columnar container for edges, optimized for batch I/O and graph construction.
+
+    Stores source/target node IDs, strand orientations, and attributes as
+    parallel numpy arrays.
+
+    Args:
+        u: Object array of source node IDs.
+        v: Object array of target node IDs.
+        u_strands: ``int8`` array of source strand orientations.
+        v_strands: ``int8`` array of target strand orientations.
+        attributes: Optional dict mapping attribute names to per-edge arrays.
+
+    Examples:
+        >>> batch = EdgeBatch.build([edge1, edge2])
+        >>> len(batch)
+        2
     """
     __slots__ = ('_u', '_v', '_u_strands', '_v_strands', '_attributes')
 
     def __init__(self, u: np.ndarray, v: np.ndarray, 
                  u_strands: np.ndarray = None, v_strands: np.ndarray = None,
                  attributes: Dict[bytes, np.ndarray] = None):
-        self._u = np.array(u, dtype=object, copy=False)
-        self._v = np.array(v, dtype=object, copy=False)
+        self._u = np.array(u, copy=False)
+        self._v = np.array(v, copy=False)
         n = len(self._u)
         self._u_strands = u_strands.astype(np.int8, copy=False) if u_strands is not None else np.full(n, 1, dtype=np.int8)
         self._v_strands = v_strands.astype(np.int8, copy=False) if v_strands is not None else np.full(n, 1, dtype=np.int8)
@@ -98,18 +155,35 @@ class EdgeBatch(Batch):
 
     @classmethod
     def build(cls, components: Iterable[Edge]) -> 'EdgeBatch':
-        # Naive build from Edge objects
+        """Constructs an EdgeBatch from an iterable of Edge objects.
+
+        Args:
+            components: An iterable of ``Edge`` objects.
+
+        Returns:
+            A new ``EdgeBatch``.
+
+        Examples:
+            >>> batch = EdgeBatch.build([edge1, edge2])
+        """
         edges = list(components)
         if not edges: return cls.empty()
-        u = np.array([e.u for e in edges], dtype=object)
-        v = np.array([e.v for e in edges], dtype=object)
+        u = np.array([e.u for e in edges])
+        v = np.array([e.v for e in edges])
         us = np.array([e.u_strand for e in edges], dtype=np.int8)
         vs = np.array([e.v_strand for e in edges], dtype=np.int8)
-        # Attributes merging is complex, skipping for brevity or assuming empty
         return cls(u, v, us, vs)
 
     @classmethod
     def concat(cls, batches: Iterable['EdgeBatch']) -> 'EdgeBatch':
+        """Concatenates multiple EdgeBatch objects into one.
+
+        Args:
+            batches: An iterable of ``EdgeBatch`` objects.
+
+        Returns:
+            A single concatenated ``EdgeBatch``.
+        """
         batches = list(batches)
         if not batches: return cls.empty()
         u = np.concatenate([b.u for b in batches])
@@ -119,14 +193,107 @@ class EdgeBatch(Batch):
         return cls(u, v, us, vs)
 
     @property
-    def nbytes(self) -> int: return self._u.nbytes + self._v.nbytes + self._u_strands.nbytes + self._v_strands.nbytes
+    def nbytes(self) -> int:
+        """Returns the total memory usage in bytes.
+
+        Returns:
+            Total bytes consumed by all internal arrays.
+        """
+        return self._u.nbytes + self._v.nbytes + self._u_strands.nbytes + self._v_strands.nbytes
+
+    @classmethod
+    def empty(cls) -> 'EdgeBatch':
+        """Creates an empty EdgeBatch with zero edges.
+
+        Returns:
+            An empty ``EdgeBatch``.
+        """
+        return cls.zeros(0)
+
+    @classmethod
+    def zeros(cls, n: int) -> 'EdgeBatch':
+        """Creates an EdgeBatch with *n* placeholder edges.
+
+        Args:
+            n: Number of placeholder edge slots.
+
+        Returns:
+            An ``EdgeBatch`` with empty IDs and forward strands.
+        """
+        return cls(
+            np.full(n, b'', dtype='S1'),
+            np.full(n, b'', dtype='S1'),
+            np.ones(n, dtype=np.int8),
+            np.ones(n, dtype=np.int8),
+            {}
+        )
+
+    @property
+    def component(self):
+        """Returns the scalar type represented by this batch.
+
+        Returns:
+            The ``Edge`` class.
+        """
+        return Edge
+
+    def __repr__(self): return f"<EdgeBatch: {len(self)} edges>"
+
+    @property
+    def u(self) -> np.ndarray:
+        """Returns the source node IDs.
+
+        Returns:
+            An object array of ``bytes``.
+        """
+        return self._u
+
+    @property
+    def v(self) -> np.ndarray:
+        """Returns the target node IDs.
+
+        Returns:
+            An object array of ``bytes``.
+        """
+        return self._v
+
+    @property
+    def u_strands(self) -> np.ndarray:
+        """Returns the source strand orientations.
+
+        Returns:
+            An ``int8`` numpy array.
+        """
+        return self._u_strands
+
+    @property
+    def v_strands(self) -> np.ndarray:
+        """Returns the target strand orientations.
+
+        Returns:
+            An ``int8`` numpy array.
+        """
+        return self._v_strands
+
+    @property
+    def attributes(self) -> Dict[bytes, np.ndarray]:
+        """Returns the per-edge attribute arrays.
+
+        Returns:
+            A dict mapping attribute names to numpy arrays.
+        """
+        return self._attributes
 
     def copy(self) -> 'EdgeBatch':
+        """Returns a deep copy of this batch.
+
+        Returns:
+            A new ``EdgeBatch`` with copied arrays.
+        """
         # Note: attributes dict copy is shallow for arrays inside
         return self.__class__(self._u.copy(), self._v.copy(), self._u_strands.copy(), self._v_strands.copy(), self._attributes.copy())
 
     def __len__(self): return len(self._u)
-
     def __iter__(self):
         for i in range(len(self)):
             attrs = {k: v[i] for k, v in self._attributes.items()}
@@ -141,55 +308,30 @@ class EdgeBatch(Batch):
             return EdgeBatch(self._u[item], self._v[item], self._u_strands[item], self._v_strands[item], new_attrs)
         raise TypeError(f"Invalid index type: {type(item)}")
 
-    @classmethod
-    def empty(cls) -> 'EdgeBatch':
-        return cls.zeros(0)
-
-    @classmethod
-    def zeros(cls, n: int) -> 'EdgeBatch':
-        return cls(
-            np.full(n, b'', dtype=object),
-            np.full(n, b'', dtype=object),
-            np.ones(n, dtype=np.int8),
-            np.ones(n, dtype=np.int8),
-            {}
-        )
-
-    @classmethod
-    def empty(cls) -> 'EdgeBatch':
-        return cls.zeros(0)
-
-    @property
-    def component(self): return Edge
-
-    def __repr__(self):
-        return f"<EdgeBatch: {len(self)} edges>"
-
-    @property
-    def u(self) -> np.ndarray: return self._u
-    @property
-    def v(self) -> np.ndarray: return self._v
-    @property
-    def u_strands(self) -> np.ndarray: return self._u_strands
-    @property
-    def v_strands(self) -> np.ndarray: return self._v_strands
-    @property
-    def attributes(self) -> Dict[bytes, np.ndarray]: return self._attributes
-
 
 class Graph:
+    """A general-purpose graph supporting directed/undirected and simple/multi-edge topologies.
+
+    Nodes are identified by ``bytes`` IDs and may carry arbitrary attribute dicts.
+    Edges are stored as a set of ``Edge`` objects. An internal topology cache
+    (COO arrays) is maintained lazily for efficient matrix construction.
+
+    Args:
+        edges: Optional initial edges to add (``Edge`` objects or tuples).
+        directed: Whether the graph is directed (default ``True``).
+        multi: Whether to allow parallel edges (default ``True``).
+
+    Examples:
+        >>> g = Graph(directed=True)
+        >>> g.add_node(b'A')
+        >>> g.add_edges([Edge(b'A', b'B')])
+        >>> len(g)
+        1
+    """
     __slots__ = ('_directed', '_multi', '_edges', '_nodes', '_node_to_idx', '_node_attributes',
                  '_topology_cache', '_topo_lists', '_matrix_cache')
 
     def __init__(self, edges: Iterable[Union[Edge, tuple]] = None, directed: bool = True, multi: bool = True):
-        """
-        Initializes the Graph.
-
-        Args:
-            edges: Initial edges to add.
-            directed: Whether the graph is directed.
-            multi: Whether to allow multiple edges between the same nodes (Multigraph).
-        """
         self._directed = directed
         self._multi = multi
         self._edges: Set[Edge] = set()
@@ -203,21 +345,76 @@ class Graph:
         if edges: self.add_edges(edges)
 
     @property
-    def directed(self): return self._directed
+    def directed(self) -> bool:
+        """Returns ``True`` if the graph is directed.
+
+        Returns:
+            Direction flag.
+        """
+        return self._directed
+
     @property
-    def multi(self): return self._multi
+    def multi(self) -> bool:
+        """Returns ``True`` if the graph allows parallel edges.
+
+        Returns:
+            Multi-edge flag.
+        """
+        return self._multi
+
     @property
-    def nodes(self): return self._nodes
+    def nodes(self) -> List[bytes]:
+        """Returns the ordered list of node IDs.
+
+        Returns:
+            A list of ``bytes`` node IDs.
+        """
+        return self._nodes
+
     @property
-    def edges(self): return self._edges
+    def edges(self) -> Set[Edge]:
+        """Returns the set of all edges in the graph.
+
+        Returns:
+            A set of ``Edge`` objects.
+        """
+        return self._edges
+
     @property
-    def node_to_idx(self): return self._node_to_idx
+    def node_to_idx(self) -> Dict[bytes, int]:
+        """Returns the node-to-index mapping.
+
+        Returns:
+            A dict mapping ``bytes`` node IDs to integer indices.
+        """
+        return self._node_to_idx
+
     @property
-    def node_attributes(self): return self._node_attributes
+    def node_attributes(self) -> Dict[bytes, dict]:
+        """Returns the per-node attribute dictionaries.
+
+        Returns:
+            A dict mapping node IDs to attribute dicts.
+        """
+        return self._node_attributes
+
     @property
-    def topology_cache(self): return self._topology_cache
+    def topology_cache(self):
+        """Returns the COO topology cache, or ``None`` if not yet built.
+
+        Returns:
+            A tuple of ``(u_indices, v_indices, edge_list)`` or ``None``.
+        """
+        return self._topology_cache
+
     @property
-    def matrix_cache(self): return self._matrix_cache
+    def matrix_cache(self) -> Dict:
+        """Returns the sparse matrix cache.
+
+        Returns:
+            A dict mapping ``MatrixPolicy`` keys to CSR matrices.
+        """
+        return self._matrix_cache
 
     def __repr__(self):
         type_str = "Directed" if self._directed else "Undirected"
@@ -230,12 +427,16 @@ class Graph:
     def __getitem__(self, item): return self._nodes[item]
 
     def add_node(self, node: Any, attributes: dict = None):
-        """
-        Adds a node to the graph.
+        """Adds a node to the graph, optionally with attributes.
+
+        If the node already exists, its attributes are merged (updated).
 
         Args:
-            node: The node ID.
+            node: The node ID (coerced to ``bytes``).
             attributes: Optional dictionary of node attributes.
+
+        Examples:
+            >>> g.add_node(b'contig_1', attributes={'length': 5000})
         """
         node = Edge._coerce_node(node)
         if node not in self._node_to_idx:
@@ -250,16 +451,21 @@ class Graph:
             self._matrix_cache.clear()
 
     def add_edges(self, edges: Iterable[Union[Edge, tuple]]):
-        """
-        Batch optimization for adding multiple edges.
+        """Adds multiple edges to the graph, auto-creating nodes as needed.
+
+        Accepts ``Edge`` objects, ``EdgeBatch`` instances, or tuples that
+        can be unpacked into an ``Edge`` constructor. Invalidates the
+        topology and matrix caches.
 
         Args:
-            edges: An iterable of Edge objects or tuples.
+            edges: An iterable of ``Edge`` objects, tuples, or an ``EdgeBatch``.
+
+        Examples:
+            >>> g.add_edges([Edge(b'A', b'B'), Edge(b'B', b'C')])
         """
         # Optimization: Collect unique nodes first to reduce dict lookups from O(E) to O(V)
         if isinstance(edges, EdgeBatch):
             # Fast path for batch: access arrays directly
-            # np.unique is faster than set() for large numpy arrays of objects/bytes
             potential_nodes = np.unique(np.concatenate((edges.u, edges.v)))
             edge_objs = edges
         else:
@@ -293,6 +499,11 @@ class Graph:
         if added: self._matrix_cache.clear()
 
     def ensure_topology(self):
+        """Builds or refreshes the COO topology cache if stale.
+
+        After calling this, ``self.topology_cache`` is guaranteed to be
+        a valid ``(u_indices, v_indices, edge_list)`` tuple.
+        """
         if self._topology_cache is not None: return
 
         u_list, v_list, e_list = self._topo_lists
@@ -303,14 +514,18 @@ class Graph:
         )
 
     def subgraph(self, nodes: Iterable[Any]) -> 'Graph':
-        """
-        Returns a new Graph containing only the specified nodes and the edges between them (induced subgraph).
+        """Returns an induced subgraph containing only the specified nodes.
+
+        Edges are kept only if both endpoints are in the node set.
 
         Args:
-            nodes: Iterable of node IDs to keep.
+            nodes: An iterable of node IDs to keep.
 
         Returns:
-            A new Graph instance.
+            A new ``Graph`` with the selected nodes and their inter-edges.
+
+        Examples:
+            >>> sub = g.subgraph([b'A', b'B'])
         """
         keep_set = {Edge._coerce_node(n) for n in nodes}
         # Filter to only existing nodes
@@ -352,21 +567,31 @@ class Graph:
 
 
 class Path:
+    """An ordered sequence of node IDs representing a walk through a graph.
+
+    Args:
+        nodes: List of ``bytes`` node IDs in traversal order.
+        cost: Cumulative edge weight along the path (default ``0.0``).
+
+    Examples:
+        >>> p = Path([b'A', b'B', b'C'], cost=2.5)
+        >>> len(p)
+        3
+    """
     __slots__ = ('nodes', 'total_cost')
 
     def __init__(self, nodes: list[bytes], cost: float = 0.0):
-        """
-        Initializes a Path.
-
-        Args:
-            nodes: List of node IDs in the path.
-            cost: Total cost of the path.
-        """
         self.nodes = nodes
         self.total_cost = cost
     
     @property
-    def batch(self) -> type['Batch']: return PathBatch
+    def batch(self) -> type['Batch']:
+        """Returns the batch type for this class.
+
+        Returns:
+            The ``PathBatch`` class.
+        """
+        return PathBatch
 
     def __len__(self): return len(self.nodes)
     def __iter__(self): return iter(self.nodes)
@@ -383,7 +608,19 @@ class Path:
 
 class PathBatch(RaggedBatch):
     """
-    Efficient storage for many paths (Structure of Arrays).
+    Columnar batch of paths using ragged array storage.
+
+    Stores all node IDs in a flat array with per-path offsets and costs.
+
+    Args:
+        flat_nodes: Flat object array of all node IDs concatenated.
+        offsets: ``int32`` offset array (length = ``n_paths + 1``).
+        costs: Optional ``float32`` array of per-path costs.
+
+    Examples:
+        >>> batch = PathBatch.build([path1, path2])
+        >>> len(batch)
+        2
     """
     __slots__ = ('_flat_nodes', '_costs')
 
@@ -395,21 +632,48 @@ class PathBatch(RaggedBatch):
 
     @classmethod
     def empty(cls) -> 'PathBatch':
+        """Creates an empty PathBatch with zero paths.
+
+        Returns:
+            An empty ``PathBatch``.
+        """
         return cls.zeros(0)
 
     @classmethod
     def zeros(cls, n: int) -> 'PathBatch':
+        """Creates a PathBatch with *n* empty placeholder paths.
+
+        Args:
+            n: Number of placeholder path slots.
+
+        Returns:
+            A ``PathBatch`` with zero-cost, zero-length paths.
+        """
         return cls(
-            np.empty(0, dtype=object),
+            np.empty(0, dtype='S1'),
             np.zeros(n + 1, dtype=np.int32),
             np.zeros(n, dtype=np.float32)
         )
 
     @property
-    def component(self): return Path
+    def component(self):
+        """Returns the scalar type represented by this batch.
+
+        Returns:
+            The ``Path`` class.
+        """
+        return Path
 
     @classmethod
     def concat(cls, batches: Iterable['PathBatch']) -> 'PathBatch':
+        """Concatenates multiple PathBatch objects into one.
+
+        Args:
+            batches: An iterable of ``PathBatch`` objects.
+
+        Returns:
+            A single concatenated ``PathBatch``.
+        """
         batches = list(batches)
         if not batches: return cls.empty()
         flat_nodes = np.concatenate([b._flat_nodes for b in batches])
@@ -418,9 +682,20 @@ class PathBatch(RaggedBatch):
         return cls(flat_nodes, offsets, costs)
 
     @property
-    def nbytes(self) -> int: return super().nbytes + self._flat_nodes.nbytes + self._costs.nbytes
+    def nbytes(self) -> int:
+        """Returns the total memory usage in bytes.
+
+        Returns:
+            Total bytes consumed by all internal arrays.
+        """
+        return super().nbytes + self._flat_nodes.nbytes + self._costs.nbytes
 
     def copy(self) -> 'PathBatch':
+        """Returns a deep copy of this batch.
+
+        Returns:
+            A new ``PathBatch`` with copied arrays.
+        """
         return self.__class__(self._flat_nodes.copy(), self._offsets.copy(), self._costs.copy())
 
     def __repr__(self): return f"<PathBatch: {len(self)} paths>"
@@ -447,10 +722,21 @@ class PathBatch(RaggedBatch):
         raise TypeError(f"Invalid index type: {type(item)}")
 
     @classmethod
-    def build(cls, components: Iterable[object]) -> 'PathBatch':
+    def build(cls, components: Iterable[Path]) -> 'PathBatch':
+        """Constructs a PathBatch from an iterable of Path objects.
+
+        Args:
+            components: An iterable of ``Path`` objects.
+
+        Returns:
+            A new ``PathBatch``.
+
+        Examples:
+            >>> batch = PathBatch.build([path1, path2])
+        """
         paths = list(components)
         if not paths:
-            return cls(np.empty(0, dtype=object), np.array([0], dtype=np.int32))
+            return cls(np.empty(0, dtype='S1'), np.array([0], dtype=np.int32))
         
         flat_nodes = []
         offsets = [0]
@@ -461,7 +747,7 @@ class PathBatch(RaggedBatch):
             offsets.append(curr)
             
         return cls(
-            np.array(flat_nodes, dtype=object),
+            np.array(flat_nodes),
             np.array(offsets, dtype=np.int32),
             np.array([p.total_cost for p in paths], dtype=np.float32)
         )

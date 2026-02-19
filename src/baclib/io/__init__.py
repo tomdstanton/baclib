@@ -15,7 +15,7 @@ from baclib.containers.graph import Edge
 from baclib.containers.record import Record, Feature, RecordBatch
 from baclib.containers.alignment import Alignment
 from baclib.containers import Batch
-from baclib.lib.io import Xopen, PeekableHandle, ThreadedChunkReader, ThreadedChunkWriter
+from baclib.lib.io import Xopen, OpenMode, CompressionFormat, PeekableHandle, ThreadedChunkReader, ThreadedChunkWriter
 
 
 # Exceptions and Warnings ----------------------------------------------------------------------------------------------
@@ -25,7 +25,8 @@ class SeqIOError(IOError):
 class TruncatedFileError(SeqIOError):
     """Raised when a file appears to be truncated."""
 
-class ParserError(Exception): pass
+class ParserError(Exception):
+    """Raised when a file parser encounters malformed or unexpected input."""
 class SeqFileError(Exception):
     """Exception raised for errors in sequence file processing."""
     pass
@@ -100,12 +101,21 @@ class BaseReader(ABC):
         self._iterator = None
     
     @classmethod
+    @classmethod
     @abstractmethod
-    def sniff(cls, s: bytes) -> bool: ...
+    def sniff(cls, s: bytes) -> bool:
+        """Checks if input bytes look like the format."""
+        ...
+        
     @abstractmethod
-    def __iter__(self) -> Generator: ...
+    def __iter__(self) -> Generator:
+        """Iterates over records."""
+        ...
+
     def __enter__(self): return self
+
     def __exit__(self, exc_type, exc_val, exc_tb): self.close()
+
     def __next__(self):
         if self._iterator is None:
             self._iterator = self.__iter__()
@@ -124,14 +134,13 @@ class BaseReader(ABC):
         return ThreadedChunkReader(self._handle, chunk_size)
 
     def batches(self, size: int = 1024) -> Generator[Batch, None, None]:
-        """
-        Yields records in batches for efficiency.
+        """Yields records in batches for efficiency.
 
         Args:
             size: Number of records per batch.
 
         Yields:
-            Batch objects.
+            ``Batch`` objects.
         """
         batch_records = []
         for record in self:
@@ -146,7 +155,15 @@ class BaseReader(ABC):
         return RecordBatch(records)
 
     def _build_seq_batch(self, seq_bytes_list: list[bytes], alphabet: Alphabet) -> SeqBatch:
-        """Helper to efficiently build a SeqBatch from a list of sequence bytes."""
+        """Helper to efficiently build a SeqBatch from a list of sequence bytes.
+
+        Args:
+            seq_bytes_list: List of bytes sequences.
+            alphabet: The alphabet to use.
+
+        Returns:
+            A new ``SeqBatch``.
+        """
         if not seq_bytes_list:
              return alphabet.new_batch(np.empty(0, dtype=np.uint8), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32))
              
@@ -185,8 +202,8 @@ class BaseWriter(ABC):
         ...     w.write(record1, record2)
     """
     __slots__ = ('_opener', '_handle', '_threaded', '_writer_wrapper', '_real_handle')
-    def __init__(self, file: Union[str, Path, BinaryIO], mode: Union[str, Xopen.Mode] = Xopen.Mode.WRITE,
-                 compression: Union[str, Xopen.Format] = Xopen.Format.INFER,
+    def __init__(self, file: Union[str, Path, BinaryIO], mode: Union[str, OpenMode] = OpenMode.WRITE,
+                 compression: Union[str, CompressionFormat] = CompressionFormat.INFER,
                  threaded: bool = True, **kwargs):
         """
         Initializes the writer.
@@ -262,6 +279,7 @@ class FormatSpec:
 
 class SeqFileFormat(str, Enum):
     """Supported sequence file formats."""
+    INFER = 'infer'
     FASTA = 'fasta'
     FASTQ = 'fastq'
     GENBANK = 'genbank'
@@ -283,40 +301,51 @@ class SeqFile:
     compression (e.g., gzip, bzip2), providing a single, unified way to
     iterate over sequence data.
     """
-    __slots__ = ('_opener', '_handle', '_format', '_reader', '_reader_kwargs', '_iterator')
+    __slots__ = ('_name', '_opener', '_handle', '_format', '_reader', '_reader_kwargs', '_iterator')
     _REGISTRY = {}
-    Format = SeqFileFormat
-    def __init__(self, file: Union[str, Path, BinaryIO], fmt: Union[str, Format] = None,
-                 alphabet: Alphabet = None, **reader_kwargs):
+    def __init__(self, file: Union[str, Path, BinaryIO], fmt: Union[str, SeqFileFormat] = SeqFileFormat.INFER, **reader_kwargs):
         """
         Initializes the SeqFile reader.
         """
         self._opener = Xopen(file, mode='rb')
+        self._name = self._opener.name or None
         self._handle = None
-        self._format = self.Format(fmt) if fmt else None
+        self._format = SeqFileFormat(fmt)
         self._reader = None
         self._reader_kwargs = reader_kwargs
         self._iterator = None
 
-        # Auto-detect Alphabet from extension if not provided
-        if alphabet is None and isinstance(file, (str, Path)) and self._format:
-            if spec := self._REGISTRY.get(self._format):
-                path_str = str(file)
-                for ext, alpha in spec.alphabets.items():
-                    if path_str.endswith(ext):
-                        alphabet = alpha
-                        break
-
-        if alphabet: self._reader_kwargs['alphabet'] = alphabet
+        if self._format == SeqFileFormat.INFER and self._name is not None:
+            filename, _, ext = self._name.rpartition('.')
+            ext = f'.{ext.lower()}'
+            for registered_format, spec in self._REGISTRY.items():
+                if ext in spec.extensions:
+                    self._name = filename
+                    self._format = registered_format
+                    if (alpha := spec.alphabets.get(ext)) and 'alphabet' not in self._reader_kwargs:
+                        self._reader_kwargs['alphabet'] = alpha
+                    break
 
     @property
-    def format(self) -> Format: return self._format
+    def format(self) -> SeqFileFormat: return self._format
     @property
     def name(self) -> str: return self._opener.name
 
     @classmethod
     def open(cls, file: Union[str, Path, BinaryIO], mode: Union[str, OpenMode] = OpenMode.READ,
-             fmt: Union[str, Format] = None, alphabet: Alphabet = None, **kwargs) -> Union['SeqFile', BaseWriter]:
+             fmt: Union[str, SeqFileFormat] = None, alphabet: Alphabet = None, **kwargs) -> Union['SeqFile', BaseWriter]:
+        """Opens a sequence file for reading or writing.
+
+        Args:
+            file: File path or object.
+            mode: Mode to open file ('r', 'w', 'a', etc.).
+            fmt: Format specifier (e.g. 'fasta'). If None, infers from extension.
+            alphabet: Alphabet to use for reading.
+            **kwargs: Additional arguments for the reader/writer.
+
+        Returns:
+            A ``SeqFile`` (reader) or ``BaseWriter``.
+        """
         if fmt is None:
             fmt = kwargs.pop('format', None)
         
@@ -458,7 +487,7 @@ class SeqFile:
         self.close()
 
     @classmethod
-    def register(cls, fmt: Format, extensions: list[str] = None, alphabets: dict[str, 'Alphabet'] = None):
+    def register(cls, fmt: SeqFileFormat, extensions: list[str] = None, alphabets: dict[str, 'Alphabet'] = None):
         """
         Decorator to register a Reader or Writer for a specific format.
         """

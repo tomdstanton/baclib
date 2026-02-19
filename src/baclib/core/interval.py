@@ -1,3 +1,4 @@
+"""Genomic interval representation with strand and context, plus batched interval operations."""
 from typing import Union, Any, Match, Iterable, ClassVar
 from enum import IntEnum, auto
 
@@ -14,6 +15,7 @@ else:
 
 # Classes --------------------------------------------------------------------------------------------------------------
 class Context(IntEnum):
+    """Spatial relationship between two genomic intervals."""
     UPSTREAM = auto()
     DOWNSTREAM = auto()
     INSIDE = auto()
@@ -125,7 +127,14 @@ class Interval:
 
     # --- Hull Arithmetic ---
     def __add__(self, other: Union[slice, int, 'Interval']) -> 'Interval':
-        """Returns the convex hull (union extent) as a NEW Interval."""
+        """Returns the convex hull (union extent) as a NEW Interval.
+
+        Args:
+            other: The other interval.
+
+        Returns:
+            A new ``Interval`` spanning from the minimum start to maximum end.
+        """
         other = Interval.from_item(other)
         new_strand = self._strand if self._strand == other.strand else 0
         return Interval(min(self._start, other.start), max(self._end, other.end), new_strand)
@@ -134,7 +143,14 @@ class Interval:
         return self.__add__(other)
 
     def intersection(self, other: Union[slice, int, 'Interval']) -> 'Interval':
-        """Returns the intersection of this interval and another as a NEW Interval."""
+        """Returns the intersection of this interval and another as a NEW Interval.
+
+        Args:
+            other: The other interval.
+
+        Returns:
+            A new ``Interval`` representing the overlapping region.
+        """
         other = Interval.from_item(other)
         new_start = max(self._start, other.start)
         new_end = min(self._end, other.end)
@@ -226,11 +242,31 @@ class Interval:
     
     @classmethod
     def from_int(cls, item: int, strand: int = Strand.UNSTRANDED, length: int = None) -> 'Interval':
+        """Creates an interval from a single integer index.
+
+        Args:
+            item: The integer index (can be negative).
+            strand: The strand.
+            length: Sequence length (required for negative indices).
+
+        Returns:
+            A new ``Interval`` of length 1.
+        """
         if item < 0 and length is not None: item += length
         return cls(item, item + 1, strand)
 
     @classmethod
     def from_slice(cls, item: slice, strand: int = Strand.UNSTRANDED, length: int = None) -> 'Interval':
+        """Creates an interval from a slice object.
+
+        Args:
+            item: The slice object.
+            strand: The strand.
+            length: Sequence length (required for slices with ``None`` stop).
+
+        Returns:
+            A new ``Interval``.
+        """
         start, stop, step = item.start, item.stop, item.step
         if start is None: start = 0
         if stop is None and length is not None: stop = length
@@ -323,7 +359,14 @@ class IntervalBatch(Batch):
 
     @classmethod
     def zeros(cls, n: int) -> 'IntervalBatch':
-        """Creates a batch of n 0-length intervals at position 0."""
+        """Creates a batch of *n* 0-length intervals at position 0.
+
+        Args:
+            n: Number of intervals.
+
+        Returns:
+            A new ``IntervalBatch``.
+        """
         return cls(
             np.zeros(n, dtype=np.int32),
             np.zeros(n, dtype=np.int32),
@@ -374,12 +417,22 @@ class IntervalBatch(Batch):
 
     @classmethod
     def empty(cls) -> 'IntervalBatch':
+        """Creates an empty IntervalBatch.
+
+        Returns:
+            An empty ``IntervalBatch``.
+        """
         return cls.zeros(0)
 
     @classmethod
     def build(cls, *intervals: Union[Interval, Iterable[Interval]]) -> 'IntervalBatch':
-        """
-        Creates an IntervalBatch from an iterable of Interval objects (or varargs).
+        """Creates an IntervalBatch from an iterable of Interval objects (or varargs).
+
+        Args:
+            *intervals: Iterable of intervals or individual ``Interval`` arguments.
+
+        Returns:
+            A new ``IntervalBatch``.
         """
         if not intervals: return cls.empty()
         # Handle single iterable argument
@@ -409,10 +462,7 @@ class IntervalBatch(Batch):
         if len(features) == 1:
             obj = features[0]
             
-            # 1. Fast Path: Container with cached batch (e.g. FeatureList, Record)
-            if batch := getattr(obj, 'interval_batch', None): return batch
-            
-            # 2. Fast Path: Container with intervals property (e.g. FeatureBatch, AlignmentBatch)
+            # Fast Path: Container with intervals property (e.g. FeatureList, Record, FeatureBatch)
             if batch := getattr(obj, 'intervals', None):
                 if isinstance(batch, cls): return batch
             
@@ -450,8 +500,13 @@ class IntervalBatch(Batch):
 
     @classmethod
     def concat(cls, batches: Iterable['IntervalBatch']) -> 'IntervalBatch':
-        """
-        Concatenates multiple IntervalBatches.
+        """Concatenates multiple IntervalBatches.
+
+        Args:
+            batches: Iterable of ``IntervalBatch`` objects.
+
+        Returns:
+            A new concatenated ``IntervalBatch``.
         """
         batches = list(batches)
         if not batches: return cls.empty()
@@ -462,8 +517,7 @@ class IntervalBatch(Batch):
         
         return cls(starts, ends, strands, sort=True)
 
-    def empty(self) -> 'IntervalBatch':
-        return IntervalBatch.empty()
+
 
     def __repr__(self): return f"<IntervalBatch: {len(self)} intervals>"
 
@@ -519,17 +573,21 @@ class IntervalBatch(Batch):
     def strands(self): return self._strands
     
     @property
+    def component(self): return Interval
+
+    
+    @property
     def nbytes(self) -> int:
         return self._starts.nbytes + self._ends.nbytes + self._strands.nbytes + (self._original_indices.nbytes if self._original_indices is not None else 0)
 
     @property
     def centers(self) -> np.ndarray:
-        """Returns the center points of the intervals."""
+        """Returns the center points of the intervals (float array)."""
         return (self._starts + self._ends) / 2
 
     @property
     def lengths(self) -> np.ndarray:
-        """Returns the lengths of the intervals."""
+        """Returns the lengths of the intervals (int array)."""
         return self._ends - self._starts
 
     def query(self, start: int, end: int) -> np.ndarray:
@@ -543,15 +601,14 @@ class IntervalBatch(Batch):
                              start, end, self._max_len)
 
     def intersect(self, other: 'IntervalBatch', stranded: bool = False) -> 'IntervalBatch':
-        """
-        Computes the intersection with another IntervalBatch.
+        """Computes the intersection with another IntervalBatch.
 
         Args:
             other: The other IntervalBatch.
-            stranded: If True, only intersects intervals on the same strand.
+            stranded: If ``True``, only intersects intervals on the same strand.
 
         Returns:
-            A new IntervalBatch representing the intersection.
+            A new ``IntervalBatch`` representing the intersection.
         """
         if len(self) == 0 or len(other) == 0: return IntervalBatch.empty()
         # Call Numba Kernel
@@ -562,15 +619,14 @@ class IntervalBatch(Batch):
         return IntervalBatch(out[0], out[1], out[2], sort=False)
 
     def subtract(self, other: 'IntervalBatch', stranded: bool = False) -> 'IntervalBatch':
-        """
-        Subtracts regions in 'other' from this index.
+        """Subtracts regions in ``other`` from this index.
 
         Args:
             other: The IntervalBatch to subtract.
-            stranded: If True, only subtracts intervals on the same strand.
+            stranded: If ``True``, only subtracts intervals on the same strand.
 
         Returns:
-            A new IntervalBatch.
+            A new ``IntervalBatch`` with regions removed.
         """
         if len(other) == 0: return self.copy()
         # Merge B to simplify subtraction

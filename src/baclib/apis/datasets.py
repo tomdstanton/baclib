@@ -1,3 +1,4 @@
+"""Client for the NCBI Datasets API, supporting genome, gene, and virus data retrieval."""
 from typing import List, Optional, Union, Any, Iterator
 from pathlib import Path
 import os
@@ -13,6 +14,7 @@ from baclib.io import SeqFile, Record
 
 # Classes --------------------------------------------------------------------------------------------------------------
 class GenomeTag(str, Enum):
+    """File types available in an NCBI genome dataset package."""
     GENOME_FASTA = "GENOME_FASTA"
     GENOME_GFF = "GENOME_GFF"
     GENOME_GB = "GENOME_GB"
@@ -23,6 +25,7 @@ class GenomeTag(str, Enum):
 
 
 class GeneTag(str, Enum):
+    """File types available in an NCBI gene dataset package."""
     GENE_FASTA = "GENE_FASTA"
     PROTEIN_FASTA = "PROTEIN_FASTA"
     CDS_FASTA = "CDS_FASTA"
@@ -30,6 +33,7 @@ class GeneTag(str, Enum):
 
 
 class VirusTag(str, Enum):
+    """File types available in an NCBI virus dataset package."""
     GENOME = "GENOME"
     PROTEIN = "PROTEIN"
     CDS = "CDS"
@@ -192,15 +196,15 @@ class DatasetPackage:
                 if pattern == "*" or pattern in name: 
                      yield name
                      
-    def sequences(self, fmt: Optional[Union[str, SeqFile.Format]] = None) -> Iterator[Record]:
+    def sequences(self, fmt: Optional[Union[str, SeqFileFormat]] = None) -> Iterator[Record]:
         """
         Yields Record objects from files in the package that match supported sequence formats.
         
         Args:
-            fmt: Optional format to filter by (e.g. SeqFile.Format.FASTA).
+            fmt: Optional format to filter by (e.g. SeqFileFormat.FASTA).
                  If None, tries to detect format for every file in the registry.
         """
-        target_fmt = SeqFile.Format(fmt) if fmt else None
+        target_fmt = SeqFileFormat(fmt) if fmt else None
         
         with zipfile.ZipFile(self.zip_path, 'r') as z:
             for name in z.namelist():

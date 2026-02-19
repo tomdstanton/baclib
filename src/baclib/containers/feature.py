@@ -1,3 +1,4 @@
+"""Containers for genomic features (genes, CDS, etc.) with interval-based coordinates and batch support."""
 from typing import Generator, Union, MutableSequence, Iterable, ClassVar
 from enum import IntEnum, auto
 
@@ -15,9 +16,18 @@ class FeatureKey(IntEnum):
     """
     Valid INSDC Feature Table Keys.
 
-    Includes a __str__ method to return the exact INSDC string representation,
-    handling special characters (like 5'UTR and D-loop) that are not valid
-    Python identifiers.
+    Each member maps to a string representation via ``__str__`` and a bytes
+    representation via the ``bytes`` property. Special characters
+    (like ``5'UTR`` and ``D-loop``) that are not valid Python identifiers
+    are handled automatically.
+
+    Examples:
+        >>> FeatureKey.CDS
+        <FeatureKey.CDS: 2>
+        >>> str(FeatureKey.CDS)
+        'CDS'
+        >>> FeatureKey.from_bytes(b'CDS')
+        <FeatureKey.CDS: 2>
     """
     # --- Genes, Coding & Transcriptional Products ---
     GENE = auto()
@@ -86,10 +96,36 @@ class FeatureKey(IntEnum):
     _FROM_BYTES_CACHE: ClassVar[dict]
 
     def __str__(self): return self._STR_CACHE[self]
+
     @property
-    def bytes(self) -> bytes: return self._BYTES_CACHE[self]
+    def bytes(self) -> bytes:
+        """Returns the INSDC byte-string representation of this key.
+
+        Returns:
+            The key name as ASCII bytes (e.g. ``b'CDS'``, ``b"5'UTR"``).
+        """
+        return self._BYTES_CACHE[self]
+
     @classmethod
-    def from_bytes(cls, b: bytes) -> 'FeatureKey': return cls._FROM_BYTES_CACHE.get(b, cls.MISC_FEATURE)
+    def from_bytes(cls, b: bytes) -> 'FeatureKey':
+        """Looks up a FeatureKey by its byte-string representation.
+
+        Falls back to ``MISC_FEATURE`` for unrecognised keys.
+
+        Args:
+            b: INSDC key as bytes (e.g. ``b'CDS'``).
+
+        Returns:
+            The matching FeatureKey member.
+
+        Examples:
+            >>> FeatureKey.from_bytes(b'CDS')
+            <FeatureKey.CDS: 2>
+            >>> FeatureKey.from_bytes(b'unknown')
+            <FeatureKey.MISC_FEATURE: ...>
+        """
+        return cls._FROM_BYTES_CACHE.get(b, cls.MISC_FEATURE)
+
     @classmethod
     def _init_caches(cls):
         cls._STR_CACHE = {}
@@ -135,7 +171,23 @@ class FeatureKey(IntEnum):
 
 class Feature(HasInterval, Batchable):
     """
-    Represents a genomic feature, such as a gene or CDS.
+    A single genomic feature with an interval, type key, and qualifiers.
+
+    Features represent annotated regions of a sequence (genes, CDS, regulatory
+    elements, etc.) and carry metadata as key-value qualifier pairs.
+
+    Args:
+        interval: Genomic coordinates and strand.
+        key: The INSDC feature type. Accepts a ``FeatureKey`` enum or raw bytes.
+        qualifiers: Optional iterable of ``(key, value)`` qualifier tuples.
+
+    Examples:
+        >>> feat = Feature(Interval(100, 500, 1), FeatureKey.CDS,
+        ...                [(b'gene', b'dnaA'), (b'product', b'initiator')])
+        >>> feat.key
+        <FeatureKey.CDS: 2>
+        >>> feat[b'gene']
+        b'dnaA'
     """
     Key = FeatureKey  # Alias for convenience (e.g. Feature.Key.CDS)
     __slots__ = ('_interval', '_key', '_qualifiers')
@@ -146,13 +198,41 @@ class Feature(HasInterval, Batchable):
         self._qualifiers = QualifierList(qualifiers)
 
     @property
-    def batch(self) -> type['Batch']: return FeatureBatch
+    def batch(self) -> type['Batch']:
+        """Returns the batch type for this class.
+
+        Returns:
+            The ``FeatureBatch`` class.
+        """
+        return FeatureBatch
+
     @property
-    def interval(self) -> 'Interval': return self._interval
+    def interval(self) -> 'Interval':
+        """Returns the genomic interval (start, end, strand).
+
+        Returns:
+            The feature's ``Interval``.
+        """
+        return self._interval
+
     @property
-    def key(self) -> FeatureKey: return self._key
+    def key(self) -> FeatureKey:
+        """Returns the INSDC feature type key.
+
+        Returns:
+            A ``FeatureKey`` enum member.
+        """
+        return self._key
+
     @property
-    def qualifiers(self) -> QualifierList: return self._qualifiers
+    def qualifiers(self) -> QualifierList:
+        """Returns the qualifier list for this feature.
+
+        Returns:
+            A ``QualifierList`` of ``(key, value)`` tuples.
+        """
+        return self._qualifiers
+
     def __len__(self) -> int: return len(self.interval)
     def __iter__(self): return self.interval.__iter__()
     def __contains__(self, item) -> bool: return self.interval.__contains__(item)
@@ -166,29 +246,124 @@ class Feature(HasInterval, Batchable):
     # to avoid ambiguity with integer indices if Feature were to support them.
     def __getitem__(self, item): return self.qualifiers.get(item)
     def __setitem__(self, key: bytes, value: QualifierType): self.qualifiers[key] = value
-    def overlap(self, other) -> int: return self.interval.overlap(other)
-    def get(self, item, default = None): return self.qualifiers.get(item, default)
-    def get_all(self, key: bytes) -> list[QualifierType]: return self.qualifiers.get_all(key)
-    def add_qualifier(self, key: bytes, value: QualifierType = True): self.qualifiers.add(key, value)
+
+    def overlap(self, other) -> int:
+        """Returns the number of overlapping bases with another interval.
+
+        Args:
+            other: An ``Interval``, ``Feature``, or other ``HasInterval``.
+
+        Returns:
+            Number of overlapping bases (0 if none).
+        """
+        return self.interval.overlap(other)
+
+    def get(self, item: bytes, default=None) -> QualifierType:
+        """Returns the first qualifier value for a key, or *default*.
+
+        Args:
+            item: The qualifier key to look up.
+            default: Value to return if key is absent.
+
+        Returns:
+            The first matching value, or *default*.
+
+        Examples:
+            >>> feat.get(b'gene')
+            b'dnaA'
+        """
+        return self.qualifiers.get(item, default)
+
+    def get_all(self, key: bytes) -> list[QualifierType]:
+        """Returns all qualifier values for a key.
+
+        Args:
+            key: The qualifier key to look up.
+
+        Returns:
+            A list of all matching values.
+        """
+        return self.qualifiers.get_all(key)
+
+    def add_qualifier(self, key: bytes, value: QualifierType = True):
+        """Appends a qualifier to this feature.
+
+        Args:
+            key: The qualifier key.
+            value: The qualifier value (defaults to ``True`` for flag qualifiers).
+
+        Examples:
+            >>> feat.add_qualifier(b'pseudo')
+            >>> feat[b'pseudo']
+            True
+        """
+        self.qualifiers.add(key, value)
+
     def shift(self, x: int, y: int = None) -> 'Feature':
+        """Returns a new Feature with shifted coordinates.
+
+        Args:
+            x: Offset to add to the start (and end, unless *y* is given).
+            y: Optional separate offset for the end.
+
+        Returns:
+            A new ``Feature`` with adjusted interval.
+        """
         return Feature(self.interval.shift(x, y), self.key, list(self.qualifiers))
+
     def reverse_complement(self, parent_length: int) -> 'Feature':
+        """Returns a new Feature with reverse-complemented coordinates.
+
+        Args:
+            parent_length: Length of the parent sequence.
+
+        Returns:
+            A new ``Feature`` on the opposite strand.
+        """
         return Feature(self.interval.reverse_complement(parent_length), self.key, list(self.qualifiers))
+
     def extract(self, parent_seq: Seq) -> Seq:
-        """Extracts the feature's sequence from the parent."""
+        """Extracts the feature's sequence from the parent, respecting strand.
+
+        Args:
+            parent_seq: The full parent ``Seq`` to slice from.
+
+        Returns:
+            The extracted subsequence (reverse-complemented if on minus strand).
+
+        Examples:
+            >>> seq = Alphabet.DNA.from_bytes(b'ATGCGATCGA')
+            >>> feat = Feature(Interval(0, 3, 1), FeatureKey.CDS)
+            >>> feat.extract(seq)  # returns Seq('ATG')
+        """
         sub = parent_seq[self.interval.start:self.interval.end]
         if self.interval.strand == -1: return parent_seq.alphabet.reverse_complement(sub)
         return sub
+
     def copy(self) -> 'Feature':
-        """Creates a shallow copy of the feature (qualifiers are copied)."""
+        """Creates a shallow copy of the feature (qualifiers are copied).
+
+        Returns:
+            A new ``Feature`` with the same interval, key, and copied qualifiers.
+        """
         return Feature(self.interval, self.key, list(self.qualifiers))
 
 
 class FeatureList(MutableSequence, HasIntervals):
     """
-    A list-like object that manages genomic features and their spatial index.
+    A mutable list of genomic features with a lazily-built spatial index.
 
-    It automatically invalidates the spatial index when features are modified.
+    The spatial index is automatically invalidated when features are added,
+    removed, or reordered, and rebuilt on next access via the ``intervals``
+    property.
+
+    Args:
+        features: Optional iterable of ``Feature`` objects.
+
+    Examples:
+        >>> fl = FeatureList([feat1, feat2])
+        >>> fl.append(feat3)
+        >>> overlapping = list(fl.get_overlapping(100, 500))
     """
     __slots__ = ('_data', '_intervals')
 
@@ -198,6 +373,13 @@ class FeatureList(MutableSequence, HasIntervals):
 
     @property
     def intervals(self) -> 'IntervalBatch':
+        """Returns the spatial index over all feature intervals.
+
+        Lazily built on first access and invalidated when the list is modified.
+
+        Returns:
+            An ``IntervalBatch`` covering all features.
+        """
         if self._intervals is None:
             self._intervals = IntervalBatch.from_features(self._data)
         return self._intervals
@@ -218,35 +400,79 @@ class FeatureList(MutableSequence, HasIntervals):
         del self._data[index]
         self._flag_dirty()
 
-    def insert(self, index, value):
+    def insert(self, index: int, value: 'Feature'):
+        """Inserts a feature at the given index.
+
+        Args:
+            index: Position to insert at.
+            value: The ``Feature`` to insert.
+        """
         self._data.insert(index, value)
         self._flag_dirty()
 
     def extend(self, values: Iterable['Feature']):
+        """Appends multiple features to the list.
+
+        Args:
+            values: An iterable of ``Feature`` objects.
+        """
         self._data.extend(values)
         self._flag_dirty()
 
     def reverse(self):
+        """Reverses the feature list in place."""
         self._data.reverse()
         self._flag_dirty()
 
-    def sort(self, key=None, reverse=False):
+    def sort(self, key=None, reverse: bool = False):
+        """Sorts the feature list in place.
+
+        Args:
+            key: Optional sort key function.
+            reverse: If ``True``, sort in descending order.
+        """
         self._data.sort(key=key, reverse=reverse)
         self._flag_dirty()
 
     def get_overlapping(self, start: int, end: int) -> Generator['Feature', None, None]:
+        """Yields features overlapping the interval ``[start, end)``.
+
+        Uses the spatial index for fast querying.
+
+        Args:
+            start: Start coordinate (inclusive).
+            end: End coordinate (exclusive).
+
+        Yields:
+            ``Feature`` objects whose intervals overlap the query range.
+
+        Examples:
+            >>> for feat in fl.get_overlapping(100, 500):
+            ...     print(feat.key)
         """
-        Yields features overlapping [start, end).
-        Delegates to the IntervalBatch for robust and fast querying.
-        """
-        # self.interval_batch ensures the index is built and up-to-date
+        # self.intervals ensures the index is built and up-to-date
         indices = self.intervals.query(start, end)
         for i in indices: yield self._data[i]
 
 
 class FeatureBatch(Batch, HasIntervals):
     """
-    A batch of Features, stored in a columnar format.
+    A columnar batch of features for efficient bulk operations.
+
+    Stores intervals, keys, and qualifiers in separate numpy arrays,
+    enabling vectorized filtering and slicing.
+
+    Args:
+        intervals: An ``IntervalBatch`` of feature coordinates.
+        keys: An ``int16`` numpy array of ``FeatureKey`` values.
+        qualifiers: A ``QualifierBatch`` of per-feature qualifiers.
+
+    Examples:
+        >>> batch = FeatureBatch.build([feat1, feat2, feat3])
+        >>> len(batch)
+        3
+        >>> batch[0]  # reconstructs a Feature
+        Feature(CDS, Interval(100, 500, +))
     """
     __slots__ = ('_intervals', '_keys', '_qualifiers')
 
@@ -257,10 +483,28 @@ class FeatureBatch(Batch, HasIntervals):
 
     @classmethod
     def empty(cls) -> 'FeatureBatch':
+        """Creates an empty FeatureBatch with zero features.
+
+        Returns:
+            An empty ``FeatureBatch``.
+        """
         return cls(IntervalBatch.empty(), np.empty(0, dtype=np.int16), QualifierBatch.empty())
 
     @classmethod
     def build(cls, features: list[Feature]) -> 'FeatureBatch':
+        """Constructs a FeatureBatch from a list of Feature objects.
+
+        Args:
+            features: List of ``Feature`` objects to batch.
+
+        Returns:
+            A new ``FeatureBatch``.
+
+        Examples:
+            >>> batch = FeatureBatch.build([feat1, feat2])
+            >>> len(batch)
+            2
+        """
         n = len(features)
 
         # Manual extraction to ensure sort=False (IntervalBatch.from_features sorts by default)
@@ -279,11 +523,22 @@ class FeatureBatch(Batch, HasIntervals):
         intervals = IntervalBatch(starts, ends, strands, sort=False)
 
         # Generator to avoid creating intermediate list of qualifier lists
-        qualifiers = QualifierBatch.from_qualifiers((f.qualifiers for f in features))
+        qualifiers = QualifierBatch.build(f.qualifiers for f in features)
         return cls(intervals, keys, qualifiers)
 
     @classmethod
     def concat(cls, batches: Iterable['FeatureBatch']) -> 'FeatureBatch':
+        """Concatenates multiple FeatureBatch objects into one.
+
+        Args:
+            batches: An iterable of ``FeatureBatch`` objects.
+
+        Returns:
+            A single concatenated ``FeatureBatch``.
+
+        Examples:
+            >>> combined = FeatureBatch.concat([batch_a, batch_b])
+        """
         batches = list(batches)
         if not batches: return cls.empty()
         
@@ -294,25 +549,89 @@ class FeatureBatch(Batch, HasIntervals):
         return cls(intervals, keys, qualifiers)
 
     @property
-    def nbytes(self) -> int: return self._intervals.nbytes + self._keys.nbytes + self._qualifiers.nbytes
+    def nbytes(self) -> int:
+        """Returns the total memory usage in bytes.
+
+        Returns:
+            Total bytes consumed by intervals, keys, and qualifiers.
+        """
+        return self._intervals.nbytes + self._keys.nbytes + self._qualifiers.nbytes
 
     def copy(self) -> 'FeatureBatch':
+        """Returns a deep copy of this batch.
+
+        Returns:
+            A new ``FeatureBatch`` with copied arrays.
+        """
         return self.__class__(self._intervals.copy(), self._keys.copy(), self._qualifiers.copy())
 
     @property
-    def component(self): return Feature
+    def component(self):
+        """Returns the scalar type represented by this batch.
+
+        Returns:
+            The ``Feature`` class.
+        """
+        return Feature
 
     @property
-    def intervals(self) -> IntervalBatch: return self._intervals
+    def intervals(self) -> IntervalBatch:
+        """Returns the interval array for all features.
+
+        Returns:
+            An ``IntervalBatch`` of feature coordinates.
+        """
+        return self._intervals
+
     @property
-    def keys(self): return self._keys
-    def get_key(self, idx: int) -> FeatureKey: return FeatureKey(self._keys[idx])
-    def get_qualifiers(self, idx: int) -> list[tuple]: return self._qualifiers[idx]
+    def keys(self) -> np.ndarray:
+        """Returns the raw ``int16`` array of feature key values.
+
+        Returns:
+            A numpy array of ``FeatureKey`` integer values.
+        """
+        return self._keys
+
+    def get_key(self, idx: int) -> FeatureKey:
+        """Returns the FeatureKey for the feature at *idx*.
+
+        Args:
+            idx: Feature index.
+
+        Returns:
+            The ``FeatureKey`` enum member.
+
+        Examples:
+            >>> batch.get_key(0)
+            <FeatureKey.CDS: 2>
+        """
+        return FeatureKey(self._keys[idx])
+
+    def get_qualifiers(self, idx: int) -> list[tuple]:
+        """Returns the qualifier list for the feature at *idx*.
+
+        Args:
+            idx: Feature index.
+
+        Returns:
+            A list of ``(key, value)`` tuples.
+
+        Examples:
+            >>> batch.get_qualifiers(0)
+            [(b'gene', b'dnaA'), (b'product', b'initiator')]
+        """
+        return self._qualifiers[idx]
+
     def __repr__(self): return f"<FeatureBatch: {len(self)} features>"
     def __len__(self): return len(self._intervals)
     def __getitem__(self, item) -> Union['Feature', 'FeatureBatch']:
-        """
-        Reconstructs a Feature object from the batch.
+        """Reconstructs a Feature or slices a sub-batch.
+
+        Args:
+            item: Integer index (returns ``Feature``) or slice (returns ``FeatureBatch``).
+
+        Returns:
+            A single ``Feature`` or a sliced ``FeatureBatch``.
         """
         if isinstance(item, (int, np.integer)):
             interval = Interval(
@@ -337,20 +656,58 @@ class FeatureBatch(Batch, HasIntervals):
         raise TypeError(f"Invalid index type: {type(item)}")
 
     @classmethod
+    def random(cls, n: int, rng: np.random.Generator = None, length: int = None, min_len: int = 1, max_len: int = 1000,
+               min_start: int = 0, max_start: int = 1_000_000) -> 'FeatureBatch':
+        """Creates a batch of *n* random features for testing.
+
+        Args:
+            n: Number of features to generate.
+            rng: Random number generator (optional).
+            length: Fixed length for all features (optional).
+            min_len: Minimum feature length (default 1).
+            max_len: Maximum feature length (default 1000).
+            min_start: Minimum start coordinate (default 0).
+            max_start: Maximum start coordinate (default 1,000,000).
+
+        Returns:
+            A new ``FeatureBatch`` with random keys and intervals.
+
+        Examples:
+            >>> batch = FeatureBatch.random(10, rng=np.random.default_rng(42))
+            >>> len(batch)
+            10
+        """
+        intervals = IntervalBatch.random(n, rng, length, min_len, max_len, min_start, max_start)
+        if rng is None: rng = np.random.default_rng()
+        
+        # Select random keys from available FeatureKey values
+        valid_keys = np.array([k.value for k in FeatureKey], dtype=np.int16)
+        keys = rng.choice(valid_keys, size=n)
+        
+        qualifiers = QualifierBatch.zeros(n)
+        
+        return cls(intervals, keys, qualifiers)
+
+    @classmethod
     def zeros(cls, n: int) -> 'FeatureBatch':
-        """Creates a batch of n 'empty' features (0-length, 0-start)."""
+        """Creates a batch of *n* zero-length placeholder features.
+
+        Args:
+            n: Number of features to create.
+
+        Returns:
+            A ``FeatureBatch`` where every feature has interval ``(0, 0)``
+            and key ``0``.
+
+        Examples:
+            >>> batch = FeatureBatch.zeros(3)
+            >>> len(batch)
+            3
+        """
         return cls(
             IntervalBatch.build([Interval(0, 0)] * n),
             np.zeros(n, dtype=np.int16),
             QualifierBatch.zeros(n)
-        )
-
-    @classmethod
-    def empty(cls) -> 'FeatureBatch':
-        return cls(
-            IntervalBatch.empty(),
-            np.array([], dtype=np.int16),
-            QualifierBatch.empty()
         )
 
 

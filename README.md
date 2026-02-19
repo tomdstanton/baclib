@@ -27,7 +27,8 @@
     *   Built-in pairwise aligner (Smith-Waterman, Needleman-Wunsch) with affine gap penalties.
     *   Fast K-mer indexing (MinHash, Minimizers) for rapid sequence comparison.
     *   Seamless integration with **Minimap2** via direct process streaming.
-*   **Assembly Graph Toolkit**: Native support for GFA graphs, including pathfinding, simplification, and topological analysis.
+*   **Assembly Graph Toolkit**: Native support for GFA graphs, including pathfinding, simplification, and topological analysis uses efficient `RecordBatch` backends.
+*   **API Clients**: Includes a client for the PRODORIC database (`ProdoricClient`) for retrieving transcriptional regulation data.
 
 ## ⚠️ Important: Binary Strings
 
@@ -54,32 +55,36 @@ This design choice ensures zero-copy compatibility with low-level parsers and ex
 Requires Python 3.11+.
 
 ```bash
-pip install baclib
+python -m pip install baclib
 ```
 
 For documentation generation support:
 ```bash
-pip install baclib[docs]
+python -m pip install baclib --group docs
+```
+
+For developers:
+```bash
+python -m pip install baclib -e --group dev
 ```
 
 ## Quick Start
 
 ### Reading Sequences
 
-`baclib` automatically detects file formats and compression. Note the use of binary keys.
-
 ```python
 from baclib.io import SeqFile
 
 # Read a FASTA file (gzip supported automatically)
-with SeqFile("genome.fasta.gz") as reader:
+# Use SeqFile.open() as the unified entry point
+with SeqFile.open("genome.fasta.gz") as reader:
     for record in reader:
         # record.id is bytes!
         print(f"ID: {record.id.decode()}, Length: {len(record)}")
         print(f"Sequence: {record.seq[:50]}...")
 
 # Read a GenBank file with features
-with SeqFile("annotation.gbk") as reader:
+with SeqFile.open("annotation.gbk") as reader:
     for record in reader:
         for feature in record.features:
             if feature.key == b'CDS':
@@ -93,7 +98,7 @@ with SeqFile("annotation.gbk") as reader:
 ```python
 from baclib.containers.seq import Alphabet, GeneticCode
 
-dna = Alphabet.dna()
+dna = Alphabet.DNA
 
 # Create a sequence from string
 seq = dna.seq_from("ATGCGTAGCTAG")
@@ -119,11 +124,11 @@ Perform local, global, or glocal alignment using the built-in high-performance a
 from baclib.engines.pairwise import Aligner
 from baclib.containers.seq import Alphabet, SeqBatch
 
-dna = Alphabet.dna()
+dna = Alphabet.DNA
 
 # Create random sequences
-targets = SeqBatch([dna.random_seq(length=1000) for _ in range(5)], alphabet=dna)
-queries = SeqBatch([dna.random_seq(length=100) for _ in range(2)], alphabet=dna)
+targets = dna.random_batch(n_seqs=5, length=1000)
+queries = dna.random_batch(n_seqs=2, length=100)
 
 # Initialize aligner (Glocal mode: Global in Query, Local in Target)
 aligner = Aligner(mode='glocal', compute_traceback=True)
@@ -145,18 +150,50 @@ Ensure `minimap2` is installed and in your PATH.
 
 ```python
 from baclib.lib.external import Minimap2
-from baclib.containers.record import Record
+from baclib.containers.record import RecordBatch
 from baclib.containers.seq import Alphabet
 
-dna = Alphabet.dna()
-ref = Record(dna.random_seq(length=10000), id_=b"ref")
-query = Record(dna.random_seq(length=1000), id_=b"query")
+dna = Alphabet.DNA
+ref = RecordBatch.random(dna, n_seqs=100, length=1000)
+queries = RecordBatch.random(dna, n_seqs=10, length=100)
 
 # Align using Minimap2 wrapper (handles indexing automatically)
 with Minimap2(ref) as mapper:
-    for alignment in mapper.align(query):
-        print(f"Query: {alignment.query} -> Target: {alignment.target}")
+    for alignment in mapper.align(queries):
+        print(f"Query: {alignment.queries} -> Target: {alignment.target}")
         print(f"Matches: {alignment.n_matches}")
+```
+
+### Genome Assembly Graph
+
+Load and analyze assembly graphs (GFA format).
+
+```python
+from baclib.containers.genome import GenomeAssembly
+
+# Load GFA graph
+assembly = GenomeAssembly.from_file("assembly.gfa")
+
+print(f"Edges: {assembly.edges}")
+```
+
+### PRODORIC Client
+
+Fetch regulatory data directly from the PRODORIC database.
+
+```python
+from baclib.apis.prodoric import ProdoricClient
+
+client = ProdoricClient()
+
+# Search for motifs
+motifs = client.search_motifs("LexA")
+for m in motifs:
+    print(f"Found motif: {m.name} ({m.accession})")
+
+# Get a matrix details
+motif = client.get_motif(motifs[0].accession)
+print(motif.name)
 ```
 
 ## Dependencies

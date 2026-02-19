@@ -1,10 +1,11 @@
+"""Readers for motif matrix formats including MEME and TRANSFAC."""
 from typing import Generator, BinaryIO
 
 import numpy as np
 
 from baclib.engines.motif import Motif, Background, MotifBatch
 from baclib.core.alphabet import Alphabet
-from baclib.io import BaseReader, SeqFile
+from baclib.io import BaseReader, SeqFile, SeqFileFormat
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
@@ -12,6 +13,13 @@ class MotifReader(BaseReader):
     """Base class for motif readers."""
     _DEFAULT_BACKGROUND = Background.uniform(Alphabet.DNA)
     def __init__(self, handle: BinaryIO, background: Background = None, **kwargs):
+        """Initializes the MotifReader.
+
+        Args:
+            handle: Binary file handle.
+            background: Background distribution (defaults to uniform DNA).
+            **kwargs: Additional arguments.
+        """
         super().__init__(handle, **kwargs)
         self.background: Background = background or self._DEFAULT_BACKGROUND
 
@@ -19,7 +27,7 @@ class MotifReader(BaseReader):
         return MotifBatch(items)
 
 
-@SeqFile.register(SeqFile.Format.MEME, extensions=['.meme', '.txt'])
+@SeqFile.register(SeqFileFormat.MEME, extensions=['.meme', '.txt'])
 class MemeReader(MotifReader):
     """
     Reader for MEME format files.
@@ -32,6 +40,11 @@ class MemeReader(MotifReader):
     """
 
     def __iter__(self) -> Generator[Motif, None, None]:
+        """Iterates over motifs in the MEME file.
+
+        Yields:
+            ``Motif`` objects.
+        """
         lines = (line.strip() for line in self._handle)
 
         current_name = b"Unknown"
@@ -117,9 +130,10 @@ class MemeReader(MotifReader):
 
     @classmethod
     def sniff(cls, s: bytes) -> bool:
+        """Checks if input bytes look like MEME format."""
         return s.startswith(b'MEME version')
 
-@SeqFile.register(SeqFile.Format.TRANSFAC, extensions=['.transfac', '.tf'])
+@SeqFile.register(SeqFileFormat.TRANSFAC, extensions=['.transfac', '.tf'])
 class TransfacReader(MotifReader):
     """
     Reader for TRANSFAC format files.
@@ -132,6 +146,11 @@ class TransfacReader(MotifReader):
     """
 
     def __iter__(self) -> Generator[Motif, None, None]:
+        """Iterates over motifs in the TRANSFAC file.
+
+        Yields:
+            ``Motif`` objects.
+        """
         lines = (line.strip() for line in self._handle)
 
         current_id = b"Unknown"
@@ -172,4 +191,5 @@ class TransfacReader(MotifReader):
 
     @classmethod
     def sniff(cls, s: bytes) -> bool:
+        """Checks if input bytes look like TRANSFAC format."""
         return s.startswith(b'ID') or s.startswith(b'AC') or s.startswith(b'VV')

@@ -1,3 +1,4 @@
+"""Core sequence containers with alphabet-aware encoding, hashing, and batch support."""
 from binascii import hexlify
 from hashlib import blake2b
 from typing import Union, Iterable, Generator
@@ -5,7 +6,6 @@ from typing import Union, Iterable, Generator
 import numpy as np
 
 from baclib.core.interval import Interval
-# Note, to avoid circular imports, this module must NOT import from `core.alphabet`
 from baclib.containers import Batch, Batchable
 from baclib.lib.resources import jit, RESOURCES
 from baclib.lib.protocols import HasAlphabet
@@ -19,12 +19,25 @@ else:
 # Classes --------------------------------------------------------------------------------------------------------------
 class Seq(HasAlphabet, Batchable):
     """
-    Sequence container optimized for high-throughput genomics.
-    Holds ONLY encoded integers (uint8) to minimize memory usage.
+    Immutable, alphabet-aware sequence container storing encoded integers (uint8).
 
-    Note:
-        Unlike other containers, Seq objects should be created via `Alphabet.seq()` or `Alphabet.random()` to
-        ensure encoding/decoding consistency.
+    ``Seq`` objects should be created via ``Alphabet.seq()`` or ``Alphabet.random()``
+    rather than directly, to ensure encoding consistency.
+
+    Args:
+        data: A numpy uint8 array of encoded symbol indices.
+        alphabet: The ``Alphabet`` that owns this sequence.
+        _validation_token: Internal token (must be the alphabet) to prevent
+            direct construction.
+
+    Examples:
+        >>> seq = Alphabet.DNA.seq(b'ATGCGA')
+        >>> len(seq)
+        6
+        >>> bytes(seq)
+        b'ATGCGA'
+        >>> seq[1:4]
+        TGC
     """
     __slots__ = ('_data', '_alphabet', '_hash')
     def __init__(self, data: np.ndarray, alphabet: 'Alphabet', _validation_token: object = None):
@@ -36,14 +49,30 @@ class Seq(HasAlphabet, Batchable):
         self._data.flags.writeable = False  # Enforce immutability for hashing safety
 
     @property
-    def batch(self) -> type['Batch']: return SeqBatch
+    def batch(self) -> type['Batch']:
+        """Returns the batch type for this class.
+
+        Returns:
+            The ``SeqBatch`` class.
+        """
+        return SeqBatch
 
     @property
-    def alphabet(self) -> 'Alphabet': return self._alphabet
+    def alphabet(self) -> 'Alphabet':
+        """Returns the alphabet used for encoding/decoding.
+
+        Returns:
+            The owning ``Alphabet`` singleton.
+        """
+        return self._alphabet
 
     @property
     def encoded(self) -> np.ndarray:
-        """Returns the underlying integer array (Zero Copy)."""
+        """Returns the underlying encoded integer array (zero-copy).
+
+        Returns:
+            A read-only ``uint8`` numpy array.
+        """
         return self._data
 
     def __array__(self, dtype=None):
@@ -51,9 +80,19 @@ class Seq(HasAlphabet, Batchable):
         return self._data.astype(dtype, copy=False) if dtype else self._data
 
     def __bytes__(self) -> bytes: return self._alphabet.decode(self._data)
-    def tobytes(self) -> bytes: 
-        """Explicit alias for __bytes__."""
+
+    def tobytes(self) -> bytes:
+        """Decodes the sequence to raw bytes.
+
+        Returns:
+            The decoded byte string.
+
+        Examples:
+            >>> seq.tobytes()
+            b'ATGCGA'
+        """
         return self.__bytes__()
+
     def __len__(self): return self._data.shape[0]
     def __str__(self): return self.__bytes__().decode('ascii')
     def __iter__(self): return iter(self._data)
@@ -131,14 +170,23 @@ class Seq(HasAlphabet, Batchable):
         return bytes(self) >= bytes(other)
 
     def __getitem__(self, item: Union[slice, int, Interval]) -> 'Seq':
-        """
-        Gets a subsequence.
+        """Extracts a subsequence by index, slice, or ``Interval``.
+
+        When an ``Interval`` with ``strand == -1`` is used, the result is
+        automatically reverse-complemented.
 
         Args:
-            item: Index, slice, or Interval.
+            item: An integer index, a Python slice, or an ``Interval``.
 
         Returns:
-            A new Seq object representing the subsequence.
+            A new ``Seq`` representing the subsequence.
+
+        Examples:
+            >>> seq = Alphabet.DNA.seq(b'ATGCGA')
+            >>> seq[1:4]
+            TGC
+            >>> seq[Interval(1, 4, -1)]  # reverse complement
+            GCA
         """
         # 1. Standard Slicing (Fastest)
         if isinstance(item, slice):
@@ -168,23 +216,43 @@ class Seq(HasAlphabet, Batchable):
         return self._alphabet.seq_from(chunk_encoded)
 
     def generate_id(self, digest_size: int = 8) -> bytes:
-        """
-        Generates a deterministic, fixed-length ID based on the sequence content.
-        Uses BLAKE2b hashing. Output is a hex string (2 * digest_size chars).
+        """Generates a deterministic ID from the sequence content using BLAKE2b.
 
         Args:
-            digest_size: Size of the digest in bytes.
+            digest_size: Hash digest size in bytes (output is ``2 * digest_size``
+                hex characters).
 
         Returns:
             The hex digest as bytes.
+
+        Examples:
+            >>> seq.generate_id()
+            b'a1b2c3d4e5f6a7b8'
         """
         return hexlify(blake2b(self._data.tobytes(), digest_size=digest_size, usedforsecurity=False).digest())
 
 
 class SeqBatch(Batch, HasAlphabet):
     """
-    A 'Struct of Arrays' container that flattens a list of Seqs
-    into contiguous memory for Numba parallel processing.
+    Flattened batch of sequences for Numba-accelerated parallel processing.
+
+    Stores all encoded symbols in a single contiguous ``uint8`` array with
+    per-sequence start/length metadata, enabling zero-copy slicing and
+    parallel kernels.
+
+    Args:
+        data: Contiguous ``uint8`` array of all encoded symbols.
+        starts: ``int32`` array of per-sequence start offsets into *data*.
+        lengths: ``int32`` array of per-sequence lengths.
+        alphabet: The shared ``Alphabet``.
+        _validation_token: Internal token (must be the alphabet).
+
+    Examples:
+        >>> batch = Alphabet.DNA.batch_from([seq1, seq2, seq3])
+        >>> len(batch)
+        3
+        >>> batch[0]
+        ATGCGA
     """
     __slots__ = ('_alphabet', '_data', '_starts', '_lengths', '_count')
     def __init__(self, data: np.ndarray, starts: np.ndarray, lengths: np.ndarray, 
@@ -204,9 +272,23 @@ class SeqBatch(Batch, HasAlphabet):
 
     @classmethod
     def build(cls, seqs: Iterable['Seq']) -> 'SeqBatch':
-        """
-        Creates a SeqBatch from a list of Seq objects.
+        """Creates a SeqBatch from an iterable of Seq objects.
+
         Infers the alphabet from the first sequence.
+
+        Args:
+            seqs: An iterable of ``Seq`` objects (must share the same alphabet).
+
+        Returns:
+            A new ``SeqBatch``.
+
+        Raises:
+            ValueError: If the iterable is empty (use ``Alphabet.empty_batch()``).
+
+        Examples:
+            >>> batch = SeqBatch.build([seq1, seq2])
+            >>> len(batch)
+            2
         """
         seqs_list = list(seqs)
         if not seqs_list:
@@ -215,27 +297,39 @@ class SeqBatch(Batch, HasAlphabet):
 
     @classmethod
     def zeros(cls, n: int) -> 'SeqBatch':
-        """Creates a batch of n empty sequences."""
-        # 0-length sequences
-        starts = np.zeros(n, dtype=np.int32)
-        lengths = np.zeros(n, dtype=np.int32)
-        # Empty data array
-        data = np.zeros(0, dtype=np.uint8)
-        # Default alphabet? DNA is safe default or None?
-        # The __init__ requires an alphabet.
-        from baclib.core.alphabet import Alphabet
-        alpha = Alphabet.DNA
-        return cls(data, starts, lengths, alpha, _validation_token=alpha)
+        """Not supported directly — use ``Alphabet.zeros_batch(n)`` instead.
+
+        Raises:
+            TypeError: Always.
+        """
+        raise TypeError("SeqBatch.zeros() requires an Alphabet. Use Alphabet.zeros_batch(n) instead.")
 
     @classmethod
     def empty(cls) -> 'SeqBatch':
-        from baclib.core.alphabet import Alphabet
-        return cls.zeros(0)._alphabet.empty_batch()
+        """Not supported directly — use ``Alphabet.empty_batch()`` instead.
+
+        Raises:
+            TypeError: Always.
+        """
+        raise TypeError("SeqBatch.empty() requires an Alphabet. Use Alphabet.empty_batch() instead.")
 
     @classmethod
     def concat(cls, batches: Iterable['SeqBatch']) -> 'SeqBatch':
-        """
-        Concatenates multiple SeqBatches into a single batch.
+        """Concatenates multiple SeqBatch objects into one.
+
+        All batches must share the same alphabet.
+
+        Args:
+            batches: An iterable of ``SeqBatch`` objects.
+
+        Returns:
+            A single concatenated ``SeqBatch``.
+
+        Raises:
+            ValueError: If the list is empty or alphabets differ.
+
+        Examples:
+            >>> combined = SeqBatch.concat([batch_a, batch_b])
         """
         batches = list(batches)
         if not batches: raise ValueError("Cannot concatenate empty list of batches")
@@ -254,32 +348,88 @@ class SeqBatch(Batch, HasAlphabet):
         return cls(data, starts, lengths, alphabet, _validation_token=alphabet)
 
     def __add__(self, other: 'SeqBatch') -> 'SeqBatch':
-        """Allows `batch1 + batch2` concatenation."""
+        """Concatenates two batches via the ``+`` operator."""
         return self.concat([self, other])
 
     # --- Numba Accessors ---
     # Properties to unpack into Numba function arguments: *batch.arrays
     @property
-    def arrays(self): return self._data, self._starts, self._lengths
-    @property
-    def component(self): return Seq
+    def arrays(self):
+        """Returns ``(data, starts, lengths)`` for Numba kernel unpacking.
+
+        Returns:
+            A 3-tuple of numpy arrays.
+        """
+        return self._data, self._starts, self._lengths
 
     @property
-    def alphabet(self): return self._alphabet
-    @property
-    def encoded(self): return self._data
-    @property
-    def starts(self): return self._starts
-    @property
-    def lengths(self): return self._lengths
+    def component(self):
+        """Returns the scalar type represented by this batch.
+
+        Returns:
+            The ``Seq`` class.
+        """
+        return Seq
 
     @property
-    def nbytes(self) -> int: return self._data.nbytes + self._starts.nbytes + self._lengths.nbytes
+    def alphabet(self) -> 'Alphabet':
+        """Returns the shared alphabet.
+
+        Returns:
+            The ``Alphabet`` singleton.
+        """
+        return self._alphabet
+
+    @property
+    def encoded(self) -> np.ndarray:
+        """Returns the flat encoded data array (zero-copy).
+
+        Returns:
+            A read-only ``uint8`` numpy array.
+        """
+        return self._data
+
+    @property
+    def starts(self) -> np.ndarray:
+        """Returns the per-sequence start offsets.
+
+        Returns:
+            An ``int32`` numpy array.
+        """
+        return self._starts
+
+    @property
+    def lengths(self) -> np.ndarray:
+        """Returns the per-sequence lengths.
+
+        Returns:
+            An ``int32`` numpy array.
+        """
+        return self._lengths
+
+    @property
+    def nbytes(self) -> int:
+        """Returns the total memory usage in bytes.
+
+        Returns:
+            Total bytes consumed by data, starts, and lengths arrays.
+        """
+        return self._data.nbytes + self._starts.nbytes + self._lengths.nbytes
 
     def copy(self) -> 'SeqBatch':
+        """Returns a deep copy of this batch.
+
+        Returns:
+            A new ``SeqBatch`` with copied arrays.
+        """
         return self.__class__(self._data.copy(), self._starts.copy(), self._lengths.copy(), self._alphabet, _validation_token=self._alphabet)
 
     def empty(self) -> 'SeqBatch':
+        """Returns an empty batch with the same alphabet.
+
+        Returns:
+            An empty ``SeqBatch``.
+        """
         return self._alphabet.empty()
 
     def __repr__(self): return f"<SeqBatch: {len(self)} sequences>"
@@ -341,15 +491,29 @@ class SeqBatch(Batch, HasAlphabet):
             yield self._alphabet.seq_from(self._data[start:start + length])
 
     def generate_id(self, digest_size: int = 8) -> bytes:
-        """
-        Generates a deterministic, fixed-length ID based on the sequence content.
-        Uses BLAKE2b hashing. Output is a hex string (2 * digest_size chars).
+        """Generates a deterministic ID for the entire batch using BLAKE2b.
+
+        Args:
+            digest_size: Hash digest size in bytes.
+
+        Returns:
+            The hex digest as bytes.
         """
         return hexlify(blake2b(self._data.tobytes(), digest_size=digest_size, usedforsecurity=False).digest())
 
     def generate_ids(self, digest_size: int = 8) -> np.ndarray:
-        """
-        Generates a list of deterministic IDs for each sequence in the batch.
+        """Generates a deterministic ID for each sequence in the batch.
+
+        Args:
+            digest_size: Hash digest size in bytes per ID.
+
+        Returns:
+            An object array of hex digest bytes, one per sequence.
+
+        Examples:
+            >>> ids = batch.generate_ids()
+            >>> ids[0]
+            b'a1b2c3d4e5f6a7b8'
         """
         ids = np.empty(self._count, dtype=object)
         for i in range(self._count):
@@ -359,7 +523,14 @@ class SeqBatch(Batch, HasAlphabet):
         return ids
 
     def _gather(self, indices: np.ndarray) -> 'SeqBatch':
-        """Internal method to gather sequences by index."""
+        """Internal method to gather sequences by index array.
+
+        Args:
+            indices: Integer array of sequence indices to gather.
+
+        Returns:
+            A new ``SeqBatch`` containing only the selected sequences.
+        """
         if len(indices) == 0: return self._alphabet.empty()
         
         new_lengths = self._lengths[indices]
@@ -376,11 +547,28 @@ class SeqBatch(Batch, HasAlphabet):
 
 class CompressedSeq(HasAlphabet, Batchable):
     """
-    A bit-packed sequence.
-    Stores symbols in a compressed format (e.g. 2 bits per base for DNA).
+    A bit-packed sequence for reduced memory footprint.
+
+    Stores symbols using fewer bits per base (e.g. 2 bits for DNA),
+    achieving up to 4× compression over ``Seq``.
+
+    Args:
+        data: Packed ``uint8`` numpy array.
+        length: Number of symbols (may differ from ``len(data)`` × packing ratio
+            due to padding).
+        alphabet: The owning ``Alphabet``.
+        bits: Bits per symbol (e.g. 2 for DNA).
+        _validation_token: Internal token (must be the alphabet).
+
+    Examples:
+        >>> cseq = Alphabet.DNA.compress(seq)
+        >>> cseq.decompress() == seq
+        True
     """
     __slots__ = ('_data', '_length', '_alphabet', '_bits')
-    def __init__(self, data: np.ndarray, length: int, alphabet: 'Alphabet', bits: int):
+    def __init__(self, data: np.ndarray, length: int, alphabet: 'Alphabet', bits: int, _validation_token: object = None):
+        if _validation_token is not alphabet:
+            raise PermissionError("CompressedSeq objects must be created via an Alphabet")
         self._data = data
         self._length = length
         self._alphabet = alphabet
@@ -389,13 +577,33 @@ class CompressedSeq(HasAlphabet, Batchable):
     def __len__(self): return self._length
     
     @property
-    def batch(self) -> type['Batch']: return CompressedSeqBatch
+    def batch(self) -> type['Batch']:
+        """Returns the batch type for this class.
+
+        Returns:
+            The ``CompressedSeqBatch`` class.
+        """
+        return CompressedSeqBatch
     
     @property
-    def alphabet(self) -> 'Alphabet': return self._alphabet
+    def alphabet(self) -> 'Alphabet':
+        """Returns the alphabet used for encoding.
+
+        Returns:
+            The owning ``Alphabet`` singleton.
+        """
+        return self._alphabet
 
     def decompress(self) -> Seq:
-        """Decompresses the sequence back to a standard Seq."""
+        """Decompresses back to a standard ``Seq``.
+
+        Returns:
+            A full ``Seq`` object with the original encoded data.
+
+        Examples:
+            >>> cseq.decompress() == original_seq
+            True
+        """
         return self._alphabet.decompress(self)
     
     def __repr__(self):
@@ -404,11 +612,26 @@ class CompressedSeq(HasAlphabet, Batchable):
 
 class CompressedSeqBatch(Batch, HasAlphabet):
     """
-    A batch of bit-packed sequences.
-    Each sequence is byte-aligned for efficient random access.
+    A batch of bit-packed sequences, byte-aligned for efficient random access.
+
+    Args:
+        data: Packed ``uint8`` array of all compressed data.
+        starts: ``int32`` offsets into *data* for each sequence.
+        lengths: ``int32`` original (uncompressed) symbol counts.
+        alphabet: The shared ``Alphabet``.
+        bits: Bits per symbol.
+        _validation_token: Internal token (must be the alphabet).
+
+    Examples:
+        >>> cbatch = Alphabet.DNA.compress_batch(batch)
+        >>> cbatch.decompress() == batch
+        True
     """
     __slots__ = ('_data', '_starts', '_lengths', '_alphabet', '_bits', '_count')
-    def __init__(self, data: np.ndarray, starts: np.ndarray, lengths: np.ndarray, alphabet: 'Alphabet', bits: int):
+    def __init__(self, data: np.ndarray, starts: np.ndarray, lengths: np.ndarray, alphabet: 'Alphabet', bits: int,
+                 _validation_token: object = None):
+        if _validation_token is not alphabet:
+            raise PermissionError("CompressedSeqBatch objects must be created via an Alphabet")
         self._data = data
         self._starts = starts
         self._lengths = lengths
@@ -419,17 +642,45 @@ class CompressedSeqBatch(Batch, HasAlphabet):
     def __len__(self): return self._count
 
     @property
-    def component(self): return CompressedSeq
+    def component(self):
+        """Returns the scalar type represented by this batch.
+
+        Returns:
+            The ``CompressedSeq`` class.
+        """
+        return CompressedSeq
     
     @property
-    def alphabet(self) -> 'Alphabet': return self._alphabet
+    def alphabet(self) -> 'Alphabet':
+        """Returns the shared alphabet.
+
+        Returns:
+            The ``Alphabet`` singleton.
+        """
+        return self._alphabet
 
     @classmethod
     def build(cls, components: Iterable[object]) -> 'Batch':
+        """Not supported directly — use ``Alphabet.compress()``.
+
+        Raises:
+            NotImplementedError: Always.
+        """
         raise NotImplementedError("Direct build not supported. Use Alphabet.compress()")
 
     @classmethod
     def concat(cls, batches: Iterable['CompressedSeqBatch']) -> 'CompressedSeqBatch':
+        """Concatenates multiple CompressedSeqBatch objects into one.
+
+        Args:
+            batches: An iterable of ``CompressedSeqBatch`` objects.
+
+        Returns:
+            A single concatenated ``CompressedSeqBatch``.
+
+        Raises:
+            ValueError: If the list is empty.
+        """
         batches = list(batches)
         if not batches: raise ValueError("Cannot concatenate empty list")
         first = batches[0]
@@ -443,16 +694,44 @@ class CompressedSeqBatch(Batch, HasAlphabet):
             byte_lens = (lengths + per_byte - 1) // per_byte
             np.cumsum(byte_lens[:-1], out=starts[1:])
             
-        return cls(data, starts, lengths, first._alphabet, first._bits)
+            np.cumsum(byte_lens[:-1], out=starts[1:])
+            
+        return cls(data, starts, lengths, first._alphabet, first._bits, _validation_token=first._alphabet)
     
     @property
-    def nbytes(self) -> int: return self._data.nbytes + self._starts.nbytes + self._lengths.nbytes
+    def nbytes(self) -> int:
+        """Returns the total memory usage in bytes.
+
+        Returns:
+            Total bytes consumed by data, starts, and lengths arrays.
+        """
+        return self._data.nbytes + self._starts.nbytes + self._lengths.nbytes
 
     def copy(self) -> 'CompressedSeqBatch':
-        return self.__class__(self._data.copy(), self._starts.copy(), self._lengths.copy(), self._alphabet, self._bits)
+        """Returns a deep copy of this batch.
 
-    def empty(self) -> 'CompressedSeqBatch':
-        return CompressedSeqBatch(np.empty(0, dtype=np.uint8), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), self._alphabet, self._bits)
+        Returns:
+            A new ``CompressedSeqBatch`` with copied arrays.
+        """
+        return self.__class__(self._data.copy(), self._starts.copy(), self._lengths.copy(), self._alphabet, self._bits, _validation_token=self._alphabet)
+
+    @classmethod
+    def empty(cls) -> 'CompressedSeqBatch':
+        """Not supported directly — use ``Alphabet.empty_compressed()`` instead.
+
+        Raises:
+            TypeError: Always.
+        """
+        raise TypeError("CompressedSeqBatch.empty() requires an Alphabet. Use Alphabet.empty_compressed() instead.")
+
+    @classmethod
+    def zeros(cls, n: int) -> 'CompressedSeqBatch':
+        """Not supported directly — use ``Alphabet.zeros_compressed(n)`` instead.
+
+        Raises:
+            TypeError: Always.
+        """
+        raise TypeError("CompressedSeqBatch.zeros() requires an Alphabet. Use Alphabet.zeros_compressed(n) instead.")
 
     def __getitem__(self, item):
         if isinstance(item, (int, np.integer)):
@@ -463,7 +742,7 @@ class CompressedSeqBatch(Batch, HasAlphabet):
             per_byte = 8 // self._bits
             byte_len = (length + per_byte - 1) // per_byte
             data = self._data[start : start + byte_len]
-            return CompressedSeq(data, length, self._alphabet, self._bits)
+            return CompressedSeq(data, length, self._alphabet, self._bits, _validation_token=self._alphabet)
         
         if isinstance(item, slice):
             start, stop, step = item.indices(self._count)
@@ -471,171 +750,19 @@ class CompressedSeqBatch(Batch, HasAlphabet):
             new_lengths = self._lengths[start:stop]
             p_start = self._starts[start]
             p_end = self._starts[stop] if stop < self._count else len(self._data)
-            return CompressedSeqBatch(self._data[p_start:p_end], self._starts[start:stop] - p_start, new_lengths, self._alphabet, self._bits)
+            return CompressedSeqBatch(self._data[p_start:p_end], self._starts[start:stop] - p_start, new_lengths, self._alphabet, self._bits, _validation_token=self._alphabet)
             
         raise NotImplementedError("Slicing not implemented for CompressedSeqBatch")
 
     def decompress(self) -> SeqBatch:
-        """Decompresses the batch back to a standard SeqBatch."""
+        """Decompresses the batch back to a standard ``SeqBatch``.
+
+        Returns:
+            A ``SeqBatch`` with the original uncompressed symbol data.
+        """
         return self._alphabet.decompress_batch(self)
 
     def __repr__(self): return f"<CompressedSeqBatch: {len(self)} sequences>"
-
-
-# class SparseSeq(Seq):
-#     """
-#     A compressed sequence representation that stores edits relative to a reference.
-#     Effectively a linear coordinate projection (Compacted De Bruijn Graph path).
-#     """
-#     __slots__ = ('_reference', '_length', '_breakpoints', '_offsets', '_sources', '_mut_pool')
-# 
-#     def __init__(self, reference: Seq, mutations: Iterable):
-#         """
-#         Args:
-#             reference: The reference Seq.
-#             mutations: Iterable of Mutation objects (must have interval, ref_seq, alt_seq).
-#         """
-#         # Bypass Seq.__init__ validation for internal construction if needed,
-#         # but here we play nice by passing empty data and the correct alphabet.
-#         super().__init__(data=np.empty(0, dtype=self._DTYPE),
-#                          alphabet=reference.alphabet,
-#                          _validation_token=reference.alphabet)
-# 
-#         self._reference = reference
-#         self._build_index(mutations)
-# 
-#     @classmethod
-#     def _from_data(cls, reference: Seq, length, breakpoints, offsets, sources, mut_pool):
-#         """Internal factory for slicing/copying without re-building index."""
-#         obj = cls.__new__(cls)
-#         # Manually set Seq attributes since we skipped __init__
-#         obj._alphabet = reference.alphabet
-#         obj._data = np.empty(0, dtype=cls._DTYPE) # Dummy
-#         obj._hash = None
-#         
-#         obj._reference = reference
-#         obj._length = length
-#         obj._breakpoints = breakpoints
-#         obj._offsets = offsets
-#         obj._sources = sources
-#         obj._mut_pool = mut_pool
-#         return obj
-# 
-#     def _build_index(self, mutations: Iterable):
-#         reference = self._reference
-# 
-#         # 1. Sort mutations
-#         mutations = sorted(list(mutations), key=lambda x: x.interval.start)
-# 
-#         # 2. Pre-allocate flattened arrays
-#         capacity = len(mutations) * 2 + 1
-#         breakpoints = np.empty(capacity, dtype=np.int64)
-#         offsets = np.empty(capacity, dtype=np.int64)
-#         sources = np.empty(capacity, dtype=np.uint8)  # 0=Ref, 1=Pool
-# 
-#         mut_pool_parts = []
-#         mut_pool_cursor = 0
-#         virtual_pos = 0
-#         ref_pos = 0
-#         idx = 0
-# 
-#         for mut in mutations:
-#             # A. Ref Block (Sequence before mutation)
-#             ref_len_before = mut.interval.start - ref_pos
-#             if ref_len_before > 0:
-#                 breakpoints[idx] = virtual_pos
-#                 offsets[idx] = ref_pos - virtual_pos
-#                 sources[idx] = 0
-#                 idx += 1
-#                 virtual_pos += ref_len_before
-#                 ref_pos += ref_len_before
-# 
-#             # B. Mutation Block (Alt Sequence)
-#             if len(mut.alt_seq) > 0:
-#                 breakpoints[idx] = virtual_pos
-#                 encoded_alt = mut.alt_seq.encoded
-#                 mut_pool_parts.append(encoded_alt)
-#                 offsets[idx] = mut_pool_cursor - virtual_pos
-#                 sources[idx] = 1
-#                 idx += 1
-#                 mut_len = len(encoded_alt)
-#                 virtual_pos += mut_len
-#                 mut_pool_cursor += mut_len
-# 
-#             ref_pos += len(mut.ref_seq)
-# 
-#         # C. Final Ref Block
-#         remaining_ref = len(reference) - ref_pos
-#         if remaining_ref > 0:
-#             breakpoints[idx] = virtual_pos
-#             offsets[idx] = ref_pos - virtual_pos
-#             sources[idx] = 0
-#             idx += 1
-#             virtual_pos += remaining_ref
-# 
-#         self._length = virtual_pos
-#         self._breakpoints = breakpoints[:idx]
-#         self._offsets = offsets[:idx]
-#         self._sources = sources[:idx]
-#         self._mut_pool = np.concatenate(mut_pool_parts) if mut_pool_parts else np.empty(0, dtype=self._DTYPE)
-# 
-#     def __len__(self): return self._length
-# 
-#     @property
-#     def encoded(self) -> np.ndarray:
-#         """Materializes the full sequence into a numpy array."""
-#         return _sparse_reconstruct_kernel(
-#             0, self._length,
-#             self._breakpoints, self._offsets, self._sources,
-#             self._reference.encoded, self._mut_pool
-#         )
-# 
-#     def __getitem__(self, item):
-#         if isinstance(item, (int, np.integer)):
-#             if item < 0: item += self._length
-#             if not 0 <= item < self._length: raise IndexError("SparseSeq index out of range")
-#             arr = _sparse_reconstruct_kernel(
-#                 item, item + 1,
-#                 self._breakpoints, self._offsets, self._sources,
-#                 self._reference.encoded, self._mut_pool
-#             )
-#             return self._alphabet.seq_from(arr)
-# 
-#         if isinstance(item, slice):
-#             start, stop, step = item.indices(self._length)
-#             if step != 1:
-#                 # Complex slicing: materialize the range then slice
-#                 r_start, r_stop = (start, stop) if step > 0 else (stop + 1, start + 1)
-#                 arr = _sparse_reconstruct_kernel(
-#                     r_start, r_stop, self._breakpoints, self._offsets, self._sources,
-#                     self._reference.encoded, self._mut_pool
-#                 )
-#                 # Adjust slice relative to the reconstructed window
-#                 return self._alphabet.seq_from(arr[::step])
-# 
-#             arr = _sparse_reconstruct_kernel(
-#                 start, stop, self._breakpoints, self._offsets, self._sources,
-#                 self._reference.encoded, self._mut_pool
-#             )
-#             return self._alphabet.seq_from(arr)
-# 
-#         if isinstance(item, Interval):
-#             # Interval logic (assumes step=1)
-#             item = Interval.from_item(item, length=self._length)
-#             arr = _sparse_reconstruct_kernel(
-#                 item.start, item.end, self._breakpoints, self._offsets, self._sources,
-#                 self._reference.encoded, self._mut_pool
-#             )
-#             seq = self._alphabet.seq_from(arr)
-#             if item.strand == -1:
-#                 return self._alphabet.reverse_complement(seq)
-#             return seq
-# 
-#         raise TypeError(f"Invalid index type: {type(item)}")
-# 
-#     def densify(self) -> Seq:
-#         """Returns a standard dense Seq object."""
-#         return self._alphabet.seq_from(self.encoded)
 
 
 # TODO: There should be no kernels in the containers module - move to core.alphabet or consider moving module
@@ -666,45 +793,45 @@ def _batch_gather_kernel(data, starts, lengths, indices, out_data, out_starts):
 #     """
 #     length = stop - start
 #     result = np.empty(length, dtype=np.uint8)
-# 
+#
 #     # Find the starting block index
 #     # searchsorted returns the insertion point. We want the block *covering* start.
 #     # So if breakpoints are [0, 10, 20] and start is 5:
 #     # searchsorted(5, side='right') -> 1. block_idx = 0.
 #     blk_idx = np.searchsorted(breakpoints, start, side='right') - 1
 #     if blk_idx < 0: blk_idx = 0
-# 
+#
 #     current_virt = start
 #     filled = 0
 #     n_blocks = len(breakpoints)
-# 
+#
 #     while filled < length and blk_idx < n_blocks:
 #         # Determine boundaries of the current block
 #         blk_start = breakpoints[blk_idx]
-# 
+#
 #         # If this is the last block, the end is infinity (effectively)
 #         if blk_idx < n_blocks - 1:
 #             blk_end = breakpoints[blk_idx + 1]
 #         else:
 #             blk_end = 9223372036854775807
-# 
+#
 #         # Calculate overlap between [start, stop] and [blk_start, blk_end]
 #         chunk_start = max(current_virt, blk_start)
 #         chunk_end = min(stop, blk_end)
 #         chunk_len = chunk_end - chunk_start
-# 
+#
 #         if chunk_len > 0:
 #             offset = offsets[blk_idx]
 #             phys_start = chunk_start + offset
 #             phys_end = phys_start + chunk_len
 #             source = sources[blk_idx]
-# 
+#
 #             if source == 0:  # Reference
 #                 result[filled: filled + chunk_len] = ref_seq[phys_start: phys_end]
 #             else:  # Mutation Pool
 #                 result[filled: filled + chunk_len] = mut_pool[phys_start: phys_end]
-# 
+#
 #             filled += chunk_len
 #             current_virt += chunk_len
-# 
+#
 #         blk_idx += 1

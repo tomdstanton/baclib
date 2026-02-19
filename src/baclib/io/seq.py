@@ -1,3 +1,4 @@
+"""Readers and writers for sequence formats: FASTA, FASTQ, and GFA."""
 from pathlib import Path
 from typing import Union, Generator, BinaryIO, Iterable
 
@@ -5,14 +6,15 @@ import numpy as np
 
 from baclib.core.alphabet import Alphabet
 from baclib.core.interval import Strand
+from baclib.containers import Batch
 from baclib.containers.record import Record, RecordBatch
 from baclib.containers.graph import Edge, EdgeBatch
-from baclib.io import BaseReader, BaseWriter, ParserError, SeqFile, Qualifier
-from baclib.containers import Batch
+from baclib.io import BaseReader, BaseWriter, ParserError, SeqFile, Qualifier, SeqFileFormat
+
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
-@SeqFile.register(SeqFile.Format.FASTA, extensions=['.fasta', '.fa', '.fna', '.faa', '.ffn'],
+@SeqFile.register(SeqFileFormat.FASTA, extensions=['.fasta', '.fa', '.fna', '.faa', '.ffn'],
                   alphabets={'.faa': Alphabet.AMINO, '.fna': Alphabet.DNA, '.ffn': Alphabet.DNA})
 class FastaReader(BaseReader):
     """
@@ -20,17 +22,25 @@ class FastaReader(BaseReader):
     """
     __slots__ = ('_alphabet', '_min_seq_length', '_n_seq_lines')
     def __init__(self, handle: BinaryIO, alphabet: Alphabet = None, min_seq_length: int = 1, n_seq_lines: int = 0, **kwargs):
+        """Initializes the FASTA reader.
+
+        Args:
+            handle: Binary file handle.
+            alphabet: Alphabet to use (auto-detected if None).
+            min_seq_length: Minimum sequence length to yield.
+            n_seq_lines: Number of lines per sequence (optimization for fixed-width FASTA).
+            **kwargs: Additional arguments for base reader.
+        """
         super().__init__(handle, **kwargs)
         self._alphabet = alphabet
         self._min_seq_length = min_seq_length
         self._n_seq_lines = n_seq_lines
 
     def __iter__(self) -> Generator[Record, None, None]:
-        """
-        Iterates over FASTA records.
+        """Iterates over FASTA records.
 
         Yields:
-            Record objects.
+            ``Record`` objects.
         """
         if self._alphabet is None:
             # First element logic to detect alphabet
@@ -51,8 +61,13 @@ class FastaReader(BaseReader):
                 yield self._make_record(header, seq_parts)
 
     def batches(self, size: int = 1024) -> Generator[RecordBatch, None, None]:
-        """
-        Optimized batch reader that performs bulk encoding.
+        """Optimized batch reader that performs bulk encoding.
+
+        Args:
+            size: Maximum number of records per batch.
+
+        Yields:
+            ``RecordBatch`` objects.
         """
         entries = []
         iterator = self._read_entries()
@@ -206,10 +221,12 @@ class FastaReader(BaseReader):
         return RecordBatch.from_aligned_batch(batch, records)
     
     @classmethod
-    def sniff(cls, s: bytes) -> bool: return s.startswith(b">")
+    def sniff(cls, s: bytes) -> bool:
+        """Checks if the input bytes look like a FASTA file header."""
+        return s.startswith(b">")
 
 
-@SeqFile.register(SeqFile.Format.FASTA)
+@SeqFile.register(SeqFileFormat.FASTA)
 class FastaWriter(BaseWriter):
     """
     Writer for FASTA format files.
@@ -250,6 +267,11 @@ class FastaWriter(BaseWriter):
             self._handle.write(seq_bytes + b"\n")
 
     def write_batch(self, batch: Batch):
+        """Writes a batch of sequences efficiently.
+
+        Args:
+            batch: ``RecordBatch`` or other batch type.
+        """
         if isinstance(batch, RecordBatch):
             # Optimization: Decode entire batch data at once to avoid N translate calls
             seqs = batch.seqs
@@ -286,23 +308,29 @@ class FastaWriter(BaseWriter):
             super().write_batch(batch)
 
 
-@SeqFile.register(SeqFile.Format.GFA, extensions=['.gfa'])
+@SeqFile.register(SeqFileFormat.GFA, extensions=['.gfa'])
 class GfaReader(BaseReader):
     """
     Reader for GFA (Graphical Fragment Assembly) files.
     """
     __slots__ = ('_alphabet', '_min_seq_length')
     def __init__(self, handle: BinaryIO, min_seq_length: int = 1, **kwargs):
+        """Initializes the GFA reader.
+
+        Args:
+            handle: Binary file handle.
+            min_seq_length: Minimum sequence length for segments.
+            **kwargs: Additional arguments.
+        """
         super().__init__(handle, **kwargs)
         self._alphabet = Alphabet.DNA
         self._min_seq_length = min_seq_length
 
     def __iter__(self) -> Generator[Union[Record, Edge], None, None]:
-        """
-        Iterates over GFA lines (Segments as Records, Links as Edges).
+        """Iterates over GFA lines (Segments as Records, Links as Edges).
 
         Yields:
-            Record or Edge objects.
+            ``Record`` or ``Edge`` objects.
         """
         # Optimization: Read large binary chunks
         buf = bytearray()
@@ -325,6 +353,14 @@ class GfaReader(BaseReader):
                 pos = nl_pos + 1
     
     def batches(self, size: int = 1024):
+        """Yields batches of Records or Edges.
+
+        Args:
+            size: Maximum items per batch.
+
+        Yields:
+            ``RecordBatch`` or ``EdgeBatch`` objects.
+        """
         rec_entries = []
         edge_u = []
         edge_v = []
@@ -440,10 +476,12 @@ class GfaReader(BaseReader):
                        {b'cigar': parts[5]})
     
     @classmethod
-    def sniff(cls, s: bytes) -> bool: return s.startswith(b'H\t') or s.startswith(b'S\t')
+    def sniff(cls, s: bytes) -> bool:
+        """Checks if the input bytes look like a GFA file."""
+        return s.startswith(b'H\t') or s.startswith(b'S\t')
 
 
-@SeqFile.register(SeqFile.Format.GFA)
+@SeqFile.register(SeqFileFormat.GFA)
 class GfaWriter(BaseWriter):
     """
     Writer for GFA format files.
@@ -467,6 +505,11 @@ class GfaWriter(BaseWriter):
                                item.v + b"\t" + vs + b"\t" + cigar + b"\n")
 
     def write_batch(self, batch: Batch):
+        """Writes a batch of Records or Edges efficiently.
+
+        Args:
+            batch: ``RecordBatch`` or ``EdgeBatch``.
+        """
         if isinstance(batch, EdgeBatch):
             # Vectorized write for Edges
             u = batch.u
@@ -514,7 +557,7 @@ class GfaWriter(BaseWriter):
             super().write_batch(batch)
 
 
-@SeqFile.register(SeqFile.Format.FASTQ, extensions=['.fastq', '.fq'])
+@SeqFile.register(SeqFileFormat.FASTQ, extensions=['.fastq', '.fq'])
 class FastqReader(BaseReader):
     """
     Reader for FASTQ format files.
@@ -528,22 +571,36 @@ class FastqReader(BaseReader):
     """
     __slots__ = ('_alphabet', '_min_seq_length')
     def __init__(self, handle: BinaryIO, min_seq_length: int = 1, **kwargs):
+        """Initializes the FASTQ reader.
+
+        Args:
+            handle: Binary file handle.
+            min_seq_length: Minimum sequence length.
+            **kwargs: Additional arguments.
+        """
         super().__init__(handle, **kwargs)
         self._alphabet = Alphabet.DNA
         self._min_seq_length = min_seq_length
 
     def __iter__(self) -> Generator[Record, None, None]:
-        """
-        Iterates over FASTQ records.
+        """Iterates over FASTQ records.
 
         Yields:
-            Record objects.
+            ``Record`` objects.
         """
         for header, seq_bytes, qual_bytes in self._read_entries():
             name, _, desc = header.partition(b' ')
             yield Record(self._alphabet.seq_from(seq_bytes), name, desc, qualifiers=[(b'quality', qual_bytes)])
     
     def batches(self, size: int = 1024):
+        """Reads FASTQ records in batches.
+
+        Args:
+            size: Maximum records per batch.
+
+        Yields:
+            ``RecordBatch`` objects.
+        """
         entries = []
         for entry in self._read_entries():
             entries.append(entry)
@@ -622,4 +679,6 @@ class FastqReader(BaseReader):
         return RecordBatch.from_aligned_batch(batch, records)
 
     @classmethod
-    def sniff(cls, s: bytes) -> bool: return s.startswith(b"@")
+    def sniff(cls, s: bytes) -> bool:
+        """Checks if the input bytes look like a FASTQ file."""
+        return s.startswith(b"@")
