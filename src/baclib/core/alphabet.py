@@ -6,8 +6,8 @@ from typing import Union, Iterable, Final, Literal, ClassVar
 import numpy as np
 
 from baclib.core.interval import IntervalBatch
-from baclib.core.seq import CompressedSeqBatch, CompressedSeq, Seq, SeqBatch
-from baclib.utils.resources import jit, RESOURCES
+from baclib.containers.seq import Seq, SeqBatch, CompressedSeq, CompressedSeqBatch
+from baclib.lib.resources import jit, RESOURCES
 
 if RESOURCES.has_module('numba'):
     from numba import prange
@@ -143,6 +143,68 @@ class Alphabet:
         """Returns the complement lookup table if available."""
         return self._complement
 
+    @classmethod
+    def detect(cls, text: bytes) -> 'Alphabet':
+        """
+        Detects the most likely alphabet for the given byte string.
+
+        Candidates are checked in the following priority order:
+        1. DNA
+        2. RNA
+        3. AMINO
+        4. MURPHY_10
+
+        Scoring is based on:
+        1. Canonical Count: Number of characters strictly in the alphabet definition (case-insensitive).
+        2. Valid Count: Number of characters valid in the alphabet (including aliases).
+
+        Args:
+            text: The input byte string (or ASCII string).
+
+        Returns:
+            The most likely Alphabet singleton.
+        """
+        if isinstance(text, str):
+            text = text.encode(cls.ENCODING)
+
+        data = np.frombuffer(text, dtype=cls.DTYPE)
+
+        # Optimization: Scan data once to get character counts
+        # This reduces complexity from O(K*N) to O(N + K*C) where K=num_alphabets, C=256
+        counts = np.bincount(data, minlength=cls.MAX_LEN)
+
+        # Candidate alphabets in priority order
+        candidates = [cls.DNA, cls.RNA, cls.AMINO, cls.MURPHY_10]
+
+        best_alpha = candidates[0]
+        best_score = (-1, -1)
+
+        for alpha in candidates:
+            # 1. Canonical Score
+            # Create mask for canonical symbols (both cases)
+            is_canonical = np.zeros(cls.MAX_LEN, dtype=bool)
+            is_canonical[alpha._data] = True
+
+            # Handle lowercase
+            lower_indices = np.frombuffer(alpha._data.tobytes().lower(), dtype=cls.DTYPE)
+            is_canonical[lower_indices] = True
+
+            # Sum counts of canonical characters
+            n_canonical = counts[is_canonical].sum()
+
+            # 2. Valid Score
+            # Use lookup table - anything not INVALID is valid
+            is_valid = (alpha._lookup_table != cls.INVALID)
+            n_valid = counts[is_valid].sum()
+
+            score = (n_canonical, n_valid)
+
+            if score > best_score:
+                best_score = score
+                best_alpha = alpha
+
+        return best_alpha
+
     def masker(self, k: int) -> tuple[int, int, np.dtype]:
         """
         Returns (bits_per_symbol, bit_mask, dtype) for a specific K.
@@ -255,6 +317,22 @@ class Alphabet:
 
         raise TypeError(f"Cannot compress {type(seq)}")
 
+    def decompress(self, compressed: 'CompressedSeq') -> 'Seq':
+        """Decompresses a CompressedSeq back to a standard Seq."""
+        decoded = _unpack_seq_kernel(compressed._data, compressed._length, compressed._bits)
+        return self.seq_from(decoded)
+
+    def decompress_batch(self, batch: 'CompressedSeqBatch') -> 'SeqBatch':
+        """Decompresses a CompressedSeqBatch back to a standard SeqBatch."""
+        total_len = batch._lengths.sum()
+        out_data = np.empty(total_len, dtype=np.uint8)
+        out_starts = np.zeros(len(batch), dtype=np.int32)
+        if len(batch) > 1:
+            np.cumsum(batch._lengths[:-1], out=out_starts[1:])
+            
+        _unpack_batch_kernel(batch._data, batch._starts, batch._lengths, out_data, out_starts, batch._bits)
+        return self.new_batch(out_data, out_starts, batch._lengths)
+
     def new_seq(self, data: np.ndarray) -> 'Seq':
         """
         Factory method. The ONLY valid way to create a Seq.
@@ -314,7 +392,7 @@ class Alphabet:
         """
         return SeqBatch(data, starts, lengths, self, _validation_token=self)
 
-    def batch_from(self, data: Iterable['Seq']) -> 'SeqBatch':
+    def batch_from(self, data: Iterable['Seq'], deduplicate: bool = False) -> 'SeqBatch':
         # Optimization: Fast path for existing SeqBatch (Clone)
         if isinstance(data, SeqBatch):
             if data.alphabet != self: raise AlphabetError(
@@ -332,17 +410,34 @@ class Alphabet:
             if s.alphabet != self: raise AlphabetError("Can only create a batch from sequences with the same alphabet.")
 
         # Pass 2: Fill Data (Optimized with C-level concatenation)
-        if count > 0:
-            if count == 1:
-                # Zero-copy optimization for single sequence
-                data = items[0].encoded
-            else:
-                data = np.concatenate([s.encoded for s in items])
-        else:
-            data = np.empty(0, dtype=self.DTYPE)
-
         starts = np.zeros(count, dtype=np.int32)
-        if count > 1: np.cumsum(lengths[:-1], out=starts[1:])
+        
+        if deduplicate and count > 1:
+            # Deduplication Logic
+            unique_map = {} # Seq -> (offset, length)
+            unique_parts = []
+            current_offset = 0
+            
+            for i, s in enumerate(items):
+                if s in unique_map:
+                    offset, _ = unique_map[s]
+                    starts[i] = offset
+                else:
+                    starts[i] = current_offset
+                    unique_map[s] = (current_offset, lengths[i])
+                    unique_parts.append(s.encoded)
+                    current_offset += lengths[i]
+            
+            data = np.concatenate(unique_parts) if unique_parts else np.empty(0, dtype=self.DTYPE)
+        else:
+            # Standard Contiguous Logic
+            if count > 0:
+                data = items[0].encoded if count == 1 else np.concatenate([s.encoded for s in items])
+            else:
+                data = np.empty(0, dtype=self.DTYPE)
+            
+            if count > 1: np.cumsum(lengths[:-1], out=starts[1:])
+            
         return self.new_batch(data, starts, lengths)
 
     def empty_batch(self) -> 'SeqBatch':
@@ -409,6 +504,7 @@ class Alphabet:
         if self._complement is None: return seq
         # Use .encoded for direct numpy access (much faster than iterating reversed(seq))
         return self.seq_from(self._complement[seq.encoded[::-1]])
+
 
 
 # Initialize Standard Alphabets
@@ -968,3 +1064,32 @@ def _batch_score_kernel(data, starts, lengths, is_mean):
         else:
             out[i] = total
     return out
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _unpack_seq_kernel(packed, length, bits):
+    out = np.empty(length, dtype=np.uint8)
+    per_byte = 8 // bits
+    mask = (1 << bits) - 1
+    
+    for i in range(length):
+        byte_idx = i // per_byte
+        bit_offset = (per_byte - 1 - (i % per_byte)) * bits
+        val = (packed[byte_idx] >> bit_offset) & mask
+        out[i] = val
+    return out
+
+
+@jit(nopython=True, cache=True, nogil=True, parallel=True)
+def _unpack_batch_kernel(packed, packed_starts, lengths, out_data, out_starts, bits):
+    n_seqs = len(lengths)
+    per_byte = 8 // bits
+    mask = (1 << bits) - 1
+    for i in prange(n_seqs):
+        p_s = packed_starts[i]
+        l = lengths[i]
+        dst_s = out_starts[i]
+        for j in range(l):
+            byte_idx = j // per_byte
+            bit_offset = (per_byte - 1 - (j % per_byte)) * bits
+            out_data[dst_s + j] = (packed[p_s + byte_idx] >> bit_offset) & mask

@@ -3,8 +3,8 @@ from enum import IntEnum, auto
 
 import numpy as np
 
-from baclib.utils.resources import RESOURCES, jit
-from baclib.utils import Batch
+from baclib.lib.resources import RESOURCES, jit
+from baclib.containers import Batch
 
 if RESOURCES.has_module('numba'):
     from numba import prange
@@ -13,7 +13,6 @@ else:
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
-
 class Context(IntEnum):
     UPSTREAM = auto()
     DOWNSTREAM = auto()
@@ -59,8 +58,6 @@ class Strand(IntEnum):
         cls._BYTES_CACHE = {cls.FORWARD: b'+', cls.REVERSE: b'-', cls.UNSTRANDED: b'.'}
         cls._FROM_BYTES_CACHE = { b'+': cls.FORWARD, b'-': cls.REVERSE, b'.': cls.UNSTRANDED}
 
-Strand._init_caches()
-
 
 class Interval:
     """
@@ -71,7 +68,6 @@ class Interval:
         end: The end position (0-based, exclusive).
         strand: The strand (FORWARD, REVERSE, or UNSTRANDED).
     """
-    # 1. Use private slots
     __slots__ = ('_start', '_end', '_strand')
 
     def __init__(self, start: int, end: int, strand: Any = None):
@@ -225,25 +221,25 @@ class Interval:
         return cls(start, start + length, rng.choice([1, -1]))
     
     @classmethod
-    def from_match(cls, item: Match, strand: int = 0) -> 'Interval': 
-        return Interval(item.start(), item.end(), strand or 1)
+    def from_match(cls, item: Match, strand: int = Strand.UNSTRANDED) -> 'Interval': 
+        return Interval(item.start(), item.end(), strand)
     
     @classmethod
-    def from_int(cls, item: int, strand: int = 0, length: int = None) -> 'Interval':
+    def from_int(cls, item: int, strand: int = Strand.UNSTRANDED, length: int = None) -> 'Interval':
         if item < 0 and length is not None: item += length
-        return cls(item, item + 1, strand or 1)
+        return cls(item, item + 1, strand)
 
     @classmethod
-    def from_slice(cls, item: slice, strand: int = 0, length: int = None) -> 'Interval':
+    def from_slice(cls, item: slice, strand: int = Strand.UNSTRANDED, length: int = None) -> 'Interval':
         start, stop, step = item.start, item.stop, item.step
         if start is None: start = 0
         if stop is None and length is not None: stop = length
         if stop is None: raise ValueError("Cannot create Interval from slice with None stop without 'length'")
-        if step == -1: return cls(stop + 1, start + 1, strand or -1)
-        return cls(start, stop, strand or 1)
+        if step == -1: return cls(stop + 1, start + 1, strand)
+        return cls(start, stop, strand)
 
     @classmethod
-    def from_item(cls, item: Union[slice, int, 'Interval', Match], strand: int = 0, length: int = None) -> 'Interval':
+    def from_item(cls, item: Union[slice, int, 'Interval', Match], strand: int = Strand.UNSTRANDED, length: int = None) -> 'Interval':
         """
         Coerces various types into an Interval.
 
@@ -324,18 +320,68 @@ class IntervalBatch(Batch):
                 # Create the mapping only now that we know we are scrambling the order
                 self._original_indices = order.astype(np.int32)
 
+
     @classmethod
-    def from_intervals(cls, *intervals: Interval) -> 'IntervalBatch':
+    def zeros(cls, n: int) -> 'IntervalBatch':
+        """Creates a batch of n 0-length intervals at position 0."""
+        return cls(
+            np.zeros(n, dtype=np.int32),
+            np.zeros(n, dtype=np.int32),
+            np.ones(n, dtype=np.int32) # Default strand? Or 0? Or 1 (FORWARD)? Strand(1) is standard.
+        )
+
+    @classmethod
+    def random(cls, n: int, rng: np.random.Generator = None, length: int = None, min_len: int = 1, max_len: int = 1000,
+               min_start: int = 0, max_start: int = 1_000_000) -> 'IntervalBatch':
         """
-        Creates an IntervalBatch from a list of Interval objects.
+        Creates a batch of n random intervals.
 
         Args:
-            *intervals: Variable number of Interval objects.
+            n: Number of intervals to generate.
+            rng: Random number generator (optional).
+            length: Fixed length for all intervals (optional).
+            min_len: Minimum length (default: 1).
+            max_len: Maximum length (default: 1000).
+            min_start: Minimum start position (default: 0).
+            max_start: Maximum start position (default: 1,000,000).
 
         Returns:
             An IntervalBatch.
         """
-        if not intervals: return cls()
+        if rng is None: rng = RESOURCES.rng
+        if n <= 0: return cls.empty()
+
+        # 1. Generate Lengths
+        if length is not None:
+             lengths = np.full(n, length, dtype=np.int32)
+        else:
+             lengths = rng.integers(min_len, max_len, size=n, dtype=np.int32)
+
+        # 2. Generate Starts
+        # We treat max_start as the upper bound for the start coordinate (exclusive).
+        if max_start <= min_start:
+             raise ValueError(f"max_start ({max_start}) must be > min_start ({min_start})")
+             
+        starts = rng.integers(min_start, max_start, size=n, dtype=np.int32)
+        
+        # 3. Generate Ends
+        ends = starts + lengths
+        
+        # 4. Generate Strands (-1, 0, 1)
+        strands = rng.choice([-1, 0, 1], size=n).astype(np.int32)
+        
+        return cls(starts, ends, strands, sort=True)
+
+    @classmethod
+    def empty(cls) -> 'IntervalBatch':
+        return cls.zeros(0)
+
+    @classmethod
+    def build(cls, *intervals: Union[Interval, Iterable[Interval]]) -> 'IntervalBatch':
+        """
+        Creates an IntervalBatch from an iterable of Interval objects (or varargs).
+        """
+        if not intervals: return cls.empty()
         # Handle single iterable argument
         if len(intervals) == 1 and isinstance(intervals[0], Iterable) and not isinstance(intervals[0], Interval):
             intervals = intervals[0]
@@ -343,7 +389,7 @@ class IntervalBatch(Batch):
         # Vectorized construction using list comprehension is generally faster than explicit loops
         data = [(x._start, x._end, x._strand) for x in intervals]
         arr = np.array(data, dtype=cls._DTYPE)
-        if len(arr) == 0: return cls()
+        if len(arr) == 0: return cls.empty()
         return cls(arr[:, 0], arr[:, 1], arr[:, 2])
 
     @classmethod
@@ -357,7 +403,7 @@ class IntervalBatch(Batch):
         Returns:
             An IntervalBatch.
         """
-        if not features: return cls()
+        if not features: return cls.empty()
         
         # Handle single argument (list, batch, iterator)
         if len(features) == 1:
@@ -398,7 +444,7 @@ class IntervalBatch(Batch):
         Returns:
             An IntervalBatch.
         """
-        if not items: return cls()
+        if not items: return cls.empty()
         arr = np.array([tuple(Interval.from_item(i)) for i in items], dtype=cls._DTYPE)
         return cls(arr[:, 0], arr[:, 1], arr[:, 2])
 
@@ -408,7 +454,7 @@ class IntervalBatch(Batch):
         Concatenates multiple IntervalBatches.
         """
         batches = list(batches)
-        if not batches: return cls()
+        if not batches: return cls.empty()
         
         starts = np.concatenate([b._starts for b in batches])
         ends = np.concatenate([b._ends for b in batches])
@@ -417,7 +463,7 @@ class IntervalBatch(Batch):
         return cls(starts, ends, strands, sort=True)
 
     def empty(self) -> 'IntervalBatch':
-        return IntervalBatch()
+        return IntervalBatch.empty()
 
     def __repr__(self): return f"<IntervalBatch: {len(self)} intervals>"
 
@@ -473,6 +519,10 @@ class IntervalBatch(Batch):
     def strands(self): return self._strands
     
     @property
+    def nbytes(self) -> int:
+        return self._starts.nbytes + self._ends.nbytes + self._strands.nbytes + (self._original_indices.nbytes if self._original_indices is not None else 0)
+
+    @property
     def centers(self) -> np.ndarray:
         """Returns the center points of the intervals."""
         return (self._starts + self._ends) / 2
@@ -503,12 +553,12 @@ class IntervalBatch(Batch):
         Returns:
             A new IntervalBatch representing the intersection.
         """
-        if len(self) == 0 or len(other) == 0: return IntervalBatch()
+        if len(self) == 0 or len(other) == 0: return IntervalBatch.empty()
         # Call Numba Kernel
         out = _intersect_kernel(self.starts, self.ends, self.strands,
                                 other.starts, other.ends, other.strands, stranded)
         # Kernel returns tuple of arrays
-        if len(out[0]) == 0: return IntervalBatch()
+        if len(out[0]) == 0: return IntervalBatch.empty()
         return IntervalBatch(out[0], out[1], out[2], sort=False)
 
     def subtract(self, other: 'IntervalBatch', stranded: bool = False) -> 'IntervalBatch':
@@ -528,7 +578,7 @@ class IntervalBatch(Batch):
 
         out = _subtract_kernel(self.starts, self.ends, self.strands,
                                b_merged.starts, b_merged.ends, b_merged.strands, stranded)
-        if len(out[0]) == 0: return IntervalBatch()
+        if len(out[0]) == 0: return IntervalBatch.empty()
         return IntervalBatch(out[0], out[1], out[2], sort=False)
 
     def promoters(self, upstream: int = 100, downstream: int = 0) -> 'IntervalBatch':
@@ -544,7 +594,7 @@ class IntervalBatch(Batch):
         Returns:
             A new IntervalBatch of promoters.
         """
-        if len(self) == 0: return IntervalBatch()
+        if len(self) == 0: return IntervalBatch.empty()
 
         s = self._starts
         e = self._ends
@@ -583,7 +633,7 @@ class IntervalBatch(Batch):
             A new IntervalBatch.
         """
         if right is None: right = left
-        if len(self) == 0: return IntervalBatch()
+        if len(self) == 0: return IntervalBatch.empty()
 
         # Map string direction to int for Numba
         d_code = 0  # both
@@ -686,12 +736,12 @@ class IntervalBatch(Batch):
             A new IntervalBatch of tiles.
         """
         if step is None: step = width
-        if len(self) == 0: return IntervalBatch()
+        if len(self) == 0: return IntervalBatch.empty()
 
         # Pass 1: Count tiles per interval (Parallel)
         counts = _tile_count_kernel(self.starts, self.ends, width, step)
         total_tiles = counts.sum()
-        if total_tiles == 0: return IntervalBatch()
+        if total_tiles == 0: return IntervalBatch.empty()
 
         # Calculate Offsets
         offsets = np.zeros(len(counts), dtype=np.int32)
@@ -756,7 +806,7 @@ class IntervalBatch(Batch):
         Returns:
             A new IntervalBatch.
         """
-        if len(self) == 0: return IntervalBatch()
+        if len(self) == 0: return IntervalBatch.empty()
         return IntervalBatch(length - self._ends, length - self._starts, self._strands * -1, sort=True)
 
     def complement(self, length: int = None) -> 'IntervalBatch':
@@ -772,8 +822,8 @@ class IntervalBatch(Batch):
             A new IntervalBatch representing the gaps.
         """
         if len(self) == 0:
-            if length is None: return IntervalBatch()
-            return IntervalBatch.from_intervals(Interval(0, length))
+            if length is None: return IntervalBatch.empty()
+            return IntervalBatch.build(Interval(0, length))
 
         # Merge first to remove overlaps and sort
         merged = self.merge()
@@ -1284,3 +1334,7 @@ def _is_sorted_kernel(starts, ends):
         if starts[i] == starts[i+1]:
             if ends[i] > ends[i+1]: return False
     return True
+
+
+# Cache initialisations ------------------------------------------------------------------------------------------------
+Strand._init_caches()

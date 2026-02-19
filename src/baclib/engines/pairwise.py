@@ -3,10 +3,10 @@ from enum import IntEnum
 
 import numpy as np
 
-from baclib.core.seq import Seq, SeqBatch
+from baclib.containers.seq import Seq, SeqBatch
 from baclib.engines.index import SparseMapIndex, _find_hits_kernel
-from baclib.containers.alignment import AlignmentBatch, Cigar, CigarOp
-from baclib.utils.resources import RESOURCES, jit
+from baclib.containers.alignment import AlignmentBatch, Cigar
+from baclib.lib.resources import RESOURCES, jit
 
 if RESOURCES.has_module('numba'):
     from numba import prange
@@ -177,7 +177,7 @@ class Aligner:
         raw_q_ids = (raw_packed >> 32).astype(np.uint32)
         raw_q_pos = raw_packed.astype(np.uint32)
         
-        if len(raw_q_ids) == 0: return AlignmentBatch()
+        if len(raw_q_ids) == 0: return AlignmentBatch.empty()
 
         # 2. Cluster & Bounding Box (Crucial Optimization)
         # Groups seeds by (q_id, t_id) and finds min/max coords
@@ -188,7 +188,7 @@ class Aligner:
             queries.arrays[2], self._data.arrays[2],
             is_global=(self._mode == AlignmentMode.GLOBAL)
         )
-        if len(candidates) == 0: return AlignmentBatch()
+        if len(candidates) == 0: return AlignmentBatch.empty()
 
         # Unpack candidates: [q_idx, t_idx, qs, qe, ts, te]
         c_q_idx = candidates[:, 0]
@@ -213,7 +213,7 @@ class Aligner:
         )
         # 4. Filter & Refine
         mask = out_scores >= min_score
-        if not np.any(mask): return AlignmentBatch()
+        if not np.any(mask): return AlignmentBatch.empty()
 
         v_q_idx = c_q_idx[mask]
         v_t_idx = c_t_idx[mask]

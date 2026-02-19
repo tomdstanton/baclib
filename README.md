@@ -91,7 +91,7 @@ with SeqFile("annotation.gbk") as reader:
 ### Sequence Manipulation
 
 ```python
-from baclib.core.seq import Alphabet, GeneticCode
+from baclib.containers.seq import Alphabet, GeneticCode
 
 dna = Alphabet.dna()
 
@@ -117,7 +117,7 @@ Perform local, global, or glocal alignment using the built-in high-performance a
 
 ```python
 from baclib.engines.pairwise import Aligner
-from baclib.core.seq import Alphabet, SeqBatch
+from baclib.containers.seq import Alphabet, SeqBatch
 
 dna = Alphabet.dna()
 
@@ -144,9 +144,9 @@ for hit in hits:
 Ensure `minimap2` is installed and in your PATH.
 
 ```python
-from baclib.utils.external import Minimap2
+from baclib.lib.external import Minimap2
 from baclib.containers.record import Record
-from baclib.core.seq import Alphabet
+from baclib.containers.seq import Alphabet
 
 dna = Alphabet.dna()
 ref = Record(dna.random_seq(length=10000), id_=b"ref")

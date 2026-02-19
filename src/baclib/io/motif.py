@@ -7,9 +7,10 @@ from baclib.core.alphabet import Alphabet
 from baclib.io import BaseReader, SeqFile
 
 
+# Classes --------------------------------------------------------------------------------------------------------------
 class MotifReader(BaseReader):
     """Base class for motif readers."""
-    _DEFAULT_BACKGROUND = Background.uniform(Alphabet.dna())
+    _DEFAULT_BACKGROUND = Background.uniform(Alphabet.DNA)
     def __init__(self, handle: BinaryIO, background: Background = None, **kwargs):
         super().__init__(handle, **kwargs)
         self.background: Background = background or self._DEFAULT_BACKGROUND
@@ -18,7 +19,7 @@ class MotifReader(BaseReader):
         return MotifBatch(items)
 
 
-@SeqFile.register('meme')
+@SeqFile.register(SeqFile.Format.MEME, extensions=['.meme', '.txt'])
 class MemeReader(MotifReader):
     """
     Reader for MEME format files.
@@ -118,7 +119,7 @@ class MemeReader(MotifReader):
     def sniff(cls, s: bytes) -> bool:
         return s.startswith(b'MEME version')
 
-@SeqFile.register('transfac')
+@SeqFile.register(SeqFile.Format.TRANSFAC, extensions=['.transfac', '.tf'])
 class TransfacReader(MotifReader):
     """
     Reader for TRANSFAC format files.

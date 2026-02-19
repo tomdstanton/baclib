@@ -3,8 +3,9 @@ from enum import IntEnum
 from typing import Union
 import numpy as np
 
-from baclib.core.seq import Seq, SeqBatch, Alphabet
-from baclib.utils.resources import RESOURCES, jit
+from baclib.containers.seq import Seq, SeqBatch
+from baclib.core.alphabet import Alphabet
+from baclib.lib.resources import RESOURCES, jit
 
 if RESOURCES.has_module('numba'):
     from numba import prange
@@ -25,7 +26,7 @@ class BaseIndex(ABC):
         canonical (bool): Whether to use canonical k-mers (min of forward/reverse).
     """
     __slots__ = ('_k', '_alphabet', '_canonical', '_built', '_bps', '_mask', '_dtype', '_rc_table')
-    _DEFAULT_ALPHABET = Alphabet.dna()
+    _DEFAULT_ALPHABET = Alphabet.DNA
     def __init__(self, k: int, alphabet: Alphabet = None, canonical: bool = True):
         self._k = k
         self._alphabet = alphabet or self._DEFAULT_ALPHABET

@@ -3,10 +3,12 @@ from typing import Union, Generator
 
 import numpy as np
 
-from baclib.containers.alignment import Alignment, AlignmentBatch
+from baclib.containers.alignments import Alignment, AlignmentBatch
 from baclib.containers.record import Record, Feature, FeatureBatch, FeatureKey, QualifierBatch
+from baclib.containers.mutations import Mutation, MutationBatch
+from baclib.containers.seq import Seq, SeqBatch
 from baclib.core.interval import Interval, IntervalBatch
-from baclib.io import BaseWriter, BaseReader, SeqFile, SeqFileFormat, Qualifier
+from baclib.io import BaseWriter, BaseReader, SeqFile, Qualifier
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
@@ -21,27 +23,27 @@ class TabularReader(BaseReader):
         delim = self._delim
         min_cols = self._min_cols
         
-        buf = b""
+        buf = bytearray()
         for chunk in self.read_chunks(self._CHUNK_SIZE):
             if not chunk:
                 if buf:
-                    line = buf.rstrip()
+                    line = bytes(buf).rstrip()
                     if line and not line.startswith(b'#'):
                         parts = line.split(delim)
                         if len(parts) >= min_cols:
                             yield parts
                 break
 
-            buf += chunk
+            buf.extend(chunk)
             pos = 0
 
             while True:
                 nl_pos = buf.find(b'\n', pos)
                 if nl_pos == -1:
-                    buf = buf[pos:]
+                    del buf[:pos]
                     break
 
-                line = buf[pos:nl_pos].rstrip()
+                line = bytes(buf[pos:nl_pos]).rstrip()
                 pos = nl_pos + 1
 
                 if not line or line.startswith(b'#'): continue
@@ -94,7 +96,7 @@ class TabularReader(BaseReader):
         pass
 
 
-@SeqFile.register(SeqFileFormat.BED, extensions=['.bed'])
+@SeqFile.register(SeqFile.Format.BED, extensions=['.bed'])
 class BedReader(TabularReader):
     """
     Reader for BED format files.
@@ -143,29 +145,28 @@ class BedReader(TabularReader):
     def _make_batch_from_parts(self, parts_list: list[list[bytes]]) -> FeatureBatch:
         n = len(parts_list)
         if n == 0: 
-            return FeatureBatch.empty_batch()
+            return FeatureBatch.empty()
 
-        starts = np.empty(n, dtype=np.int32)
-        ends = np.empty(n, dtype=np.int32)
-        strands = np.empty(n, dtype=np.int32)
-        keys = np.empty(n, dtype=np.int16)
+        # Vectorized parsing using list comprehensions (faster than loop assignment)
+        starts = np.array([int(p[1]) for p in parts_list], dtype=np.int32)
+        ends = np.array([int(p[2]) for p in parts_list], dtype=np.int32)
         
         from_bytes = FeatureKey.from_bytes
+        keys = np.array([from_bytes(p[3] if len(p) > 3 else b'feature').value for p in parts_list], dtype=np.int16)
         
+        # Strands
+        def _get_strand(p):
+            if len(p) > 5:
+                s = p[5]
+                if s == b'+': return 1
+                if s == b'-': return -1
+            return 0
+        strands = np.array([_get_strand(p) for p in parts_list], dtype=np.int32)
+
         qualifiers_collection = []
-        
-        for i, parts in enumerate(parts_list):
-            starts[i] = int(parts[1])
-            ends[i] = int(parts[2])
-            
-            n_cols = len(parts)
-            s_char = parts[5] if n_cols > 5 else b'.'
-            strands[i] = 1 if s_char == b'+' else (-1 if s_char == b'-' else 0)
-            
-            kind_bytes = parts[3] if n_cols > 3 else b'feature'
-            keys[i] = from_bytes(kind_bytes).value
-            
+        for parts in parts_list:
             quals = [(b'source', parts[0])]
+            n_cols = len(parts)
             score = float(parts[4]) if n_cols > 4 and parts[4] != b'.' else 0.0
             if score: quals.append((b'score', score))
             if n_cols > 9: quals.append((b'blocks', b','.join(parts[9:])))
@@ -177,7 +178,7 @@ class BedReader(TabularReader):
         return FeatureBatch(intervals, keys, qualifiers)
 
 
-@SeqFile.register(SeqFileFormat.BED)
+@SeqFile.register(SeqFile.Format.BED)
 class BedWriter(BaseWriter):
     """
     Writer for BED format files.
@@ -209,7 +210,7 @@ class BedWriter(BaseWriter):
             self._handle.write(line)
 
 
-@SeqFile.register(SeqFileFormat.GFF, extensions=['.gff', '.gff3'])
+@SeqFile.register(SeqFile.Format.GFF, extensions=['.gff', '.gff3'])
 class GffReader(TabularReader):
     """
     Reader for GFF3 format files.
@@ -249,28 +250,26 @@ class GffReader(TabularReader):
     def _make_batch_from_parts(self, parts_list: list[list[bytes]]) -> FeatureBatch:
         n = len(parts_list)
         if n == 0: 
-            return FeatureBatch.empty_batch()
+            return FeatureBatch.empty()
 
-        starts = np.empty(n, dtype=np.int32)
-        ends = np.empty(n, dtype=np.int32)
-        strands = np.empty(n, dtype=np.int32)
-        keys = np.empty(n, dtype=np.int16)
+        # GFF is 1-based inclusive -> 0-based half-open
+        starts = np.array([int(p[3]) - 1 for p in parts_list], dtype=np.int32)
+        ends = np.array([int(p[4]) for p in parts_list], dtype=np.int32)
         
         from_bytes = FeatureKey.from_bytes
+        keys = np.array([from_bytes(p[2]).value for p in parts_list], dtype=np.int16)
+        
+        # Strands
+        def _get_strand(p):
+            s = p[6]
+            if s == b'+': return 1
+            if s == b'-': return -1
+            return 0
+        strands = np.array([_get_strand(p) for p in parts_list], dtype=np.int32)
+        
         parse_attrs = Qualifier.parse_gff_attributes
-        
         qualifiers_collection = []
-        
-        for i, parts in enumerate(parts_list):
-            # GFF is 1-based inclusive -> 0-based half-open
-            starts[i] = int(parts[3]) - 1
-            ends[i] = int(parts[4])
-            
-            s_char = parts[6]
-            strands[i] = 1 if s_char == b'+' else (-1 if s_char == b'-' else 0)
-            
-            keys[i] = from_bytes(parts[2]).value
-            
+        for parts in parts_list:
             quals = parse_attrs(parts[8])
             quals.append((b'source', parts[0]))
             if parts[1] != b'.': quals.append((b'tool', parts[1]))
@@ -284,7 +283,7 @@ class GffReader(TabularReader):
         return FeatureBatch(intervals, keys, qualifiers)
 
 
-@SeqFile.register(SeqFileFormat.GFF)
+@SeqFile.register(SeqFile.Format.GFF)
 class GffWriter(BaseWriter):
     """
     Writer for GFF3 format files.
@@ -341,7 +340,7 @@ class GffWriter(BaseWriter):
             b"\t".join([seq_id, source, kind_bytes, str(start).encode('ascii'), str(end).encode('ascii'), str(score).encode('ascii'), strand, str(phase).encode('ascii'), attr_block]) + b"\n")
 
 
-@SeqFile.register(SeqFileFormat.PAF, extensions=['.paf'])
+@SeqFile.register(SeqFile.Format.PAF, extensions=['.paf'])
 class PafReader(TabularReader):
     """
     Reader for PAF (Pairwise mApping Format) files.
@@ -384,7 +383,7 @@ class PafReader(TabularReader):
     
     def _make_batch_from_parts(self, parts_list: list[list[bytes]]) -> AlignmentBatch:
         n = len(parts_list)
-        if n == 0: return AlignmentBatch()
+        if n == 0: return AlignmentBatch.empty()
         
         # PAF cols: 
         # 0:q, 1:q_len, 2:q_s, 3:q_e, 4:strand, 5:t, 6:t_len, 7:t_s, 8:t_e, 9:match, 10:aln_len, 11:qual
@@ -447,7 +446,7 @@ class PafReader(TabularReader):
             return False
     
 
-@SeqFile.register(SeqFileFormat.PAF)
+@SeqFile.register(SeqFile.Format.PAF)
 class PafWriter(BaseWriter):
     """
     Writer for PAF (Pairwise mApping Format) files.
@@ -573,3 +572,166 @@ class PafWriter(BaseWriter):
                     continue
                 
                 parts.append(k + b":" + type_char + b":" + val_bytes)
+
+
+@SeqFile.register(SeqFile.Format.VCF, extensions=['.vcf'])
+class VcfReader(TabularReader):
+    """
+    Reader for VCF (Variant Call Format) files.
+    """
+    _min_cols = 8
+
+    def parse_row(self, parts: list[bytes]) -> Mutation:
+        """
+        Parses a VCF row into a Mutation.
+        CHROM POS ID REF ALT QUAL FILTER INFO
+        """
+        chrom = parts[0]
+        pos = int(parts[1]) - 1  # VCF is 1-based
+        ref_bytes = parts[3]
+        alt_bytes = parts[4]
+        
+        # Handle multiple ALTs? For now assume single or take first/split?
+        # Specification says comma separated. Mutation expects single Seq.
+        # We will take the first ALT for now or yield multiple?
+        # BaseReader model yields one item per row usually.
+        # Let's support single ALT for now or split if needed.
+        # Ideally we should yield multiple Mutations if multiple ALTs.
+        # But parse_row returns ONE object.
+        # So we treat complex ALTs as the literal bytes for now.
+        
+        # Interval
+        # Ref length determines end
+        ref_len = len(ref_bytes)
+        interval = Interval(pos, pos + ref_len, 1)
+        
+        ref_seq = Seq(ref_bytes)
+        alt_seq = Seq(alt_bytes)
+        
+        quals = []
+        # QUAL
+        if parts[5] != b'.':
+            quals.append((b'quality', float(parts[5])))
+        
+        # FILTER
+        if parts[6] != b'.':
+            quals.append((b'filter', parts[6]))
+        
+        # INFO
+        if parts[7] != b'.':
+            for chunk in parts[7].split(b';'):
+                if b'=' in chunk:
+                    k, v = chunk.split(b'=', 1)
+                    quals.append((k, v))
+                else:
+                    quals.append((chunk, True))
+        
+        # CHROM -> source? or just a qualifier?
+        # Mutation doesn't have 'seq_id' field, it relies on context or qualifiers.
+        quals.append((b'source', chrom))
+        
+        return Mutation(interval, ref_seq, alt_seq, qualifiers=quals)
+
+    @classmethod
+    def sniff(cls, s: bytes) -> bool:
+        return s.startswith(b'##fileformat=VCF')
+
+    def _make_batch(self, items: list) -> MutationBatch:
+        return MutationBatch.build(items)
+
+    def _make_batch_from_parts(self, parts_list: list[list[bytes]]) -> MutationBatch:
+        n = len(parts_list)
+        if n == 0: return MutationBatch.empty()
+
+        # Vectorized parsing
+        # CHROM(0) POS(1) ID(2) REF(3) ALT(4) QUAL(5) FILTER(6) INFO(7)
+        
+        starts = np.array([int(p[1]) - 1 for p in parts_list], dtype=np.int32)
+        
+        ref_seqs_list = [Seq(p[3]) for p in parts_list]
+        alt_seqs_list = [Seq(p[4]) for p in parts_list]
+        
+        ref_lens = np.array([len(s) for s in ref_seqs_list], dtype=np.int32)
+        ends = starts + ref_lens
+        strands = np.ones(n, dtype=np.int32)
+        
+        intervals = IntervalBatch(starts, ends, strands, sort=False)
+        ref_seqs = SeqBatch.build(ref_seqs_list)
+        alt_seqs = SeqBatch.build(alt_seqs_list)
+        
+        # Qualifiers parsing
+        qualifiers_collection = []
+        for parts in parts_list:
+            row_quals = []
+            if parts[5] != b'.': row_quals.append((b'quality', float(parts[5])))
+            if parts[6] != b'.': row_quals.append((b'filter', parts[6]))
+            if parts[7] != b'.':
+                for chunk in parts[7].split(b';'):
+                    if b'=' in chunk:
+                        k, v = chunk.split(b'=', 1)
+                        row_quals.append((k, v))
+                    else:
+                        row_quals.append((chunk, True))
+            row_quals.append((b'source', parts[0]))
+            qualifiers_collection.append(row_quals)
+            
+        qualifiers = QualifierBatch.from_qualifiers(qualifiers_collection)
+        
+        return MutationBatch(intervals, ref_seqs, alt_seqs, qualifiers=qualifiers)
+
+
+@SeqFile.register(SeqFile.Format.VCF)
+class VcfWriter(BaseWriter):
+    """
+    Writer for VCF files.
+    """
+    def write_header(self):
+        self._handle.write(b"##fileformat=VCFv4.2\n")
+        self._handle.write(b"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+
+    def write_one(self, item: Union[Mutation, MutationBatch]):
+        if isinstance(item, MutationBatch):
+            self.write_batch(item)
+        elif isinstance(item, Mutation):
+            self._write_mutation(item)
+        else:
+            raise TypeError(f"VcfWriter expects Mutation or MutationBatch, got {type(item)}")
+
+    def _write_mutation(self, m: Mutation):
+        chrom = m.qualifiers.get(b'source', b'.')
+        pos = m.interval.start + 1
+        ref = m.ref_seq.bytes
+        alt = m.alt_seq.bytes
+        
+        qual = m.qualifiers.get(b'quality', b'.')
+        if isinstance(qual, float): qual = b"%.2f" % qual
+        
+        filt = m.qualifiers.get(b'filter', b'.')
+        
+        # Reconstruct INFO
+        info_parts = []
+        for k, v in m.qualifiers:
+            if k in (b'source', b'quality', b'filter'): continue
+            if v is True: info_parts.append(k)
+            else:
+                val_str = v.decode('ascii') if isinstance(v, bytes) else str(v)
+                info_parts.append(k + b"=" + val_str.encode('ascii'))
+        
+        info = b";".join(info_parts) if info_parts else b'.'
+        
+        row = b"\t".join([
+            chrom,
+            b"%d" % pos,
+            b".",
+            ref,
+            alt,
+            qual if isinstance(qual, bytes) else str(qual).encode('ascii'),
+            filt,
+            info
+        ]) + b"\n"
+        self._handle.write(row)
+
+    def write_batch(self, batch: MutationBatch):
+        for i in range(len(batch)):
+            # TODO: Optimize batch writing
+            self._write_mutation(batch[i])

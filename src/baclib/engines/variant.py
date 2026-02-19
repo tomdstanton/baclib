@@ -1,10 +1,10 @@
 import numpy as np
 
-from baclib.core.seq import SeqBatch
+from baclib.containers.seq import SeqBatch
 from baclib.core.interval import IntervalBatch
 from baclib.containers.alignment import AlignmentBatch, Cigar, CigarOp
-from baclib.containers.record import MutationBatch
-from baclib.utils.resources import jit
+from baclib.containers.delta import MutationBatch
+from baclib.lib.resources import jit
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
@@ -127,11 +127,7 @@ class VariantCaller:
 
         # Construct Batch
         if not mut_starts:
-            return MutationBatch(
-                IntervalBatch(), 
-                queries.alphabet.empty_batch(), 
-                queries.alphabet.empty_batch()
-            )
+            return MutationBatch.empty()
             
         return MutationBatch(
             IntervalBatch(
@@ -239,11 +235,7 @@ class VariantCaller:
                             mut_alts.append(queries.alphabet.seq_from(alt_arr))
 
         if not mut_starts:
-            return MutationBatch(
-                IntervalBatch(), 
-                queries.alphabet.empty_batch(), 
-                queries.alphabet.empty_batch()
-            )
+            return MutationBatch.empty()
 
         return MutationBatch(
             IntervalBatch(

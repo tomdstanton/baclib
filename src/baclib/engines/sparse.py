@@ -8,8 +8,8 @@ from typing import Union, Callable, Optional, Literal
 import numpy as np
 from scipy.sparse import csgraph, csr_matrix
 
-from baclib.utils.resources import jit, RESOURCES
-from baclib.containers.alignment import ClusterBatch
+from baclib.lib.resources import jit, RESOURCES
+from baclib.containers.cluster import ClusterBatch
 from baclib.containers.graph import Graph, Path, PathBatch
 
 if RESOURCES.has_module('numba'):

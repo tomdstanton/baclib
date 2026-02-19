@@ -1,17 +1,18 @@
 from binascii import hexlify
 from operator import attrgetter
-from typing import Generator, Union, Iterator, MutableSequence, Iterable, ClassVar
+from typing import Generator, Union, Iterator, Iterable
 from uuid import uuid4
-from enum import IntEnum, auto
 
 import numpy as np
 
 from baclib.core.alphabet import Alphabet
-from baclib.core.seq import Seq, SeqBatch, SparseSeq
+from baclib.containers.seq import Seq, SeqBatch
 from baclib.core.interval import Interval, IntervalBatch
-from baclib.utils import Batch, RaggedBatch
-from baclib.utils.resources import RESOURCES, jit
-from baclib.utils.protocols import HasInterval, HasIntervals
+from baclib.containers import Batch, Batchable
+from baclib.containers.feature import FeatureKey, Feature, FeatureList, FeatureBatch
+from baclib.containers.qualifier import QualifierList, QualifierBatch
+from baclib.lib.resources import RESOURCES, jit
+from baclib.lib.protocols import HasIntervals
 
 if RESOURCES.has_module('numba'): 
     from numba import prange
@@ -20,313 +21,7 @@ else:
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
-QualifierType = Union[int, float, bytes, bool]
-
-
-class QualifierList(MutableSequence):
-    """
-    A list-like container for (key, value) tuples that also supports dictionary-style access.
-    Maintains insertion order and allows duplicate keys.
-    """
-    __slots__ = ('_data',)
-
-    def __init__(self, items: Iterable[tuple[bytes, QualifierType]] = None):
-        self._data = list(items) if items else []
-
-    def __getitem__(self, item):
-        # List-style access
-        if isinstance(item, (int, slice)): return self._data[item]
-        # Dict-style access (First match)
-        for k, v in self._data:
-            if k == item: return v
-        return None
-
-    def __setitem__(self, key, value):
-        if isinstance(key, (int, slice)):
-            self._data[key] = value
-            return
-
-        # Dict-style set: Replace first occurrence or append
-        for i, (k, v) in enumerate(self._data):
-            if k == key:
-                self._data[i] = (key, value)
-                return
-        self._data.append((key, value))
-
-    def __delitem__(self, index): del self._data[index]
-    def __len__(self): return len(self._data)
-    def __iter__(self): return iter(self._data)
-    def __repr__(self):
-        if len(self) > 6:
-            return f"[{', '.join(repr(x) for x in self[:3])}, ..., {', '.join(repr(x) for x in self[-3:])}]"
-        return repr(self._data)
-    def insert(self, index, value): self._data.insert(index, value)
-
-    def __eq__(self, other):
-        if isinstance(other, QualifierList): return self._data == other._data
-        if isinstance(other, list): return self._data == other
-        return False
-
-    def get(self, key, default=None):
-        """Returns the first value for a key, or default."""
-        for k, v in self._data:
-            if k == key: return v
-        return default
-
-    def get_all(self, key: bytes) -> list[QualifierType]:
-        """Returns all values for a key."""
-        return [v for k, v in self._data if k == key]
-
-    def add(self, key: bytes, value: QualifierType):
-        """Adds a new key-value pair."""
-        self._data.append((key, value))
-
-    def to_dict(self) -> dict[bytes, QualifierType]:
-        """Converts the list to a standard dictionary (lossy for duplicates)."""
-        return {k: v for k, v in self._data}
-
-
-class FeatureKey(IntEnum):
-    """
-    Valid INSDC Feature Table Keys.
-
-    Includes a __str__ method to return the exact INSDC string representation,
-    handling special characters (like 5'UTR and D-loop) that are not valid
-    Python identifiers.
-    """
-    # --- Genes, Coding & Transcriptional Products ---
-    GENE = auto()
-    CDS = auto()
-    MRNA = auto()
-    TRNA = auto()
-    RRNA = auto()
-    NCRNA = auto()
-    TMRNA = auto()
-    PRECURSOR_RNA = auto()
-    PRIM_TRANSCRIPT = auto()
-    EXON = auto()
-    INTRON = auto()
-    # Handled specifically in __str__
-    FIVE_PRIME_UTR = auto()
-    THREE_PRIME_UTR = auto()
-    # --- Protein Maturation & Signaling ---
-    SIG_PEPTIDE = auto()
-    MAT_PEPTIDE = auto()
-    PROPEPTIDE = auto()
-    TRANSIT_PEPTIDE = auto()
-    # --- Immunoglobulin & T-cell Receptor ---
-    V_REGION = auto()
-    D_SEGMENT = auto()
-    J_SEGMENT = auto()
-    C_REGION = auto()
-    N_REGION = auto()
-    S_REGION = auto()
-    V_SEGMENT = auto()
-    IDNA = auto()
-    # --- Genomic Structure & Regulation ---
-    REGULATORY = auto()  # Replaces promoter, enhancer, terminator, etc.
-    OPERON = auto()
-    POLYA_SITE = auto()
-    REP_ORIGIN = auto()
-    ORIT = auto()
-    CENTROMERE = auto()
-    TELOMERE = auto()
-    MOBILE_ELEMENT = auto()
-    REPEAT_REGION = auto()
-    # --- Sequence, Variation & Binding ---
-    GAP = auto()
-    ASSEMBLY_GAP = auto()
-    VARIATION = auto()
-    MISC_DIFFERENCE = auto()
-    MODIFIED_BASE = auto()
-    PROTEIN_BIND = auto()
-    PRIMER_BIND = auto()
-    MISC_BINDING = auto()
-    # --- Secondary Structure ---
-    STEM_LOOP = auto()
-    D_LOOP = auto()  # Handled specifically in __str__
-    MISC_STRUCTURE = auto()
-    # --- Miscellaneous / Other ---
-    SOURCE = auto()
-    MISC_FEATURE = auto()
-    MISC_RECOMB = auto()
-    MISC_RNA = auto()
-    OLD_SEQUENCE = auto()
-    MOTIF = auto()
-    STS = auto()
-    UNSURE = auto()
-
-    _STR_CACHE: ClassVar[dict]
-    _BYTES_CACHE: ClassVar[dict]
-    _FROM_BYTES_CACHE: ClassVar[dict]
-
-    def __str__(self): return self._STR_CACHE[self]
-    @property
-    def bytes(self) -> bytes: return self._BYTES_CACHE[self]
-    @classmethod
-    def from_bytes(cls, b: bytes) -> 'FeatureKey': return cls._FROM_BYTES_CACHE.get(b, cls.MISC_FEATURE)
-    @classmethod
-    def _init_caches(cls):
-        cls._STR_CACHE = {}
-        cls._BYTES_CACHE = {}
-        cls._FROM_BYTES_CACHE = {}
-        special = {
-            cls.FIVE_PRIME_UTR: "5'UTR",
-            cls.THREE_PRIME_UTR: "3'UTR",
-            cls.D_LOOP: "D-loop",
-            cls.IDNA: "iDNA",
-            cls.ORIT: "oriT",
-            # Standard INSDC Keys with specific casing
-            cls.CDS: "CDS",
-            cls.MRNA: "mRNA",
-            cls.TRNA: "tRNA",
-            cls.RRNA: "rRNA",
-            cls.NCRNA: "ncRNA",
-            cls.TMRNA: "tmRNA",
-            cls.PRECURSOR_RNA: "precursor_RNA",
-            cls.MISC_RNA: "misc_RNA",
-            cls.STS: "STS",
-            cls.V_REGION: "V_region",
-            cls.D_SEGMENT: "D_segment",
-            cls.J_SEGMENT: "J_segment",
-            cls.C_REGION: "C_region",
-            cls.N_REGION: "N_region",
-            cls.S_REGION: "S_region",
-            cls.V_SEGMENT: "V_segment",
-            cls.POLYA_SITE: "polyA_site",
-            cls.SIG_PEPTIDE: "sig_peptide",
-            cls.MAT_PEPTIDE: "mat_peptide",
-            cls.TRANSIT_PEPTIDE: "transit_peptide",
-            cls.REP_ORIGIN: "rep_origin",
-            cls.MOTIF: "motif",
-        }
-        for k in cls:
-            s = special.get(k, k.name.lower())
-            cls._STR_CACHE[k] = s
-            b = s.encode('ascii')
-            cls._BYTES_CACHE[k] = b
-            cls._FROM_BYTES_CACHE[b] = k
-
-FeatureKey._init_caches()
-
-
-class Feature(HasInterval):
-    """
-    Represents a genomic feature, such as a gene or CDS.
-    """
-    Key = FeatureKey  # Alias for convenience (e.g. Feature.Key.CDS)
-    __slots__ = ('_interval', '_key', '_qualifiers')
-    def __init__(self, interval: 'Interval', key: Union[FeatureKey, bytes] = FeatureKey.MISC_FEATURE,
-                 qualifiers: Iterable[tuple[bytes, QualifierType]] = None):
-        self._interval = interval
-        self._key = FeatureKey.from_bytes(key) if isinstance(key, bytes) else key
-        self._qualifiers = QualifierList(qualifiers)
-        
-    @property
-    def interval(self) -> 'Interval': return self._interval
-    @property
-    def key(self) -> FeatureKey: return self._key
-    @property
-    def qualifiers(self) -> QualifierList: return self._qualifiers
-
-    def __len__(self) -> int: return len(self.interval)
-    def __iter__(self): return self.interval.__iter__()
-    def __contains__(self, item) -> bool: return self.interval.__contains__(item)
-    def __eq__(self, other):
-        if isinstance(other, self.__class__):
-            return (self.interval == other.interval and self.key == other.key and
-                    self.qualifiers == other.qualifiers)
-        return False
-    
-    def __repr__(self): return f"Feature({self.key.name}, {self.interval})"
-    # Delegate dict-like access to qualifiers, but ensure we use .get() for lookups
-    # to avoid ambiguity with integer indices if Feature were to support them.
-    def __getitem__(self, item): return self.qualifiers.get(item)
-    def __setitem__(self, key: bytes, value: QualifierType): self.qualifiers[key] = value
-    def overlap(self, other) -> int: return self.interval.overlap(other)
-    def get(self, item, default = None): return self.qualifiers.get(item, default)
-    def get_all(self, key: bytes) -> list[QualifierType]: return self.qualifiers.get_all(key)
-    def add_qualifier(self, key: bytes, value: QualifierType = True): self.qualifiers.add(key, value)
-    def shift(self, x: int, y: int = None) -> 'Feature':
-        return Feature(self.interval.shift(x, y), self.key, list(self.qualifiers))
-    def reverse_complement(self, parent_length: int) -> 'Feature':
-        return Feature(self.interval.reverse_complement(parent_length), self.key, list(self.qualifiers))
-    def extract(self, parent_seq: Seq) -> Seq:
-        """Extracts the feature's sequence from the parent."""
-        sub = parent_seq[self.interval.start:self.interval.end]
-        if self.interval.strand == -1: return parent_seq.alphabet.reverse_complement(sub)
-        return sub
-    def copy(self) -> 'Feature':
-        """Creates a shallow copy of the feature (qualifiers are copied)."""
-        return Feature(self.interval, self.key, list(self.qualifiers))
-
-
-class FeatureList(MutableSequence, HasIntervals):
-    """
-    A list-like object that manages genomic features and their spatial index.
-    
-    It automatically invalidates the spatial index when features are modified.
-    """
-    __slots__ = ('_data', '_interval_batch')
-
-    def __init__(self, features: Iterable['Feature'] = None):
-        self._data: list[Feature] = list(features) if features else []
-        self._interval_batch = None
-
-    def __getitem__(self, index): return self._data[index]
-    def __repr__(self):
-        if len(self) > 6:
-            return f"[{', '.join(repr(x) for x in self[:3])}, ..., {', '.join(repr(x) for x in self[-3:])}]"
-        return repr(self._data)
-    def __len__(self): return len(self._data)
-    def __iter__(self): return iter(self._data)
-    def _flag_dirty(self): self._interval_batch = None
-    @property
-    def intervals(self) -> 'IntervalBatch':
-        """Alias for interval_batch to satisfy HasIntervals protocol."""
-        return self.interval_batch
-
-    @property
-    def interval_batch(self) -> 'IntervalBatch':
-        if self._interval_batch is None:
-            self._interval_batch = IntervalBatch.from_features(self._data)
-        return self._interval_batch
-
-    def __setitem__(self, index, value):
-        self._data[index] = value
-        self._flag_dirty()
-
-    def __delitem__(self, index):
-        del self._data[index]
-        self._flag_dirty()
-
-    def insert(self, index, value):
-        self._data.insert(index, value)
-        self._flag_dirty()
-
-    def extend(self, values: Iterable['Feature']):
-        self._data.extend(values)
-        self._flag_dirty()
-
-    def reverse(self):
-        self._data.reverse()
-        self._flag_dirty()
-
-    def sort(self, key=None, reverse=False):
-        self._data.sort(key=key, reverse=reverse)
-        self._flag_dirty()
-
-    def get_overlapping(self, start: int, end: int) -> Generator['Feature', None, None]:
-        """
-        Yields features overlapping [start, end).
-        Delegates to the IntervalBatch for robust and fast querying.
-        """
-        # self.interval_batch ensures the index is built and up-to-date
-        indices = self.interval_batch.query(start, end)
-        for i in indices: yield self._data[i]
-
-
-class Record(HasIntervals):
+class Record(HasIntervals, Batchable):
     """
     Represents a sequence record, such as a contig or chromosome.
     """
@@ -344,7 +39,15 @@ class Record(HasIntervals):
     def __len__(self) -> int: return len(self._seq)
     def __hash__(self) -> int: return hash(self.id)
     def __iter__(self) -> Iterator['Feature']: return iter(self.features)
+    @property
+    def name(self) -> bytes: return self.id
+    @name.setter
+    def name(self, value: bytes): self.id = value
+
     def __eq__(self, other) -> bool: return self.id == other.id if isinstance(other, Record) else False
+
+    @property
+    def batch(self) -> type['Batch']: return RecordBatch
 
     @classmethod
     def from_seq(cls, seq: Seq, id_: bytes = None) -> 'Record': return cls(seq, id_=id_)
@@ -374,9 +77,9 @@ class Record(HasIntervals):
     @qualifiers.setter
     def qualifiers(self, value): self._qualifiers = QualifierList(value)
     @property
-    def intervals(self) -> 'IntervalBatch': return self.features.interval_batch
+    def intervals(self) -> 'IntervalBatch': return self.features.intervals
     @property
-    def interval_batch(self) -> 'IntervalBatch': return self.features.interval_batch
+    def interval_batch(self) -> 'IntervalBatch': return self.features.intervals
 
     def add_features(self, *features: 'Feature'):
         """Adds features and sorts them by start position."""
@@ -587,169 +290,6 @@ class Record(HasIntervals):
         yield self[previous_end:]
 
 
-class QualifierBatch(RaggedBatch):
-    """
-    A batch of qualifier lists, stored in a columnar format (Structure-of-Arrays).
-    """
-    __slots__ = ('_key_vocab', '_key_ids', '_values')
-
-    def __init__(self, key_vocab, key_ids, values, offsets):
-        super().__init__(offsets)
-        self._key_vocab = key_vocab
-        self._key_ids = key_ids
-        self._values = values
-
-    @classmethod
-    def from_qualifiers(cls, qualifiers_list: Iterable[Iterable[tuple[bytes, QualifierType]]]) -> 'QualifierBatch':
-        key_to_id = {}
-        key_vocab = []
-        flat_key_ids = []
-        flat_values = []
-        
-        offsets = [0]
-        curr_idx = 0
-        
-        for quals in qualifiers_list:
-            for k, v in quals:
-                if k not in key_to_id:
-                    key_to_id[k] = len(key_vocab)
-                    key_vocab.append(k)
-                flat_key_ids.append(key_to_id[k])
-                flat_values.append(v)
-                curr_idx += 1
-            offsets.append(curr_idx)
-            
-        return cls(
-            np.array(key_vocab, dtype=object),
-            np.array(flat_key_ids, dtype=np.int32),
-            np.array(flat_values, dtype=object),
-            np.array(offsets, dtype=np.int32)
-        )
-
-    @classmethod
-    def empty_batch(cls) -> 'QualifierBatch':
-        return cls(
-            np.array([], dtype=object),
-            np.array([], dtype=np.int32),
-            np.array([], dtype=object),
-            np.array([0], dtype=np.int32)
-        )
-
-    def empty(self) -> 'QualifierBatch':
-        return self.empty_batch()
-
-    def __getitem__(self, item):
-        if isinstance(item, (int, np.integer)):
-            start = self._offsets[item]
-            end = self._offsets[item+1]
-            if start == end: return []
-            keys = self._key_vocab[self._key_ids[start:end]]
-            values = self._values[start:end]
-            return list(zip(keys, values))
-        
-        if isinstance(item, slice):
-            new_offsets, val_start, val_end = self._get_slice_info(item)
-            new_key_ids = self._key_ids[val_start:val_end]
-            new_values = self._values[val_start:val_end]
-            
-            # Create new batch (Zero Copy views where possible)
-            obj = object.__new__(QualifierBatch)
-            obj._key_vocab = self._key_vocab
-            obj._key_ids = new_key_ids
-            obj._values = new_values
-            obj._offsets = new_offsets
-            return obj
-            
-        raise TypeError(f"Invalid index type: {type(item)}")
-
-
-class FeatureBatch(Batch, HasIntervals):
-    """
-    A batch of Features, stored in a columnar format.
-    """
-    __slots__ = ('_intervals', '_keys', '_qualifiers')
-
-    def __init__(self, intervals: IntervalBatch, keys: np.ndarray, qualifiers: QualifierBatch):
-        self._intervals = intervals
-        self._keys = keys
-        self._qualifiers = qualifiers
-
-    @classmethod
-    def from_features(cls, features: list[Feature]) -> 'FeatureBatch':
-        n = len(features)
-        
-        # Manual extraction to ensure sort=False (IntervalBatch.from_features sorts by default)
-        starts = np.empty(n, dtype=np.int32)
-        ends = np.empty(n, dtype=np.int32)
-        strands = np.empty(n, dtype=np.int32)
-        keys = np.empty(n, dtype=np.int16)
-        
-        for i, f in enumerate(features):
-            iv = f.interval
-            starts[i] = iv.start
-            ends[i] = iv.end
-            strands[i] = iv.strand
-            keys[i] = f.key.value
-            
-        intervals = IntervalBatch(starts, ends, strands, sort=False)
-        
-        # Generator to avoid creating intermediate list of qualifier lists
-        qualifiers = QualifierBatch.from_qualifiers((f.qualifiers for f in features))
-        return cls(intervals, keys, qualifiers)
-
-    @classmethod
-    def empty_batch(cls) -> 'FeatureBatch':
-        return cls(
-            IntervalBatch(),
-            np.array([], dtype=np.int16),
-            QualifierBatch.empty_batch()
-        )
-
-    def empty(self) -> 'FeatureBatch':
-        return self.empty_batch()
-
-    def __repr__(self): return f"<FeatureBatch: {len(self)} features>"
-
-    def __len__(self): return len(self._intervals)
-
-    @property
-    def intervals(self) -> IntervalBatch: return self._intervals
-    @property
-    def keys(self): return self._keys
-    
-    def get_key(self, idx: int) -> FeatureKey:
-        return FeatureKey(self._keys[idx])
-        
-    def get_qualifiers(self, idx: int) -> list[tuple]:
-        return self._qualifiers[idx]
-
-    def __getitem__(self, item) -> Union['Feature', 'FeatureBatch']:
-        """
-        Reconstructs a Feature object from the batch.
-        """
-        if isinstance(item, (int, np.integer)):
-            interval = Interval(
-                self._intervals.starts[item],
-                self._intervals.ends[item],
-                self._intervals.strands[item]
-            )
-            return Feature(interval, self.get_key(item), self._qualifiers[item])
-        
-        if isinstance(item, slice):
-            # Slice components
-            new_intervals = self._intervals[item]
-            new_keys = self._keys[item]
-            new_quals = self._qualifiers[item]
-            
-            obj = object.__new__(FeatureBatch)
-            obj._intervals = new_intervals
-            obj._keys = new_keys
-            obj._qualifiers = new_quals
-            return obj
-            
-        raise TypeError(f"Invalid index type: {type(item)}")
-
-
 class RecordBatch(Batch, HasIntervals):
     """
     A high-performance, read-only container for a collection of Records.
@@ -759,21 +299,52 @@ class RecordBatch(Batch, HasIntervals):
     """
     __slots__ = ('_seqs', '_ids', '_features', '_feature_rec_indices', '_feature_offsets', '_qualifiers')
 
-    def __init__(self, records: Iterable[Record]):
+    @classmethod
+    def empty(cls) -> 'RecordBatch':
+        obj = cls.__new__(cls)
+        obj._seqs = SeqBatch.empty()
+        obj._ids = np.empty(0, dtype=object)
+        obj._features = FeatureBatch.empty()
+        obj._feature_offsets = np.zeros(1, dtype=np.int32)
+        obj._feature_rec_indices = np.empty(0, dtype=np.int32)
+        obj._qualifiers = QualifierBatch.empty()
+        return obj
+
+    def __init__(self, records: Iterable[Record], deduplicate: bool = False):
         # 1. Materialize list to avoid multiple passes if iterator
         recs = list(records)
-
         # 2. Batch Sequences
-        self._seqs = recs[0].seq.alphabet.batch_from((r.seq for r in recs))
-
+        self._seqs = recs[0].seq.alphabet.batch_from((r.seq for r in recs), deduplicate=deduplicate)
         # 3. Batch IDs (Fixed length numpy array for speed, or object array)
         # We use object array of bytes to handle variable length IDs safely
         self._ids = np.array([r.id for r in recs], dtype=object)
-        
         # 4. Batch Qualifiers
         self._qualifiers = QualifierBatch.from_qualifiers((r.qualifiers for r in recs))
-
         self._build_features(recs)
+
+    @classmethod
+    def random(cls, alphabet: Alphabet, rng: np.random.Generator = None, n: int = None, min_n: int = 1,
+               max_n: int = 1000, l: int = None, min_l: int = 10, max_l: int = 5_000_000, weights=None):
+        """
+        Generates a random genome assembly for testing purposes.
+        """
+        if rng is None: rng = RESOURCES.rng
+        seqs = alphabet.random_batch(rng=rng, n_seqs=n, min_seqs=min_n, max_seqs=max_n, length=l, min_len=min_l,
+                                     max_len=max_l, weights=weights)
+
+        # Generate random UUIDs (Standard for Records)
+        ids = np.array([hexlify(uuid4().bytes) for _ in range(len(seqs))], dtype=object)
+
+        # Construct the batch manually for performance
+        obj = cls.__new__(cls)
+        obj._seqs = seqs
+        obj._ids = ids
+        obj._features = FeatureBatch.empty()
+        obj._feature_offsets = np.zeros(len(seqs) + 1, dtype=np.int32)
+        obj._feature_rec_indices = np.empty(0, dtype=np.int32)
+        obj._qualifiers = QualifierBatch.from_qualifiers((() for _ in range(len(seqs))))
+        return obj
+
 
     @classmethod
     def from_aligned_batch(cls, batch: SeqBatch, records: list[Record]):
@@ -787,6 +358,10 @@ class RecordBatch(Batch, HasIntervals):
         obj._qualifiers = QualifierBatch.from_qualifiers((r.qualifiers for r in records))
         obj._build_features(records)
         return obj
+
+    @classmethod
+    def build(cls, components: Iterable[Record]) -> 'RecordBatch':
+        return cls(components)
 
     def _build_features(self, recs):
         # 1. Count total features
@@ -831,16 +406,78 @@ class RecordBatch(Batch, HasIntervals):
         
         self._features = FeatureBatch(intervals, keys, qualifiers)
 
-    def empty(self) -> 'RecordBatch':
-        # Use __new__ to bypass __init__ logic which expects iterable of Records
-        obj = self.__class__.__new__(self.__class__)
-        obj._seqs = self._seqs.empty()
-        obj._ids = np.array([], dtype=object)
-        obj._qualifiers = self._qualifiers.empty()
-        obj._features = self._features.empty()
-        obj._feature_offsets = np.array([0], dtype=np.int32)
-        obj._feature_rec_indices = np.array([], dtype=np.int32)
+    @classmethod
+    def empty(cls) -> 'RecordBatch':
+        return cls.zeros(0)
+
+    @classmethod
+    def zeros(cls, n: int) -> 'RecordBatch':
+        """
+        Creates a batch of n empty records.
+        """
+        obj = cls.__new__(cls)
+        obj._seqs = SeqBatch.zeros(n)
+        obj._ids = np.full(n, b'', dtype=object)
+        obj._qualifiers = QualifierBatch.zeros(n)
+        obj._features = FeatureBatch.empty()
+        obj._feature_offsets = np.zeros(n + 1, dtype=np.int32)
+        obj._feature_rec_indices = np.empty(0, dtype=np.int32)
         return obj
+
+    @classmethod
+    def concat(cls, batches: Iterable['RecordBatch']) -> 'RecordBatch':
+        batches = list(batches)
+        if not batches: raise ValueError("Cannot concatenate empty list")
+        
+        # 1. Simple Concatenations
+        seqs = SeqBatch.concat([b.seqs for b in batches])
+        ids = np.concatenate([b.ids for b in batches])
+        qualifiers = QualifierBatch.concat([b._qualifiers for b in batches])
+        
+        # 2. Feature Concatenation (Complex)
+        # We must adjust rec_indices and offsets
+        
+        # Calculate shifts for record indices (how many records were in previous batches)
+        rec_counts = [len(b) for b in batches]
+        rec_shifts = np.cumsum([0] + rec_counts[:-1])
+        
+        # Adjust indices
+        new_rec_indices = np.concatenate([
+            b._feature_rec_indices + shift 
+            for b, shift in zip(batches, rec_shifts)
+        ])
+        
+        # Stack offsets (using RaggedBatch logic manually here as this isn't a RaggedBatch subclass)
+        # offsets[0] is 0. We take offsets[1:] + total_feats_prev
+        feat_counts = [b.n_features for b in batches]
+        feat_shifts = np.cumsum([0] + feat_counts[:-1])
+        
+        # [0, 2, 5] + [0, 3] -> [0, 2, 5, 8]
+        # We need to construct the full offset array
+        offset_parts = [batches[0]._feature_offsets]
+        for i in range(1, len(batches)):
+            # Take offsets[1:] and add the cumulative feature count
+            offset_parts.append(batches[i]._feature_offsets[1:] + feat_shifts[i])
+            
+        new_offsets = np.concatenate(offset_parts)
+        
+        # Merge FeatureBatches
+        features = FeatureBatch.concat([b._features for b in batches])
+        
+        return cls._reconstruct(seqs, ids, features, new_rec_indices, new_offsets, qualifiers)
+
+    @property
+    def nbytes(self) -> int:
+        return (self._seqs.nbytes + self._ids.nbytes + self._features.nbytes + 
+                self._qualifiers.nbytes + self._feature_offsets.nbytes + self._feature_rec_indices.nbytes)
+
+    def copy(self) -> 'RecordBatch':
+        return self._reconstruct(
+            self._seqs.copy(), self._ids.copy(), self._features.copy(), 
+            self._feature_rec_indices.copy(), self._feature_offsets.copy(), self._qualifiers.copy())
+
+    @property
+    def component(self): return Record
 
     def __repr__(self): return f"<RecordBatch: {len(self)} records>"
 
@@ -978,116 +615,8 @@ class RecordBatch(Batch, HasIntervals):
         return self._features.get_qualifiers(idx)
 
 
-class MutationEffect(IntEnum):
-    """
-    Enum for efficient integer storage of mutation effects.
-    """
-    UNKNOWN = auto()
-    SYNONYMOUS = auto()
-    MISSENSE = auto()
-    NONSENSE = auto()
-    FRAMESHIFT = auto()
-    INTERGENIC = auto()
-    NON_CODING = auto()
-
-
-class Mutation(Feature):
-    """
-    Represents a discrete change: SNP, Insertion, or Deletion.
-
-    Attributes:
-        interval (Interval): The location on the REFERENCE sequence.
-        ref_seq (Seq): The reference sequence content.
-        alt_seq (Seq): The alternative sequence content.
-        effect (MutationEffect): The predicted functional impact.
-    """
-    __slots__ = ('ref_seq', 'alt_seq', 'effect', 'aa_change')
-
-    def __init__(self, interval: Interval, ref_seq: Seq, alt_seq: Seq,
-                 effect: MutationEffect = MutationEffect.UNKNOWN,
-                 aa_change: bytes = None):
-        super().__init__(interval, key=b'mutation')
-        self.ref_seq = ref_seq
-        self.alt_seq = alt_seq
-        self.effect = effect
-        self.aa_change = aa_change
-
-    def __repr__(self):
-        # VCF-style notation: Pos Ref>Alt (1-based for display)
-        return f"{self.interval.start + 1}:{self.ref_seq}>{self.alt_seq}"
-
-    @property
-    def is_snp(self): return len(self.ref_seq) == 1 and len(self.alt_seq) == 1
-    @property
-    def is_indel(self): return len(self.ref_seq) != len(self.alt_seq)
-    @property
-    def diff(self) -> int:
-        """Returns the net change in sequence length (Alt - Ref)."""
-        return len(self.alt_seq) - len(self.ref_seq)
-
-
-class MutationBatch(Batch, HasIntervals):
-    """
-    Efficient storage for a collection of mutations.
-    Can be used to reconstruct sequences via SparseSeq.
-    """
-    __slots__ = ('_intervals', '_ref_seqs', '_alt_seqs', '_effects', '_aa_changes')
-
-    def __init__(self, intervals: IntervalBatch, ref_seqs: SeqBatch, alt_seqs: SeqBatch,
-                 effects: np.ndarray = None, aa_changes: np.ndarray = None):
-        self._intervals = intervals
-        self._ref_seqs = ref_seqs
-        self._alt_seqs = alt_seqs
-        n = len(intervals)
-        self._effects = effects if effects is not None else np.zeros(n, dtype=np.uint8)
-        self._aa_changes = aa_changes if aa_changes is not None else np.full(n, None, dtype=object)
-
-    def empty(self) -> 'MutationBatch':
-        return MutationBatch(
-            self._intervals.empty(),
-            self._ref_seqs.empty(),
-            self._alt_seqs.empty()
-        )
-
-    def __repr__(self): return f"<MutationBatch: {len(self)} mutations>"
-
-    def __len__(self): return len(self._intervals)
-    
-    @property
-    def intervals(self) -> IntervalBatch: return self._intervals
-    
-    def __iter__(self):
-        for i in range(len(self)):
-            yield self[i]
-
-    def __getitem__(self, item):
-        if isinstance(item, (int, np.integer)):
-            interval = self._intervals[item]
-            ref = self._ref_seqs[item]
-            alt = self._alt_seqs[item]
-            eff = MutationEffect(self._effects[item])
-            aa = self._aa_changes[item]
-            return Mutation(interval, ref, alt, eff, aa)
-        
-        if isinstance(item, slice):
-            return MutationBatch(
-                self._intervals[item],
-                self._ref_seqs[item],
-                self._alt_seqs[item],
-                self._effects[item],
-                self._aa_changes[item]
-            )
-        raise TypeError(f"Invalid index type: {type(item)}")
-
-    def apply_to(self, reference: Seq) -> SparseSeq:
-        """
-        Applies the mutations to a reference sequence, returning a SparseSeq.
-        """
-        # We can iterate self because __iter__ yields Mutation objects
-        # which SparseSeq accepts.
-        return SparseSeq(reference, self)
-
-
+# TODO: There should be no kernels in the containers module - move elsewhere or consider moving module
+# Kernels --------------------------------------------------------------------------------------------------------------
 @jit(nopython=True, cache=True, nogil=True, parallel=True)
 def _batch_extract_kernel(seq_data, seq_starts, 
                           feat_starts, feat_strands, feat_rec_idxs,

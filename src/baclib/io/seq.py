@@ -7,30 +7,22 @@ from baclib.core.alphabet import Alphabet
 from baclib.core.interval import Strand
 from baclib.containers.record import Record, RecordBatch
 from baclib.containers.graph import Edge, EdgeBatch
-from baclib.io import BaseReader, BaseWriter, ParserError, SeqFile, SeqFileFormat, Qualifier
-from baclib.utils import Batch
+from baclib.io import BaseReader, BaseWriter, ParserError, SeqFile, Qualifier
+from baclib.containers import Batch
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
-class SeqReader(BaseReader):
-    __slots__ = ('_alphabet', '_min_seq_length')
-    _DEFAULT_ALPHABET = Alphabet.DNA
-    def __init__(self, handle: BinaryIO, alphabet: Alphabet = None, min_seq_length: int = 1, **kwargs):
-        """ABC for readers that parse files with sequences (Fasta, Fastq and GFA)"""
-        super().__init__(handle, **kwargs)
-        self._alphabet = alphabet or self._DEFAULT_ALPHABET
-        self._min_seq_length = min_seq_length
-
-
-@SeqFile.register(SeqFileFormat.FASTA, extensions=['.fasta', '.fa', '.fna', '.faa'],
-                  alphabets={'.faa': Alphabet.AMINO, '.fna': Alphabet.DNA})
-class FastaReader(SeqReader):
+@SeqFile.register(SeqFile.Format.FASTA, extensions=['.fasta', '.fa', '.fna', '.faa', '.ffn'],
+                  alphabets={'.faa': Alphabet.AMINO, '.fna': Alphabet.DNA, '.ffn': Alphabet.DNA})
+class FastaReader(BaseReader):
     """
     Reader for FASTA format files.
     """
-    __slots__ = ('_n_seq_lines',)
+    __slots__ = ('_alphabet', '_min_seq_length', '_n_seq_lines')
     def __init__(self, handle: BinaryIO, alphabet: Alphabet = None, min_seq_length: int = 1, n_seq_lines: int = 0, **kwargs):
-        super().__init__(handle, alphabet, min_seq_length, **kwargs)
+        super().__init__(handle, **kwargs)
+        self._alphabet = alphabet
+        self._min_seq_length = min_seq_length
         self._n_seq_lines = n_seq_lines
 
     def __iter__(self) -> Generator[Record, None, None]:
@@ -40,15 +32,43 @@ class FastaReader(SeqReader):
         Yields:
             Record objects.
         """
-        for header, seq_parts in self._read_entries():
-            yield self._make_record(header, seq_parts)
+        if self._alphabet is None:
+            # First element logic to detect alphabet
+            iterator = self._read_entries()
+            try:
+                first_header, first_seq_parts = next(iterator)
+                # Combine parts to detect
+                first_seq_bytes = b"".join(first_seq_parts)
+                self._alphabet = Alphabet.detect(first_seq_bytes)
+                yield self._make_record(first_header, [first_seq_bytes]) # Pass as list to reuse _make_record logic if possible or just make record directly
+            except StopIteration:
+                return
+
+            for header, seq_parts in iterator:
+                yield self._make_record(header, seq_parts)
+        else:
+            for header, seq_parts in self._read_entries():
+                yield self._make_record(header, seq_parts)
 
     def batches(self, size: int = 1024) -> Generator[RecordBatch, None, None]:
         """
         Optimized batch reader that performs bulk encoding.
         """
         entries = []
-        for entry in self._read_entries():
+        iterator = self._read_entries()
+        
+        # Auto-detect alphabet from first entry if needed
+        if self._alphabet is None:
+            try:
+                first_entry = next(iterator)
+                # first_entry is (header, seq_parts)
+                first_seq = b"".join(first_entry[1])
+                self._alphabet = Alphabet.detect(first_seq)
+                entries.append(first_entry)
+            except StopIteration:
+                return
+
+        for entry in iterator:
             entries.append(entry)
             if len(entries) >= size:
                 yield self._make_batch(entries)
@@ -64,7 +84,7 @@ class FastaReader(SeqReader):
 
         min_len = self._min_seq_length
         
-        buf = b""
+        buf = bytearray()
         header = None
         seq_parts = []
         current_len = 0
@@ -73,13 +93,13 @@ class FastaReader(SeqReader):
             if not chunk:
                 if header is not None:
                     if buf: 
-                        seq_parts.append(buf)
+                        seq_parts.append(bytes(buf))
                         current_len += len(buf)
                     if current_len >= min_len:
                         yield header, seq_parts
                 break
             
-            buf += chunk
+            buf.extend(chunk)
             pos = 0
             
             while True:
@@ -87,14 +107,14 @@ class FastaReader(SeqReader):
                 
                 if gt_pos == -1:
                     if header is not None:
-                        part = buf[pos:]
+                        part = bytes(buf[pos:])
                         seq_parts.append(part)
                         current_len += len(part)
-                    buf = b""
+                    buf.clear()
                     break
                 
                 if header is not None:
-                    part = buf[pos:gt_pos]
+                    part = bytes(buf[pos:gt_pos])
                     seq_parts.append(part)
                     current_len += len(part)
                     if current_len >= min_len:
@@ -105,17 +125,17 @@ class FastaReader(SeqReader):
                 
                 nl_pos = buf.find(b'\n', gt_pos)
                 if nl_pos == -1:
-                    buf = buf[gt_pos:]
+                    del buf[:gt_pos]
                     break
                 
-                header = buf[gt_pos+1:nl_pos].rstrip()
+                header = bytes(buf[gt_pos+1:nl_pos]).rstrip()
                 pos = nl_pos + 1
 
     def _read_entries_fixed(self):
         """Optimized reader for FASTA with fixed number of sequence lines (e.g. unwrapped)."""
         n_lines = self._n_seq_lines
         min_len = self._min_seq_length
-        buf = b""
+        buf = bytearray()
         
         state = 0 # 0=Header, 1=Sequence
         header = None
@@ -124,13 +144,13 @@ class FastaReader(SeqReader):
         
         for chunk in self.read_chunks(self._CHUNK_SIZE):
             if not chunk: break
-            buf += chunk
+            buf.extend(chunk)
             pos = 0
             
             while True:
                 nl_pos = buf.find(b'\n', pos)
                 if nl_pos == -1:
-                    buf = buf[pos:]
+                    del buf[:pos]
                     break
                 
                 # Check for > at start of line
@@ -138,7 +158,7 @@ class FastaReader(SeqReader):
                 
                 if state == 0:
                     if is_header_start:
-                        header = buf[pos+1:nl_pos].rstrip()
+                        header = bytes(buf[pos+1:nl_pos]).rstrip()
                         state = 1
                         seq_parts = []
                         seq_lines_read = 0
@@ -147,7 +167,7 @@ class FastaReader(SeqReader):
                     if is_header_start:
                         raise ParserError(f"Found '>' inside sequence. Check n_seq_lines={n_lines}.")
                     
-                    seq_parts.append(buf[pos:nl_pos])
+                    seq_parts.append(bytes(buf[pos:nl_pos]))
                     seq_lines_read += 1
                     
                     if seq_lines_read == n_lines:
@@ -189,7 +209,7 @@ class FastaReader(SeqReader):
     def sniff(cls, s: bytes) -> bool: return s.startswith(b">")
 
 
-@SeqFile.register(SeqFileFormat.FASTA)
+@SeqFile.register(SeqFile.Format.FASTA)
 class FastaWriter(BaseWriter):
     """
     Writer for FASTA format files.
@@ -265,19 +285,18 @@ class FastaWriter(BaseWriter):
         else:
             super().write_batch(batch)
 
-@SeqFile.register(SeqFileFormat.GFA, extensions=['.gfa'])
-class GfaReader(SeqReader):
+
+@SeqFile.register(SeqFile.Format.GFA, extensions=['.gfa'])
+class GfaReader(BaseReader):
     """
     Reader for GFA (Graphical Fragment Assembly) files.
-
-    Examples:
-        >>> with open("graph.gfa", "rb") as f:
-        ...     reader = GfaReader(f)
-        ...     for item in reader:
-        ...         if isinstance(item, Record): print("Segment:", item.id)
-        ...         elif isinstance(item, Edge): print("Link:", item.u, "->", item.v)
     """
-    __slots__ = ()
+    __slots__ = ('_alphabet', '_min_seq_length')
+    def __init__(self, handle: BinaryIO, min_seq_length: int = 1, **kwargs):
+        super().__init__(handle, **kwargs)
+        self._alphabet = Alphabet.DNA
+        self._min_seq_length = min_seq_length
+
     def __iter__(self) -> Generator[Union[Record, Edge], None, None]:
         """
         Iterates over GFA lines (Segments as Records, Links as Edges).
@@ -286,26 +305,25 @@ class GfaReader(SeqReader):
             Record or Edge objects.
         """
         # Optimization: Read large binary chunks
-        buf = b""
+        buf = bytearray()
         for chunk in self.read_chunks(self._CHUNK_SIZE):
             if not chunk:
                 if buf and buf.strip():
-                    yield from self._parse_line(buf)
+                    yield from self._parse_line(bytes(buf))
                 break
-
-            buf += chunk
+            buf.extend(chunk)
             pos = 0
 
             while True:
                 nl_pos = buf.find(b'\n', pos)
                 if nl_pos == -1:
-                    buf = buf[pos:]
+                    del buf[:pos]
                     break
 
-                line = buf[pos:nl_pos]
+                line = bytes(buf[pos:nl_pos])
                 yield from self._parse_line(line)
                 pos = nl_pos + 1
-
+    
     def batches(self, size: int = 1024):
         rec_entries = []
         edge_u = []
@@ -314,30 +332,29 @@ class GfaReader(SeqReader):
         edge_v_strands = []
         edge_attrs = {b'cigar': []}
         
-        buf = b""
+        buf = bytearray()
         for chunk in self.read_chunks(self._CHUNK_SIZE):
             if not chunk:
                 if buf and buf.strip():
-                    self._process_line_batch(buf, rec_entries, edge_u, edge_v, edge_u_strands, edge_v_strands, edge_attrs)
+                    self._process_line_batch(bytes(buf), rec_entries, edge_u, edge_v, edge_u_strands, edge_v_strands, edge_attrs)
                 break
 
-            buf += chunk
+            buf.extend(chunk)
             pos = 0
 
             while True:
                 nl_pos = buf.find(b'\n', pos)
                 if nl_pos == -1:
-                    buf = buf[pos:]
+                    del buf[:pos]
                     break
 
-                line = buf[pos:nl_pos]
+                line = bytes(buf[pos:nl_pos])
                 self._process_line_batch(line, rec_entries, edge_u, edge_v, edge_u_strands, edge_v_strands, edge_attrs)
                 pos = nl_pos + 1
                 
                 if len(rec_entries) >= size:
                     yield self._make_record_batch(rec_entries)
-                    rec_entries = []
-                
+                    rec_entries = []                
                 if len(edge_u) >= size:
                     yield self._make_edge_batch(edge_u, edge_v, edge_u_strands, edge_v_strands, edge_attrs)
                     edge_u = []
@@ -346,10 +363,8 @@ class GfaReader(SeqReader):
                     edge_v_strands = []
                     edge_attrs = {b'cigar': []}
         
-        if rec_entries:
-            yield self._make_record_batch(rec_entries)
-        if edge_u:
-            yield self._make_edge_batch(edge_u, edge_v, edge_u_strands, edge_v_strands, edge_attrs)
+        if rec_entries: yield self._make_record_batch(rec_entries)
+        if edge_u: yield self._make_edge_batch(edge_u, edge_v, edge_u_strands, edge_v_strands, edge_attrs)
 
     def _process_line_batch(self, line, rec_entries, edge_u, edge_v, edge_u_strands, edge_v_strands, edge_attrs):
         line = line.rstrip()
@@ -366,7 +381,7 @@ class GfaReader(SeqReader):
             if len(seq_bytes) >= self._min_seq_length:
                 tags = parts[3:] if len(parts) > 3 else []
                 rec_entries.append((name, seq_bytes, tags))
-
+                pass
         elif first == 76:  # 'L'
             parts = line.split(b'\t')
             if len(parts) < 6: return
@@ -413,8 +428,9 @@ class GfaReader(SeqReader):
             if len(seq_bytes) >= self._min_seq_length:
                 seq = self._alphabet.seq_from(seq_bytes if seq_bytes != b'*' else b'')
                 quals = Qualifier.parse_tags(parts[3:]) if len(parts) > 3 else []
+                quals = Qualifier.parse_tags(parts[3:]) if len(parts) > 3 else []
                 yield Record(seq, name, qualifiers=quals)
-
+        
         elif first == 76:  # 'L'
             parts = line.split(b'\t')
             if len(parts) < 6: return
@@ -427,7 +443,7 @@ class GfaReader(SeqReader):
     def sniff(cls, s: bytes) -> bool: return s.startswith(b'H\t') or s.startswith(b'S\t')
 
 
-@SeqFile.register(SeqFileFormat.GFA)
+@SeqFile.register(SeqFile.Format.GFA)
 class GfaWriter(BaseWriter):
     """
     Writer for GFA format files.
@@ -498,8 +514,8 @@ class GfaWriter(BaseWriter):
             super().write_batch(batch)
 
 
-@SeqFile.register(SeqFileFormat.FASTQ, extensions=['.fastq', '.fq'])
-class FastqReader(SeqReader):
+@SeqFile.register(SeqFile.Format.FASTQ, extensions=['.fastq', '.fq'])
+class FastqReader(BaseReader):
     """
     Reader for FASTQ format files.
     Optimized for standard 4-line FASTQ records. Wrapped FASTQ sequences are not supported.
@@ -510,7 +526,12 @@ class FastqReader(SeqReader):
         ...     for record in reader:
         ...         print(record.id)
     """
-    __slots__ = ()
+    __slots__ = ('_alphabet', '_min_seq_length')
+    def __init__(self, handle: BinaryIO, min_seq_length: int = 1, **kwargs):
+        super().__init__(handle, **kwargs)
+        self._alphabet = Alphabet.DNA
+        self._min_seq_length = min_seq_length
+
     def __iter__(self) -> Generator[Record, None, None]:
         """
         Iterates over FASTQ records.
@@ -521,7 +542,7 @@ class FastqReader(SeqReader):
         for header, seq_bytes, qual_bytes in self._read_entries():
             name, _, desc = header.partition(b' ')
             yield Record(self._alphabet.seq_from(seq_bytes), name, desc, qualifiers=[(b'quality', qual_bytes)])
-
+    
     def batches(self, size: int = 1024):
         entries = []
         for entry in self._read_entries():
@@ -531,27 +552,30 @@ class FastqReader(SeqReader):
                 entries = []
         if entries:
             yield self._make_batch(entries)
-
+    
     def _read_entries(self):
         min_len = self._min_seq_length
-        buf = b""
+        buf = bytearray()
         for chunk in self.read_chunks(self._CHUNK_SIZE):
             if not chunk:
                 if buf.strip():
                     # Ensure last line has a newline to simplify parsing logic
-                    if not buf.endswith(b'\n'): buf += b'\n'
+                    if not buf.endswith(b'\n'): buf.extend(b'\n')
                 else:
                     break
             else:
-                buf += chunk
+                buf.extend(chunk)
 
             pos = 0
             n_len = len(buf)
 
             while pos < n_len:
                 # Skip whitespace between records
-                while pos < n_len and buf[pos] in (10, 13, 32, 9):
-                    pos += 1
+                while pos < n_len:
+                    b = buf[pos]
+                    if b == 10 or b == 13 or b == 32 or b == 9:
+                        pos += 1
+                    else: break
 
                 if pos >= n_len: break
 
@@ -573,16 +597,16 @@ class FastqReader(SeqReader):
                 if nl4 == -1: break
 
                 # Extract fields
-                header = buf[pos + 1:nl1].rstrip()
-                seq_bytes = buf[nl1 + 1:nl2].rstrip()
-                qual_bytes = buf[nl3 + 1:nl4].rstrip()
+                header = bytes(buf[pos + 1:nl1]).rstrip()
+                seq_bytes = bytes(buf[nl1 + 1:nl2]).rstrip()
+                qual_bytes = bytes(buf[nl3 + 1:nl4]).rstrip()
 
                 if len(seq_bytes) >= min_len:
                     yield header, seq_bytes, qual_bytes
 
                 pos = nl4 + 1
 
-            if pos > 0: buf = buf[pos:]
+            if pos > 0: del buf[:pos]
 
     def _make_batch(self, entries):
         batch = self._build_seq_batch([e[1] for e in entries], self._alphabet)

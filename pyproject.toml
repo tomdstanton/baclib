@@ -21,11 +21,11 @@ classifiers = [
     "Programming Language :: Python :: 3.14"
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 test = ["pytest"]
 docs = ["mkdocs-material", "mkdocs-api-autonav", "mkdocs-include-markdown-plugin"]
-perf = ["numba"]
-dev = ["pytest", "mkdocs-material", "mkdocs-api-autonav", "mkdocs-include-markdown-plugin", "numba", "ruff"]
+fast = ["numba"]
+dev = ["ruff", {include-group = "test"}, {include-group = "docs"}, {include-group = "fast"}]
 
 [build-system]
 build-backend = "hatchling.build"

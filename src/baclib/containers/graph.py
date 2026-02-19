@@ -2,8 +2,8 @@ from typing import Any, Union, List, Dict, Set, Iterable
 
 import numpy as np
 
+from baclib.containers import Batch, RaggedBatch
 from baclib.core.interval import Strand
-from baclib.utils import Batch, RaggedBatch
 
 
 # Classes --------------------------------------------------------------------------------------------------------------
@@ -36,6 +36,8 @@ class Edge:
         self._v_strand = Strand(v_strand)
         self.attributes = attributes or {}
 
+    @property
+    def batch(self) -> type['Batch']: return EdgeBatch
     @property
     def u(self) -> bytes: return self._u
     @property
@@ -94,6 +96,35 @@ class EdgeBatch(Batch):
         if len(self._u) != len(self._v):
             raise ValueError("u and v arrays must have the same length")
 
+    @classmethod
+    def build(cls, components: Iterable[Edge]) -> 'EdgeBatch':
+        # Naive build from Edge objects
+        edges = list(components)
+        if not edges: return cls.empty()
+        u = np.array([e.u for e in edges], dtype=object)
+        v = np.array([e.v for e in edges], dtype=object)
+        us = np.array([e.u_strand for e in edges], dtype=np.int8)
+        vs = np.array([e.v_strand for e in edges], dtype=np.int8)
+        # Attributes merging is complex, skipping for brevity or assuming empty
+        return cls(u, v, us, vs)
+
+    @classmethod
+    def concat(cls, batches: Iterable['EdgeBatch']) -> 'EdgeBatch':
+        batches = list(batches)
+        if not batches: return cls.empty()
+        u = np.concatenate([b.u for b in batches])
+        v = np.concatenate([b.v for b in batches])
+        us = np.concatenate([b.u_strands for b in batches])
+        vs = np.concatenate([b.v_strands for b in batches])
+        return cls(u, v, us, vs)
+
+    @property
+    def nbytes(self) -> int: return self._u.nbytes + self._v.nbytes + self._u_strands.nbytes + self._v_strands.nbytes
+
+    def copy(self) -> 'EdgeBatch':
+        # Note: attributes dict copy is shallow for arrays inside
+        return self.__class__(self._u.copy(), self._v.copy(), self._u_strands.copy(), self._v_strands.copy(), self._attributes.copy())
+
     def __len__(self): return len(self._u)
 
     def __iter__(self):
@@ -110,9 +141,26 @@ class EdgeBatch(Batch):
             return EdgeBatch(self._u[item], self._v[item], self._u_strands[item], self._v_strands[item], new_attrs)
         raise TypeError(f"Invalid index type: {type(item)}")
 
-    def empty(self) -> 'EdgeBatch':
-        return EdgeBatch(np.empty(0, dtype=object), np.empty(0, dtype=object), 
-                         np.empty(0, dtype=np.int8), np.empty(0, dtype=np.int8), {})
+    @classmethod
+    def empty(cls) -> 'EdgeBatch':
+        return cls.zeros(0)
+
+    @classmethod
+    def zeros(cls, n: int) -> 'EdgeBatch':
+        return cls(
+            np.full(n, b'', dtype=object),
+            np.full(n, b'', dtype=object),
+            np.ones(n, dtype=np.int8),
+            np.ones(n, dtype=np.int8),
+            {}
+        )
+
+    @classmethod
+    def empty(cls) -> 'EdgeBatch':
+        return cls.zeros(0)
+
+    @property
+    def component(self): return Edge
 
     def __repr__(self):
         return f"<EdgeBatch: {len(self)} edges>"
@@ -316,6 +364,9 @@ class Path:
         """
         self.nodes = nodes
         self.total_cost = cost
+    
+    @property
+    def batch(self) -> type['Batch']: return PathBatch
 
     def __len__(self): return len(self.nodes)
     def __iter__(self): return iter(self.nodes)
@@ -342,12 +393,35 @@ class PathBatch(RaggedBatch):
         n = len(offsets) - 1
         self._costs = costs if costs is not None else np.zeros(n, dtype=np.float32)
 
-    def empty(self) -> 'PathBatch':
-        return PathBatch(
+    @classmethod
+    def empty(cls) -> 'PathBatch':
+        return cls.zeros(0)
+
+    @classmethod
+    def zeros(cls, n: int) -> 'PathBatch':
+        return cls(
             np.empty(0, dtype=object),
-            np.array([0], dtype=np.int32),
-            np.empty(0, dtype=np.float32)
+            np.zeros(n + 1, dtype=np.int32),
+            np.zeros(n, dtype=np.float32)
         )
+
+    @property
+    def component(self): return Path
+
+    @classmethod
+    def concat(cls, batches: Iterable['PathBatch']) -> 'PathBatch':
+        batches = list(batches)
+        if not batches: return cls.empty()
+        flat_nodes = np.concatenate([b._flat_nodes for b in batches])
+        costs = np.concatenate([b._costs for b in batches])
+        offsets = cls._stack_offsets(batches)
+        return cls(flat_nodes, offsets, costs)
+
+    @property
+    def nbytes(self) -> int: return super().nbytes + self._flat_nodes.nbytes + self._costs.nbytes
+
+    def copy(self) -> 'PathBatch':
+        return self.__class__(self._flat_nodes.copy(), self._offsets.copy(), self._costs.copy())
 
     def __repr__(self): return f"<PathBatch: {len(self)} paths>"
 
@@ -373,8 +447,8 @@ class PathBatch(RaggedBatch):
         raise TypeError(f"Invalid index type: {type(item)}")
 
     @classmethod
-    def from_paths(cls, paths: Iterable[Path]):
-        paths = list(paths)
+    def build(cls, components: Iterable[object]) -> 'PathBatch':
+        paths = list(components)
         if not paths:
             return cls(np.empty(0, dtype=object), np.array([0], dtype=np.int32))
         
