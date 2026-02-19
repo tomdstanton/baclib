@@ -13,7 +13,7 @@ from baclib.core.alphabet import Alphabet
 from baclib.containers.seq import SeqBatch
 from baclib.containers.graph import Edge
 from baclib.containers.record import Record, Feature, RecordBatch
-from baclib.containers.alignments import Alignment
+from baclib.containers.alignment import Alignment
 from baclib.containers import Batch
 from baclib.lib.io import Xopen, PeekableHandle, ThreadedChunkReader, ThreadedChunkWriter
 

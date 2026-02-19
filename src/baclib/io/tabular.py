@@ -3,7 +3,7 @@ from typing import Union, Generator
 
 import numpy as np
 
-from baclib.containers.alignments import Alignment, AlignmentBatch
+from baclib.containers.alignment import Alignment, AlignmentBatch
 from baclib.containers.record import Record, Feature, FeatureBatch, FeatureKey, QualifierBatch
 from baclib.containers.mutations import Mutation, MutationBatch
 from baclib.containers.seq import Seq, SeqBatch
